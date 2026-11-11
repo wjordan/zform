@@ -1,0 +1,21 @@
+[package]
+name = "zform-cli"
+description = "Command-line compressor, inspector, and compressed-domain query tool for zform (.zfm)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "zform"
+path = "src/main.rs"
+
+[dependencies]
+same-file.workspace = true
+zform.workspace = true

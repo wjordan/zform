@@ -1,0 +1,6 @@
+/target
+/*.zfm
+/*.zfp
+/bench/corpus
+/bench/results.json
+__pycache__/

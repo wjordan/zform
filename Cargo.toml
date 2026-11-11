@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/zform-core",
+    "crates/zform",
+    "crates/zform-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/wjordan/zform"
+readme = "README.md"
+keywords = ["compression", "logs", "json", "columnar", "zstd"]
+categories = ["compression", "encoding"]
+
+[workspace.lints.clippy]
+needless_range_loop = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+
+[workspace.dependencies]
+fsst-rs = "0.6"
+lz4_flex = "0.14"
+memchr = "2.8"
+same-file = "1.0"
+zstd-safe = "7"
+zform-core = { path = "crates/zform-core", version = "0.1.0" }
+zform = { path = "crates/zform", version = "0.1.0" }

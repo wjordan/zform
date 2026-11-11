@@ -1,0 +1,19 @@
+[package]
+name = "zform-core"
+description = "Core format, structural grammar planner, typed codecs, and compressed-domain pushdown engine for zform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+fsst-rs.workspace = true
+lz4_flex.workspace = true
+memchr.workspace = true
+zstd-safe.workspace = true
