@@ -934,8 +934,13 @@ pub(crate) fn try_build_mt_cells(
             .flat_map(|rec| (0..k).map(move |i| layout.word(rec, i)));
         let head: Vec<u32> = flat.by_ref().take(MT_N).collect();
         let mut stream = MtStream::after(&head);
-        stream.grow(MT_N + 1);
-        if Some(stream.words[MT_N]) == flat.next()
+        // A matching zero word in a padded identifier is weak evidence of a generator.
+        // Validate a consecutive suffix before paying for the bounded position search.
+        stream.grow(MT_N + 8);
+        if stream.words[MT_N..MT_N + 8]
+            .iter()
+            .copied()
+            .eq(flat.take(8))
             && let Some((at, missing)) = mt_locate(&mut stream, recs, width, layout)
         {
             let mut untempered = [0u32; MT_N];

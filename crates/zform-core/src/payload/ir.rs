@@ -69,9 +69,11 @@ pub enum Op {
     ScanAdd = 29,
     ScanXor = 30,
     ScanF64Add = 31,
+    I64ToF64 = 32,
+    F64DivI = 33,
 }
 
-pub const ALL_OPS: [Op; 32] = [
+pub const ALL_OPS: [Op; 34] = [
     Op::Add,
     Op::Sub,
     Op::Mul,
@@ -104,6 +106,8 @@ pub const ALL_OPS: [Op; 32] = [
     Op::ScanAdd,
     Op::ScanXor,
     Op::ScanF64Add,
+    Op::I64ToF64,
+    Op::F64DivI,
 ];
 
 impl Op {
@@ -155,6 +159,7 @@ impl Op {
                 | Self::MulHiI
                 | Self::F64AddI
                 | Self::F64MulI
+                | Self::F64DivI
                 | Self::Gather
                 | Self::ScanAdd
                 | Self::ScanXor
@@ -299,7 +304,10 @@ impl Program {
             }
             if ins.op.is_shift_imm() {
                 out.push(ins.imm as u8);
-            } else if matches!(ins.op, Op::F64AddI | Op::F64MulI | Op::ScanF64Add) {
+            } else if matches!(
+                ins.op,
+                Op::F64AddI | Op::F64MulI | Op::F64DivI | Op::ScanF64Add
+            ) {
                 out.extend_from_slice(&ins.imm.to_le_bytes());
             } else if ins.op.has_imm() {
                 put_iv(&mut out, ins.imm);
@@ -371,6 +379,8 @@ impl Program {
                         | Op::F64Mul
                         | Op::F64AddI
                         | Op::F64MulI
+                        | Op::I64ToF64
+                        | Op::F64DivI
                         | Op::U64ToF64
                         | Op::ScanF64Add
                 )
@@ -406,7 +416,7 @@ impl Program {
                     return Err(Invalid("shift count out of range"));
                 }
                 s as i64
-            } else if matches!(op, Op::F64AddI | Op::F64MulI | Op::ScanF64Add) {
+            } else if matches!(op, Op::F64AddI | Op::F64MulI | Op::F64DivI | Op::ScanF64Add) {
                 if b.len() < 8 {
                     return Err(Invalid("truncated f64 immediate"));
                 }
@@ -863,6 +873,9 @@ pub fn eval_reference(p: &Program, inputs: &[&[i64]], bufs: &[TableBuf<'_>]) -> 
                         Op::Ctz => a.trailing_zeros() as i64,
                         Op::Bswap => a.swap_bytes(),
                         Op::U64ToF64 => ((a as u64) as f64).to_bits() as i64,
+                        Op::I64ToF64 => (a as f64).to_bits() as i64,
+                        Op::F64DivI => (f64::from_bits(a as u64) / f64::from_bits(ins.imm as u64))
+                            .to_bits() as i64,
                         Op::NibbleLut => {
                             let lut = &p.luts[ins.aux as usize];
                             let mut bytes = a.to_le_bytes();

@@ -11,6 +11,8 @@ struct ReadmeExamples;
 pub use zform_core::block;
 pub use zform_core::cells;
 pub mod column;
+pub mod numeric;
+pub mod bytes;
 pub use zform_core::file;
 pub use zform_core::file::{RowSet, Stats};
 pub use zform_core::json_tree::JsonDoc;

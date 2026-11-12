@@ -123,6 +123,8 @@ fn random_program(rng: &mut u64, width: Width, trial: usize) -> Program {
                         | Op::F64Mul
                         | Op::F64AddI
                         | Op::F64MulI
+                        | Op::I64ToF64
+                        | Op::F64DivI
                         | Op::U64ToF64
                         | Op::ScanF64Add
                 )
@@ -132,7 +134,13 @@ fn random_program(rng: &mut u64, width: Width, trial: usize) -> Program {
             // Avoid generating NaN inputs into F64 ops so bit-level comparison is deterministic.
             if matches!(
                 cand,
-                Op::F64Add | Op::F64Sub | Op::F64Mul | Op::F64AddI | Op::F64MulI | Op::ScanF64Add
+                Op::F64Add
+                    | Op::F64Sub
+                    | Op::F64Mul
+                    | Op::F64AddI
+                    | Op::F64MulI
+                    | Op::F64DivI
+                    | Op::ScanF64Add
             ) {
                 continue;
             }
@@ -773,5 +781,64 @@ fn constants_folded_into_a_fused_operation_are_not_set_in_place() {
         for set in &sets {
             check_named(&lib, prog, set, 40, &mut rng);
         }
+    }
+}
+
+#[test]
+fn numeric_chains_match_reference_for_extremes_and_short_tails() {
+    let values = [i64::MIN, i64::MAX, -1, 0, 1, 9_007_199_254_740_993, -17001];
+    for rows in [0, 1, 2, 7, 15, 31, 65] {
+        let input: Vec<_> = (0..rows).map(|i| values[i % values.len()]).collect();
+        for scan in [false, true] {
+            for scale in [
+                None,
+                Some((Op::F64DivI, 1000.)),
+                Some((Op::F64MulI, -0.001)),
+            ] {
+                let b = Builder::new(1);
+                let mut v = b.input(0);
+                if scan {
+                    v = b.scan_add(v, i64::MAX);
+                }
+                v = b.ri(Op::AddI, b.ri(Op::ShlI, v, 2), -17);
+                v = b.r(Op::I64ToF64, v);
+                if let Some((op, factor)) = scale {
+                    v = b.rf(op, v, factor);
+                }
+                let p = b.finish(&[(v, 8)]);
+                let want = eval_reference(&p, &[&input], &[]);
+                let mut fast = vec![0; rows];
+                assert!(super::engine::eval_numeric_chain(&p, &input, &mut fast));
+                let mut general = vec![0; rows];
+                CompiledProgram::compile(&p).eval_i64(&[&input], &[], &mut general);
+                assert_eq!(fast, general);
+                for (got, expected) in fast.iter().zip(want) {
+                    assert_eq!(got.to_le_bytes().as_slice(), expected);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn sparse_integer_transport_preserves_wide_exceptions_and_validates_framing() {
+    use super::graph::IntStream;
+    let mut values: Vec<_> = (0..257).map(|i| i % 23 - 11).collect();
+    values[0] = i64::MIN;
+    values[128] = i64::MAX;
+    values[256] = -900_000;
+    let stream = IntStream::encode_fast(&values);
+    assert!(matches!(stream, IntStream::ZigZagBytes { .. }));
+    let mut bytes = Vec::new();
+    stream.encode(&mut bytes);
+    let budget = DecodeBudget::default();
+    let decoded = IntStream::decode_wire(&mut Cursor::new(&bytes), &budget, 0).unwrap();
+    assert_eq!(decoded.unpack(&budget).unwrap(), values);
+    for n in 0..bytes.len() {
+        assert!(
+            IntStream::decode_wire(&mut Cursor::new(&bytes[..n]), &budget, 0)
+                .and_then(|s| s.unpack(&budget))
+                .is_err()
+        );
     }
 }

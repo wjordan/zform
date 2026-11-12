@@ -15,6 +15,13 @@ pub struct Encoder {
 }
 
 impl Encoder {
+    /// Generic dictionary/raw selection without structured pack searches.
+    pub fn fast() -> Self {
+        Self {
+            registry: PackRegistry::new(),
+        }
+    }
+
     pub fn encode(&self, values: &[&[u8]]) -> Vec<u8> {
         self.registry.encode_best(values)
     }

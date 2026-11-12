@@ -481,8 +481,15 @@ def_r4!(r4_f64_muli, |ip, _ctx, _ring, _pos, _out, r0, _r1| {
     let c = (*ip).vec_imm0;
     r0 = arch::map1(r0, |x| arch::f64_mul(x, c));
 });
+def_r4!(r4_f64_divi, |ip, _ctx, _ring, _pos, _out, r0, _r1| {
+    let c = (*ip).vec_imm0;
+    r0 = arch::map1(r0, |x| arch::f64_div(x, c));
+});
 def_r4!(r4_u64_to_f64, |_ip, _ctx, _ring, _pos, _out, r0, _r1| {
     r0 = arch::map1(r0, |x| arch::u64_to_f64(x));
+});
+def_r4!(r4_i64_to_f64, |_ip, _ctx, _ring, _pos, _out, r0, _r1| {
+    r0 = arch::map1(r0, |x| arch::i64_to_f64(x));
 });
 
 def_r4!(r4_add32, |_ip, _ctx, _ring, _pos, _out, r0, r1| {
@@ -1725,11 +1732,13 @@ fn compile_wide4(spec: &RecurrenceSpec) -> (Vec<RNode4>, usize) {
                         (false, Op::MulHiI) => mk(r4_mulhii64, 0, 0, splat(ins.imm), z),
                         (_, Op::F64AddI) => mk(r4_f64_addi, 0, 0, splat(ins.imm), z),
                         (_, Op::F64MulI) => mk(r4_f64_muli, 0, 0, splat(ins.imm), z),
+                        (_, Op::F64DivI) => mk(r4_f64_divi, 0, 0, splat(ins.imm), z),
                         (true, Op::Ctz) => mk(r4_ctz32, 0, 0, z, z),
                         (false, Op::Ctz) => mk(r4_ctz64, 0, 0, z, z),
                         (true, Op::Bswap) => mk(r4_bswap32, 0, 0, z, z),
                         (false, Op::Bswap) => mk(r4_bswap64, 0, 0, z, z),
                         (_, Op::U64ToF64) => mk(r4_u64_to_f64, 0, 0, z, z),
+                        (_, Op::I64ToF64) => mk(r4_i64_to_f64, 0, 0, z, z),
                         (_, Op::NibbleLut) => {
                             let tbl = unsafe { arch::broadcast_lut16(&all_luts[ins.aux as usize]) };
                             mk(r4_nibble_lut, 0, 0, tbl, z)
@@ -2602,6 +2611,10 @@ fn eval_one_i64(p: &Program, v: &mut Vec<i64>) -> i64 {
             Op::Ctz => (a as u64).trailing_zeros() as i64,
             Op::Bswap => a.swap_bytes(),
             Op::U64ToF64 => ((a as u64) as f64).to_bits() as i64,
+            Op::I64ToF64 => (a as f64).to_bits() as i64,
+            Op::F64DivI => {
+                (f64::from_bits(a as u64) / f64::from_bits(ins.imm as u64)).to_bits() as i64
+            }
             Op::NibbleLut => {
                 let lut = &p.luts[ins.aux as usize];
                 let mut bytes = a.to_le_bytes();

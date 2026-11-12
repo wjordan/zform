@@ -143,6 +143,11 @@ pub enum IntStream {
         width: u8,
         leaf: Vec<u8>,
     },
+    ZigZagBytes {
+        len: u32,
+        head_leaf: Vec<u8>,
+        tail: Box<IntStream>,
+    },
     ForTail255 {
         len: u32,
         min: i64,
@@ -303,6 +308,76 @@ impl IntStream {
         best.unwrap().1
     }
 
+    /// Linear-time selection for latency-sensitive native numeric columns. Uses the same
+    /// generic streams as exhaustive selection, with one entropy-compression attempt.
+    pub fn encode_fast(vals: &[i64]) -> Self {
+        let len = vals.len() as u32;
+        if vals.is_empty() {
+            return Self::Const { val: 0, len };
+        }
+        let (mut min, mut max, mut runs) = (vals[0], vals[0], 1usize);
+        for w in vals.windows(2) {
+            min = min.min(w[1]);
+            max = max.max(w[1]);
+            runs += usize::from(w[0] != w[1]);
+        }
+        if min == max {
+            return Self::Const { val: min, len };
+        }
+        if runs * 16 < vals.len() {
+            let mut raw = Vec::with_capacity(runs * 12);
+            put_uvarint(&mut raw, runs as u64);
+            let mut i = 0;
+            while i < vals.len() {
+                let value = vals[i];
+                let start = i;
+                while i < vals.len() && vals[i] == value {
+                    i += 1;
+                }
+                put_ivarint(&mut raw, value);
+                put_uvarint(&mut raw, (i - start) as u64);
+            }
+            return Self::Rle {
+                len,
+                leaf: pack_leaf(&raw),
+            };
+        }
+        let bits = (64 - (max as u64).wrapping_sub(min as u64).leading_zeros()) as u8;
+        let varbytes = vals
+            .iter()
+            .map(|&v| {
+                ((64 - (((v << 1) ^ (v >> 63)) as u64).leading_zeros()).max(1) as usize).div_ceil(7)
+            })
+            .sum::<usize>();
+        if varbytes + 8 < vals.len() * bits as usize / 8 {
+            let mut head = Vec::with_capacity(vals.len());
+            let mut tail = Vec::new();
+            for &v in vals {
+                let z = ((v << 1) ^ (v >> 63)) as u64;
+                head.push(z.min(255) as u8);
+                if z >= 255 {
+                    tail.push((z - 255) as i64);
+                }
+            }
+            return Self::ZigZagBytes {
+                len,
+                head_leaf: pack_leaf(&head),
+                tail: Box::new(Self::auto_encode(&tail)),
+            };
+        }
+        let raw = bitpack_u64(
+            vals.iter().map(|&v| (v as u64).wrapping_sub(min as u64)),
+            bits,
+            vals.len(),
+        );
+        Self::ForBitpack {
+            len,
+            min,
+            bits,
+            leaf: pack_leaf(&raw),
+        }
+    }
+
     pub fn len(&self) -> usize {
         match *self {
             Self::Const { len, .. }
@@ -310,6 +385,7 @@ impl IntStream {
             | Self::ForBitpack { len, .. }
             | Self::ZigZagVarint { len, .. }
             | Self::ForPlanes { len, .. }
+            | Self::ZigZagBytes { len, .. }
             | Self::ForTail255 { len, .. } => len as usize,
         }
     }
@@ -362,6 +438,17 @@ impl IntStream {
                 out.push(*width);
                 put_uvarint(out, leaf.len() as u64);
                 out.extend_from_slice(leaf);
+            }
+            Self::ZigZagBytes {
+                len,
+                head_leaf,
+                tail,
+            } => {
+                out.push(6);
+                put_uvarint(out, *len as u64);
+                put_uvarint(out, head_leaf.len() as u64);
+                out.extend_from_slice(head_leaf);
+                tail.encode(out);
             }
             Self::ForTail255 {
                 len,
@@ -428,6 +515,15 @@ impl IntStream {
                     min,
                     width,
                     leaf,
+                })
+            }
+            6 => {
+                let head_leaf = cur.bytes()?.to_vec();
+                let tail = Box::new(Self::decode_wire(cur, budget, depth + 1)?);
+                Ok(Self::ZigZagBytes {
+                    len,
+                    head_leaf,
+                    tail,
                 })
             }
             5 => {
@@ -551,6 +647,44 @@ impl IntStream {
                         }
                     }
                     _ => unreachable!(),
+                }
+                Ok(out)
+            }
+            Self::ZigZagBytes {
+                len,
+                head_leaf,
+                tail,
+            } => {
+                let head = unpack_leaf(head_leaf, budget)?;
+                if head.len() != *len as usize {
+                    return Err(Error::Format("zigzag byte count mismatch".into()));
+                }
+                let tail = tail.unpack(budget)?;
+                let mut patches = tail.iter();
+                let mut out = Vec::with_capacity(head.len());
+                if tail.is_empty() {
+                    if head.contains(&255) {
+                        return Err(Error::Format("missing zigzag byte exception".into()));
+                    }
+                    out.extend(head.iter().map(|&v| ((v >> 1) as i64) ^ -((v & 1) as i64)));
+                } else {
+                    for byte in head {
+                        let z = if byte == 255 {
+                            (*patches.next().ok_or_else(|| {
+                                Error::Format("missing zigzag byte exception".into())
+                            })? as u64)
+                                .checked_add(255)
+                                .ok_or_else(|| {
+                                    Error::Format("zigzag byte exception overflow".into())
+                                })?
+                        } else {
+                            byte as u64
+                        };
+                        out.push(((z >> 1) as i64) ^ -((z & 1) as i64));
+                    }
+                    if patches.next().is_some() {
+                        return Err(Error::Format("unused zigzag byte exceptions".into()));
+                    }
                 }
                 Ok(out)
             }
@@ -895,6 +1029,93 @@ impl PayloadGraph {
 
     pub fn encode(&self) -> Vec<u8> {
         self.encode_linked(None)
+    }
+
+    /// Fuses consecutive numeric programs and removes unreachable intermediates. This
+    /// keeps a predictor and its output conversion in one compiled row loop.
+    pub fn fuse_numeric_programs(mut self) -> Self {
+        if self.rows == 0 {
+            return self;
+        }
+        for i in 0..self.nodes.len() {
+            let GraphNode::ProgramI64 { prog, inputs, bufs } = &self.nodes[i] else {
+                continue;
+            };
+            if inputs.len() != 1 || !bufs.is_empty() || !prog.luts.is_empty() {
+                continue;
+            }
+            let GraphNode::ProgramI64 {
+                prog: prior,
+                inputs: prior_inputs,
+                bufs: prior_bufs,
+            } = &self.nodes[inputs[0] as usize]
+            else {
+                continue;
+            };
+            if prior.width != prog.width
+                || !prior_bufs.is_empty()
+                || !prior.luts.is_empty()
+                || prior.sinks.len() != 1
+                || prior.sinks[0].1 != Len::Fixed(8)
+            {
+                continue;
+            }
+            let mut fused = (**prior).clone();
+            let map = |r: u32| {
+                if r == 0 {
+                    prior.sinks[0].0
+                } else {
+                    prior.n_in + prior.ops.len() as u32 + r - 1
+                }
+            };
+            for ins in &prog.ops {
+                let mut ins = *ins;
+                ins.a = map(ins.a);
+                if ins.op.arity() >= 2 {
+                    ins.b = map(ins.b);
+                }
+                if ins.op.arity() >= 3 {
+                    ins.c = map(ins.c);
+                }
+                fused.ops.push(ins);
+            }
+            fused.sinks = prog
+                .sinks
+                .iter()
+                .map(|&(r, len)| {
+                    (
+                        map(r),
+                        match len {
+                            Len::Lane(r) => Len::Lane(map(r)),
+                            other => other,
+                        },
+                    )
+                })
+                .collect();
+            self.nodes[i] = GraphNode::ProgramI64 {
+                prog: fused.into(),
+                inputs: prior_inputs.clone(),
+                bufs: vec![],
+            };
+        }
+        let mut live = vec![false; self.nodes.len()];
+        live[self.root as usize] = true;
+        for i in (0..self.nodes.len()).rev() {
+            if live[i] {
+                self.nodes[i].for_each_dep(|d| live[d as usize] = true);
+            }
+        }
+        let mut remap = vec![0; live.len()];
+        let mut nodes = Vec::new();
+        for (i, node) in self.nodes.iter().enumerate() {
+            if live[i] {
+                remap[i] = nodes.len() as u16;
+                nodes.push(node.remap(|d| remap[d as usize]));
+            }
+        }
+        self.root = remap[self.root as usize];
+        self.nodes = nodes;
+        self
     }
 
     /// The size selection compares: the encoded size less what shared code will not cost.
@@ -1292,6 +1513,71 @@ impl GraphBuilder {
             }
         }
         self.push(GraphNode::IntStream(direct))
+    }
+
+    /// Predicts signed lanes when their deltas need materially fewer bits. Prediction is
+    /// an ordinary scan program, so readers need no knowledge of the encoder's policy.
+    pub fn add_ints_fast(&mut self, vals: &[i64]) -> u16 {
+        if vals.len() < 2 || vals.iter().all(|v| *v == vals[0]) {
+            return self.push(GraphNode::IntStream(IntStream::encode_fast(vals)));
+        }
+        let runs = 1 + vals.windows(2).filter(|w| w[0] != w[1]).count();
+        if runs * 16 < vals.len() {
+            return self.push(GraphNode::IntStream(IntStream::encode_fast(vals)));
+        }
+        let min = *vals.iter().min().unwrap();
+        let common = vals
+            .iter()
+            .fold(0u64, |mask, &v| mask | (v as u64).wrapping_sub(min as u64));
+        let shift = common.trailing_zeros();
+        if shift >= 2 && shift < 64 && vals.len() * shift as usize > 256 {
+            let normalized: Vec<_> = vals
+                .iter()
+                .map(|&v| ((v as u64).wrapping_sub(min as u64) >> shift) as i64)
+                .collect();
+            let input = self.add_ints_fast(&normalized);
+            let b = Builder::new(1);
+            let output = b.ri(
+                super::ir::Op::AddI,
+                b.ri(super::ir::Op::ShlI, b.input(0), shift as i64),
+                min,
+            );
+            return self.add_prog_i64(b.finish(&[(output, 8)]), vec![input], vec![]);
+        }
+        let step = vals[1].wrapping_sub(vals[0]);
+        if vals.windows(2).all(|w| w[1].wrapping_sub(w[0]) == step) {
+            let input = self.push(GraphNode::IntStream(IntStream::Const {
+                val: step,
+                len: vals.len() as u32,
+            }));
+            let b = Builder::new(1);
+            let output = b.scan_add(b.input(0), vals[0].wrapping_sub(step));
+            return self.add_prog_i64(b.finish(&[(output, 8)]), vec![input], vec![]);
+        }
+        let span = |v: &[i64]| {
+            let lo = *v.iter().min().unwrap();
+            let hi = *v.iter().max().unwrap();
+            64 - (hi as u64).wrapping_sub(lo as u64).leading_zeros()
+        };
+        let mut deltas = Vec::with_capacity(vals.len());
+        deltas.push(0);
+        deltas.extend(vals.windows(2).map(|w| w[1].wrapping_sub(w[0])));
+        let delta_bytes = deltas
+            .iter()
+            .map(|&v| {
+                ((64 - (((v << 1) ^ (v >> 63)) as u64).leading_zeros()).max(1) as usize).div_ceil(7)
+            })
+            .sum::<usize>();
+        if (span(vals).saturating_sub(span(&deltas)) as usize) * vals.len() > 256
+            || delta_bytes * 8 + 256 < span(vals) as usize * vals.len()
+        {
+            let input = self.push(GraphNode::IntStream(IntStream::encode_fast(&deltas)));
+            let b = Builder::new(1);
+            let output = b.scan_add(b.input(0), vals[0]);
+            self.add_prog_i64(b.finish(&[(output, 8)]), vec![input], vec![])
+        } else {
+            self.push(GraphNode::IntStream(IntStream::encode_fast(vals)))
+        }
     }
 
     pub fn add_byte_chunks(&mut self, buf: u16, chunk_bytes: u8) -> u16 {
@@ -2011,6 +2297,62 @@ impl CoreDecoder {
         Self::decode_cells(&graph, &ExtInputs::empty(), budget)
     }
 
+    /// Numeric decoding can read a standalone stream without allocating a graph directory.
+    pub fn decode_ints_bytes(bytes: &[u8], budget: &DecodeBudget) -> Result<Vec<i64>> {
+        let mut cursor = Cursor::new(bytes);
+        let rows = cursor.uvar()?;
+        if rows > 0
+            && rows <= budget.max_records_per_block as u64
+            && cursor.u8()? == 0
+            && cursor.uvar()? == 1
+            && cursor.u8()? == 1
+        {
+            let stream = IntStream::decode_wire(&mut cursor, budget, 0)?;
+            if stream.len() as u64 != rows || cursor.uvar()? != 0 || cursor.remaining() != 0 {
+                return Err(Error::Format("numeric graph shape mismatch".into()));
+            }
+            return stream.unpack(budget);
+        }
+        let graph = PayloadGraph::decode(bytes, budget)?;
+        Self::decode_ints(&graph, &ExtInputs::empty(), budget)
+    }
+
+    /// Executes a numeric graph without allocating per-cell offsets or formatting bytes.
+    pub fn decode_ints(
+        graph: &PayloadGraph,
+        ext: &ExtInputs<'_>,
+        budget: &DecodeBudget,
+    ) -> Result<Vec<i64>> {
+        let rows = graph.rows as usize;
+        if rows == 0 {
+            return Ok(Vec::new());
+        }
+        if let GraphNode::IntStream(stream) = &graph.nodes[graph.root as usize] {
+            if stream.len() != rows {
+                return Err(Error::Format("numeric row count mismatch".into()));
+            }
+            return stream.unpack(budget);
+        }
+        let mut uses = vec![0u32; graph.nodes.len()];
+        for node in &graph.nodes {
+            node.for_each_dep(|dep| uses[dep as usize] += 1);
+        }
+        let mut values = Self::execute_nodes(
+            &graph.nodes,
+            rows,
+            ext,
+            budget,
+            &vec![false; graph.nodes.len()],
+            &mut uses,
+        )?;
+        match std::mem::replace(&mut values[graph.root as usize], Val::Empty) {
+            Val::Ints(values) if values.len() == rows => Ok(values),
+            _ => Err(Error::Format(
+                "numeric graph root type or row count mismatch".into(),
+            )),
+        }
+    }
+
     /// Executes `graph` into materialized [`Cells`].
     pub fn decode_cells(
         graph: &PayloadGraph,
@@ -2474,7 +2816,12 @@ impl CoreDecoder {
                     }
                     budget.check_alloc(n_rows.saturating_mul(8), "ProgramI64")?;
                     let mut out = vec![0i64; n_rows];
-                    CompiledProgram::with(prog, |cp| cp.eval_i64(&in_refs, &tbufs, &mut out));
+                    if in_refs.len() != 1
+                        || !tbufs.is_empty()
+                        || !super::engine::eval_numeric_chain(prog, in_refs[0], &mut out)
+                    {
+                        CompiledProgram::with(prog, |cp| cp.eval_i64(&in_refs, &tbufs, &mut out));
+                    }
                     Val::Ints(out)
                 }
                 GraphNode::ProgramCells { prog, inputs, bufs } => {
@@ -3038,10 +3385,15 @@ fn bitunpack_u64(bytes: &[u8], bits: u8, len: usize, min: i64) -> Vec<i64> {
     for _ in 0..len {
         let byte_idx = bit_pos >> 3;
         let shift = bit_pos & 7;
-        let n_lo = (bytes.len() - byte_idx).min(8);
-        let mut cur = [0u8; 8];
-        cur[..n_lo].copy_from_slice(&bytes[byte_idx..byte_idx + n_lo]);
-        let mut x = u64::from_le_bytes(cur) >> shift;
+        let word = if byte_idx + 8 <= bytes.len() {
+            u64::from_le_bytes(bytes[byte_idx..byte_idx + 8].try_into().unwrap())
+        } else {
+            let mut tail = [0u8; 8];
+            let rest = &bytes[byte_idx..];
+            tail[..rest.len()].copy_from_slice(rest);
+            u64::from_le_bytes(tail)
+        };
+        let mut x = word >> shift;
         if shift + b > 64 && byte_idx + 8 < bytes.len() {
             x |= (bytes[byte_idx + 8] as u64) << (64 - shift);
         }

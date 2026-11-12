@@ -290,8 +290,15 @@ def_handler!(op_f64_muli, |ip, _ctx, _rows, _out, r0, _r1| {
     let c = (*ip).vec_imm0;
     r0 = arch::map1(r0, |x| arch::f64_mul(x, c));
 });
+def_handler!(op_f64_divi, |ip, _ctx, _rows, _out, r0, _r1| {
+    let c = (*ip).vec_imm0;
+    r0 = arch::map1(r0, |x| arch::f64_div(x, c));
+});
 def_handler!(op_u64_to_f64, |_ip, _ctx, _rows, _out, r0, _r1| {
     r0 = arch::map1(r0, |x| arch::u64_to_f64(x));
+});
+def_handler!(op_i64_to_f64, |_ip, _ctx, _rows, _out, r0, _r1| {
+    r0 = arch::map1(r0, |x| arch::i64_to_f64(x));
 });
 
 // --- 32-bit lane handlers ---
@@ -2023,11 +2030,13 @@ fn schedule_program(
                         (false, Op::MulHiI) => node(op_mulhii64, 0, 0, 0, splat(ins.imm), z),
                         (_, Op::F64AddI) => node(op_f64_addi, 0, 0, 0, splat(ins.imm), z),
                         (_, Op::F64MulI) => node(op_f64_muli, 0, 0, 0, splat(ins.imm), z),
+                        (_, Op::F64DivI) => node(op_f64_divi, 0, 0, 0, splat(ins.imm), z),
                         (true, Op::Ctz) => node(op_ctz32, 0, 0, 0, z, z),
                         (false, Op::Ctz) => node(op_ctz64, 0, 0, 0, z, z),
                         (true, Op::Bswap) => node(op_bswap32, 0, 0, 0, z, z),
                         (false, Op::Bswap) => node(op_bswap64, 0, 0, 0, z, z),
                         (_, Op::U64ToF64) => node(op_u64_to_f64, 0, 0, 0, z, z),
+                        (_, Op::I64ToF64) => node(op_i64_to_f64, 0, 0, 0, z, z),
                         (_, Op::NibbleLut) => {
                             let tbl = unsafe { arch::broadcast_lut16(&p.luts[ins.aux as usize]) };
                             node(op_nibble_lut, 0, 0, 0, tbl, z)
@@ -2237,4 +2246,83 @@ fn prep_binary<FLoad, FSave, FRetire>(
     }
     maybe_retire(a, rem_uses, reg, spill_of, free_spills);
     maybe_retire(b, rem_uses, reg, spill_of, free_spills);
+}
+
+/// Lower a linear numeric SSA chain to one loop. The operations and constants still come
+/// entirely from the payload; short columns avoid a handler transition for each arithmetic step.
+pub(crate) fn eval_numeric_chain(p: &Program, input: &[i64], out: &mut [i64]) -> bool {
+    if p.width != Width::W64
+        || p.n_in != 1
+        || p.n_bufs != 0
+        || !p.luts.is_empty()
+        || p.sinks != [(p.ops.len() as u32, Len::Fixed(8))]
+        || input.len() != out.len()
+    {
+        return false;
+    }
+    if p.ops.iter().enumerate().any(|(i, op)| op.a != i as u32) {
+        return false;
+    }
+    let mut ops = p.ops.iter().peekable();
+    let scan = if ops.peek().is_some_and(|i| i.op == Op::ScanAdd) {
+        Some(ops.next().unwrap().imm)
+    } else {
+        None
+    };
+    let shift = if ops.peek().is_some_and(|i| i.op == Op::ShlI) {
+        ops.next().unwrap().imm as u32
+    } else {
+        0
+    };
+    let add = if ops.peek().is_some_and(|i| i.op == Op::AddI) {
+        ops.next().unwrap().imm
+    } else {
+        0
+    };
+    let float = ops.peek().is_some_and(|i| i.op == Op::I64ToF64);
+    if float {
+        ops.next();
+    }
+    let scale = if float
+        && ops
+            .peek()
+            .is_some_and(|i| matches!(i.op, Op::F64DivI | Op::F64MulI))
+    {
+        ops.next().copied()
+    } else {
+        None
+    };
+    if ops.next().is_some() {
+        return false;
+    }
+    fn run(input: &[i64], out: &mut [i64], scan: Option<i64>, f: impl Fn(i64) -> i64) {
+        if let Some(mut accumulator) = scan {
+            for (&v, output) in input.iter().zip(out) {
+                accumulator = accumulator.wrapping_add(v);
+                *output = f(accumulator);
+            }
+        } else {
+            for (&v, output) in input.iter().zip(out) {
+                *output = f(v);
+            }
+        }
+    }
+    let integer = |v: i64| v.wrapping_shl(shift).wrapping_add(add);
+    match (float, scale) {
+        (false, _) => run(input, out, scan, integer),
+        (true, None) => run(input, out, scan, |v| (integer(v) as f64).to_bits() as i64),
+        (true, Some(i)) if i.op == Op::F64DivI => {
+            let divisor = f64::from_bits(i.imm as u64);
+            run(input, out, scan, |v| {
+                (integer(v) as f64 / divisor).to_bits() as i64
+            });
+        }
+        (true, Some(i)) => {
+            let multiplier = f64::from_bits(i.imm as u64);
+            run(input, out, scan, |v| {
+                (integer(v) as f64 * multiplier).to_bits() as i64
+            });
+        }
+    }
+    true
 }

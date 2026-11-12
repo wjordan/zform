@@ -311,6 +311,13 @@ mod imp {
         ))
     }
     #[inline(always)]
+    pub unsafe fn f64_div(a: V, b: V) -> V {
+        _mm512_castpd_si512(_mm512_div_pd(
+            _mm512_castsi512_pd(a),
+            _mm512_castsi512_pd(b),
+        ))
+    }
+    #[inline(always)]
     pub unsafe fn u64_to_f64(a: V) -> V {
         #[cfg(target_feature = "avx512dq")]
         {
@@ -319,6 +326,18 @@ mod imp {
         #[cfg(not(target_feature = "avx512dq"))]
         {
             let arr: [u64; 8] = core::mem::transmute(a);
+            core::mem::transmute(arr.map(|u| (u as f64).to_bits()))
+        }
+    }
+    #[inline(always)]
+    pub unsafe fn i64_to_f64(a: V) -> V {
+        #[cfg(target_feature = "avx512dq")]
+        {
+            _mm512_castpd_si512(_mm512_cvtepi64_pd(a))
+        }
+        #[cfg(not(target_feature = "avx512dq"))]
+        {
+            let arr: [i64; 8] = core::mem::transmute(a);
             core::mem::transmute(arr.map(|u| (u as f64).to_bits()))
         }
     }
@@ -578,8 +597,20 @@ mod imp {
         ))
     }
     #[inline(always)]
+    pub unsafe fn f64_div(a: V, b: V) -> V {
+        _mm256_castpd_si256(_mm256_div_pd(
+            _mm256_castsi256_pd(a),
+            _mm256_castsi256_pd(b),
+        ))
+    }
+    #[inline(always)]
     pub unsafe fn u64_to_f64(a: V) -> V {
         let arr: [u64; 4] = core::mem::transmute(a);
+        core::mem::transmute(arr.map(|u| (u as f64).to_bits()))
+    }
+    #[inline(always)]
+    pub unsafe fn i64_to_f64(a: V) -> V {
+        let arr: [i64; 4] = core::mem::transmute(a);
         core::mem::transmute(arr.map(|u| (u as f64).to_bits()))
     }
 
@@ -905,8 +936,20 @@ mod imp {
         ])
     }
     #[inline(always)]
+    pub unsafe fn f64_div(a: V, b: V) -> V {
+        let (x, y) = (as_i64(a), as_i64(b));
+        from_i64([
+            (f64::from_bits(x[0] as u64) / f64::from_bits(y[0] as u64)).to_bits() as i64,
+            (f64::from_bits(x[1] as u64) / f64::from_bits(y[1] as u64)).to_bits() as i64,
+        ])
+    }
+    #[inline(always)]
     pub unsafe fn u64_to_f64(a: V) -> V {
         from_i64(as_i64(a).map(|x| ((x as u64) as f64).to_bits() as i64))
+    }
+    #[inline(always)]
+    pub unsafe fn i64_to_f64(a: V) -> V {
+        from_i64(as_i64(a).map(|x| (x as f64).to_bits() as i64))
     }
 
     #[inline(always)]
