@@ -13,4 +13,6 @@ jobs:
       - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Debug as well: overflow checks are off in release.
+      - run: cargo test --workspace
       - run: cargo test --release --workspace

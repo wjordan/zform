@@ -3,8 +3,9 @@
 
 use crate::cells::{Cells, Col};
 use crate::codecs::{
-    ANY_LETTERS, BlockDecodeCtx, ColSummary, column_deps, decode_present_slice, decode_u32_seq,
-    encode_dense_block_columns, encode_present_slice, encode_u32_seq, ensure_dense_block_column,
+    ANY_LETTERS, BlockDecodeCtx, ColSummary, Seeds, column_deps, decode_present_slice,
+    decode_u32_seq, encode_dense_block_columns, encode_present_slice, encode_u32_seq,
+    ensure_dense_block_column, with_seeds,
 };
 use crate::framing::{
     FramedChunk, FramingSpec, ResolvedFraming, emit_framed_record, split_chunk, split_json_array,
@@ -15,6 +16,7 @@ use crate::index::{
     KIND_ENVELOPE, KIND_JSON, KIND_LOGFMT, KIND_RESIDUAL, KIND_TEMPLATE, tokens,
 };
 use crate::json_tree::{decode_json_struct_streams, encode_json_struct_streams};
+use crate::lex::parse_base64;
 use crate::plan::{ProbeBackoff, Profile, TrainOptions, sample_strided, train_from_records};
 use crate::wire::{
     Cursor, DecodeBudget, EntropyBackend, Error, Result, compress_leaf, crc32, decompress_leaf,
@@ -113,6 +115,7 @@ pub struct StreamEncoder {
     model_idx: u32,
     frames: usize,
     comp_offset: u64,
+    seeds: Seeds,
 }
 
 impl StreamEncoder {
@@ -127,6 +130,7 @@ impl StreamEncoder {
             model_idx: 0,
             frames: 0,
             comp_offset: 0,
+            seeds: Seeds::default(),
         }
     }
 
@@ -171,6 +175,12 @@ impl StreamEncoder {
         // Pilot probe (`<= 512` strided records) to detect drift BEFORE encoding the full chunk!
         let mut plan_changed = false;
         let pilot = sample_strided(&all_recs, 512, 256 << 10);
+        // Lines that are one Base64 value each fit no template, but a column codec decodes them.
+        let mut scratch = Vec::new();
+        let coded = pilot.len() >= 4
+            && pilot
+                .iter()
+                .all(|r| r.len() >= 16 && parse_base64(r, &mut scratch).is_some());
 
         if let Some(cur_plan) = &self.active_plan {
             if self.opts.allow_drift_retrain && !pilot.is_empty() {
@@ -207,7 +217,7 @@ impl StreamEncoder {
             );
             let trained = train_from_records(&samples, fc.framing, &self.opts.train, None);
             let ps = split_records_with_plan(&pilot, &trained);
-            if trained.variants.len() > 1 && ps.residual_rows * 10 < pilot.len() * 9 {
+            if coded || trained.variants.len() > 1 && ps.residual_rows * 10 < pilot.len() * 9 {
                 self.active_plan = Some(trained);
                 plan_changed = true;
                 self.backoff.record_success();
@@ -220,7 +230,11 @@ impl StreamEncoder {
         let use_passthrough = match &self.active_plan {
             None => true,
             Some(p) => {
-                if p.variants.len() <= 1 || all_recs.len() < 2 {
+                if all_recs.len() < 2 {
+                    true
+                } else if coded {
+                    false
+                } else if p.variants.len() <= 1 {
                     true
                 } else {
                     let ps = split_records_with_plan(&pilot, p);
@@ -262,16 +276,18 @@ impl StreamEncoder {
             if fc.framing == ResolvedFraming::JsonArray {
                 compress_leaf(&mut payload, fc.sep(), self.opts.backend, self.opts.level);
             }
-            blocks = encode_structural_blocks(
-                &all_recs,
-                plan,
-                self.opts.backend,
-                self.opts.level,
-                self.opts.block_rows,
-                self.opts.block_bytes,
-                filter_bits,
-                &mut payload,
-            );
+            blocks = with_seeds(&mut self.seeds, || {
+                encode_structural_blocks(
+                    &all_recs,
+                    plan,
+                    self.opts.backend,
+                    self.opts.level,
+                    self.opts.block_rows,
+                    self.opts.block_bytes,
+                    filter_bits,
+                    &mut payload,
+                )
+            });
             fit.residual_rows = blocks.iter().map(|b| b.residual_rows).sum();
             fit.residual_bytes = blocks.iter().map(|b| b.residual_bytes).sum();
         }

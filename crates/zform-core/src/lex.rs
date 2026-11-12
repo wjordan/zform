@@ -282,7 +282,7 @@ fn days_from_civil(y: i32, m: u32, d: u32) -> Option<i64> {
     let y = y as i64 - i64::from(m <= 2);
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = (y - era * 400) as u64;
-    let mp = m as u64 + if m > 2 { !2 } else { 9 }; // m > 2 ? m - 3 : m + 9
+    let mp = (if m > 2 { m - 3 } else { m + 9 }) as u64;
     let doy = (153 * mp + 2) / 5 + d as u64 - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     Some(era * 146097 + doe as i64 - 719468)
@@ -648,6 +648,58 @@ pub fn parse_hex_exact(src: &[u8]) -> Option<(bool, [u8; 32], u8)> {
     Some((has_upper, out, n as u8))
 }
 
+const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const UNBASE64: [u8; 256] = {
+    let mut t = [0xff; 256];
+    let mut i = 0;
+    while i < 64 {
+        t[BASE64[i] as usize] = i as u8;
+        i += 1;
+    }
+    t
+};
+
+/// Appends the bytes of padded standard Base64. `None`, with `out` in any state, unless
+/// [`format_base64`] writes exactly `src` for them.
+pub fn parse_base64(src: &[u8], out: &mut Vec<u8>) -> Option<()> {
+    if src.is_empty() || !src.len().is_multiple_of(4) {
+        return None;
+    }
+    let pad = src[src.len() - 2..].iter().filter(|&&b| b == b'=').count();
+    let mut bits = 0u32;
+    for (i, &c) in src[..src.len() - pad].iter().enumerate() {
+        let d = UNBASE64[c as usize];
+        if d == 0xff {
+            return None;
+        }
+        bits = bits << 6 | u32::from(d);
+        if i % 4 == 3 {
+            out.extend_from_slice(&bits.to_be_bytes()[1..]);
+            bits = 0;
+        }
+    }
+    // The bits of the last digit that no byte takes are zero.
+    match pad {
+        1 if bits & 3 == 0 => out.extend_from_slice(&[(bits >> 10) as u8, (bits >> 2) as u8]),
+        2 if bits & 15 == 0 => out.push((bits >> 4) as u8),
+        0 => {}
+        _ => return None,
+    }
+    Some(())
+}
+
+pub fn format_base64(bytes: &[u8], out: &mut Vec<u8>) {
+    for chunk in bytes.chunks(3) {
+        let mut b = [0u8; 4];
+        b[1..1 + chunk.len()].copy_from_slice(chunk);
+        let bits = u32::from_be_bytes(b);
+        for i in 0..4 {
+            let digit = BASE64[(bits >> (18 - 6 * i)) as usize & 63];
+            out.push(if i <= chunk.len() { digit } else { b'=' });
+        }
+    }
+}
+
 #[inline]
 pub fn format_hex_bytes(bytes: &[u8], upper: bool, out: &mut Vec<u8>) {
     const LO: &[u8; 16] = b"0123456789abcdef";
@@ -974,6 +1026,25 @@ mod tests {
             let mut out = Vec::new();
             format_exact_decimal(m, sp, &mut out);
             assert_eq!(out, s.as_bytes());
+        }
+    }
+
+    #[test]
+    fn base64_is_exact_or_refused() {
+        for text in ["TWFu", "TWE=", "TQ==", "AAECAwQFBgcICQ==", "+/+/"] {
+            let (mut bytes, mut back) = (Vec::new(), Vec::new());
+            parse_base64(text.as_bytes(), &mut bytes).expect(text);
+            format_base64(&bytes, &mut back);
+            assert_eq!(back, text.as_bytes());
+        }
+        // Wrong length, alphabet or padding, and spare bits a writer would have left zero.
+        for text in [
+            "", "TWF", "TW-_", "TWE", "=WE=", "T===", "TW=u", "TWF=", "TR==",
+        ] {
+            assert!(
+                parse_base64(text.as_bytes(), &mut Vec::new()).is_none(),
+                "{text}"
+            );
         }
     }
 

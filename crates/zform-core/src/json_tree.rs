@@ -2673,7 +2673,7 @@ fn discover_json_derivations(json_rows: &[&[u8]], jt: &mut JsonTreePlan) {
                     (*cnt as f64) >= 0.20 * (uncov.len() as f64) && *cnt >= 4 && *total_saved >= 32
                 })
                 .collect();
-            ranked_tpls.sort_by(|a, b| (b.1).1.cmp(&(a.1).1));
+            ranked_tpls.sort_by(|a, b| (b.1).1.cmp(&(a.1).1).then_with(|| a.0.cmp(&b.0)));
             for ((lits, refs), _) in ranked_tpls {
                 if cands.len() >= MAX_CANDS_PER_PATH {
                     break;

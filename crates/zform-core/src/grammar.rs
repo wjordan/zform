@@ -16,6 +16,7 @@ use crate::lex::{
     parse_traceparent, parse_ulid, parse_uuid, split_email,
 };
 use crate::wire::{Cursor, DecodeBudget, Error, Result, put_bytes, put_uvarint};
+use memchr::memmem::Finder;
 use std::collections::HashMap;
 
 /// Column metadata in a `ModelPlan`.
@@ -36,9 +37,31 @@ pub struct ColumnDef {
 pub struct TemplateVariant {
     pub literals: Vec<Vec<u8>>,
     pub slots: Vec<u16>,
-    /// Longest non-empty interior literal index used as a fast `memmem` anchor during matching.
-    pub anchor_idx: usize,
-    pub min_len: usize,
+    /// Index of the longest interior literal, searched first to reject a line early; 0 if none.
+    anchor_idx: usize,
+    min_len: usize,
+    /// One searcher per literal, built once: building one costs more than searching a line.
+    finders: Vec<Finder<'static>>,
+}
+
+impl TemplateVariant {
+    pub fn new(literals: Vec<Vec<u8>>, slots: Vec<u16>) -> Self {
+        let interior = 1..literals.len().saturating_sub(1);
+        let anchor_idx = interior
+            .rev()
+            .max_by_key(|&i| literals[i].len())
+            .unwrap_or(0);
+        Self {
+            anchor_idx,
+            min_len: literals.iter().map(Vec::len).sum(),
+            finders: literals
+                .iter()
+                .map(|l| Finder::new(l).into_owned())
+                .collect(),
+            literals,
+            slots,
+        }
+    }
 }
 
 /// Envelope prefix wrapper (e.g. Kubernetes CRI `<ts> <stream> <tag> <inner>` or Syslog `<ts> <host> <app>: <inner>`).
@@ -341,28 +364,14 @@ impl ModelPlan {
                 5 => {
                     let k = cur.uvar()? as usize;
                     let mut literals = Vec::with_capacity(k + 1);
-                    let mut min_len = 0usize;
-                    let mut anchor_idx = 0usize;
-                    let mut best_alen = 0usize;
-                    for li in 0..=k {
-                        let b = cur.bytes()?.to_vec();
-                        min_len += b.len();
-                        if li > 0 && li < k && b.len() > best_alen {
-                            best_alen = b.len();
-                            anchor_idx = li;
-                        }
-                        literals.push(b);
+                    for _ in 0..=k {
+                        literals.push(cur.bytes()?.to_vec());
                     }
                     let mut slots = Vec::with_capacity(k);
                     for _ in 0..k {
                         slots.push(cur.uvar()? as u16);
                     }
-                    variants.push(PlanVariant::Template(TemplateVariant {
-                        literals,
-                        slots,
-                        anchor_idx,
-                        min_len,
-                    }));
+                    variants.push(PlanVariant::Template(TemplateVariant::new(literals, slots)));
                 }
                 6 => {
                     let delim = cur.u8()?;
@@ -567,7 +576,7 @@ pub fn parse_logfmt_line(line: &[u8]) -> Option<Vec<LogfmtPair<'_>>> {
 // 3. Rich Observability Template Tokenizer & Matcher
 // ============================================================================
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SlotClass {
     Timestamp,
     Traceparent,
@@ -877,10 +886,8 @@ pub fn match_template<'a>(
         return false;
     }
     if tv.anchor_idx > 0 && tv.anchor_idx < k {
-        let anc = &tv.literals[tv.anchor_idx];
-        if !anc.is_empty()
-            && memchr::memmem::find(&line[prefix.len()..line.len() - suffix.len()], anc).is_none()
-        {
+        let body = &line[prefix.len()..line.len() - suffix.len()];
+        if tv.finders[tv.anchor_idx].find(body).is_none() {
             return false;
         }
     }
@@ -896,7 +903,7 @@ pub fn match_template<'a>(
         if next_lit.is_empty() {
             return false;
         }
-        let Some(rel) = memchr::memmem::find(&line[pos..body_end], next_lit) else {
+        let Some(rel) = tv.finders[s + 1].find(&line[pos..body_end]) else {
             return false;
         };
         let match_at = pos + rel;

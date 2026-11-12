@@ -3,6 +3,7 @@
 //! context-keyed semantic slots, and variable-word refinement), dense horizontal candidate
 //! discovery, `ProbeBackoff`, and `ZFP1` profile serialization.
 
+use crate::codecs::encode_present_slice;
 use crate::framing::{FramingSpec, ResolvedFraming, split_chunk};
 use crate::grammar::{
     BinaryStrideSpec, CsvSpec, EnvelopeKind, EnvelopeSpec, LogfmtSpec, ModelPlan, PlanVariant,
@@ -15,7 +16,7 @@ use crate::wire::{
     Cursor, DecodeBudget, EntropyBackend, Error, Result, compress_leaf, decompress_leaf,
     sha256_hex, xxh64,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub const PROFILE_MAGIC: &[u8; 4] = b"ZFP1";
 pub const SAMPLE_RUN_ROWS: usize = 16;
@@ -214,12 +215,8 @@ pub fn train_from_records(
                         plan.add_or_get_col_with_group(&oc.name, &oc.dict_group)
                     })
                     .collect();
-                plan.variants.push(PlanVariant::Template(TemplateVariant {
-                    literals: tv.literals.clone(),
-                    slots,
-                    anchor_idx: tv.anchor_idx,
-                    min_len: tv.min_len,
-                }));
+                let tv = TemplateVariant::new(tv.literals.clone(), slots);
+                plan.variants.push(PlanVariant::Template(tv));
             }
         }
     }
@@ -362,27 +359,18 @@ fn train_binary_stride(samples: &[&[u8]], stride: u32, plan: &mut ModelPlan) {
     if s == 0 || s > 4096 {
         return;
     }
+    // Fewer trial rows for wider records, so training cost does not grow with the stride.
+    let whole = samples.iter().copied().filter(|r| r.len() == s);
+    let rows: Vec<&[u8]> = whole.take(((1 << 18) / s).max(64)).collect();
     let mut slices = Vec::new();
     let mut off = 0usize;
     while off < s {
-        let rem = s - off;
-        if rem >= 8 && looks_like_f64_field(samples, off) {
-            let cid = plan.add_or_get_col(&format!("$bin.{off}_8"));
-            slices.push((off as u16, 8u16, cid));
-            off += 8;
-        } else if rem >= 4 && looks_like_f32_or_u32_field(samples, off) {
-            let cid = plan.add_or_get_col(&format!("$bin.{off}_4"));
-            slices.push((off as u16, 4u16, cid));
-            off += 4;
-        } else if rem >= 2 {
-            let cid = plan.add_or_get_col(&format!("$bin.{off}_2"));
-            slices.push((off as u16, 2u16, cid));
-            off += 2;
-        } else {
-            let cid = plan.add_or_get_col(&format!("$bin.{off}_1"));
-            slices.push((off as u16, 1u16, cid));
-            off += 1;
+        let w = [8, 4, 2, 1].into_iter().find(|w| off + w <= s).unwrap();
+        for (off, w) in binary_fields(&rows, off, w).1 {
+            let cid = plan.add_or_get_col(&format!("$bin.{off}_{w}"));
+            slices.push((off as u16, w as u16, cid));
         }
+        off += w;
     }
     plan.variants
         .push(PlanVariant::BinaryStride(BinaryStrideSpec {
@@ -391,44 +379,26 @@ fn train_binary_stride(samples: &[&[u8]], stride: u32, plan: &mut ModelPlan) {
         }));
 }
 
-fn looks_like_f64_field(samples: &[&[u8]], off: usize) -> bool {
-    let check = samples.len().min(64);
-    if check < 8 {
-        return false;
-    }
-    let mut finite_norm = 0usize;
-    let mut exp_close = 0usize;
-    let mut prev_exp = 0i32;
-    for (i, &r) in samples.iter().take(check).enumerate() {
-        if r.len() < off + 8 {
-            return false;
+/// The fields in the `w` bytes at `off` and their encoded size over `rows`: one field, or the
+/// fields of each half where those encode an eighth smaller. A narrower gain is not worth
+/// the relations between rows that only the whole value shows.
+fn binary_fields(rows: &[&[u8]], off: usize, w: usize) -> (usize, Vec<(usize, usize)>) {
+    let col: Vec<&[u8]> = rows.iter().map(|r| &r[off..off + w]).collect();
+    let whole = match col.is_empty() {
+        true => 0,
+        false => encode_present_slice(&col, EntropyBackend::Zstd, 3, 0)
+            .3
+            .len(),
+    };
+    if w > 2 {
+        let (a, mut fields) = binary_fields(rows, off, w / 2);
+        let (b, right) = binary_fields(rows, off + w / 2, w / 2);
+        if (a + b) * 8 < whole * 7 {
+            fields.extend(right);
+            return (a + b, fields);
         }
-        let bits = u64::from_le_bytes(r[off..off + 8].try_into().unwrap());
-        let exp = ((bits >> 52) & 0x7ff) as i32;
-        if bits == 0 || (exp > 800 && exp < 1250) {
-            finite_norm += 1;
-        }
-        if i > 0 && (exp - prev_exp).abs() <= 16 {
-            exp_close += 1;
-        }
-        prev_exp = exp;
     }
-    finite_norm * 4 >= check * 3 && exp_close * 2 >= check
-}
-
-fn looks_like_f32_or_u32_field(samples: &[&[u8]], off: usize) -> bool {
-    let check = samples.len().min(64);
-    if check < 8 {
-        return false;
-    }
-    let mut distinct = HashSet::new();
-    for &r in samples.iter().take(check) {
-        if r.len() < off + 4 {
-            return false;
-        }
-        distinct.insert(r[off + 3]);
-    }
-    distinct.len() <= 12
+    (whole, vec![(off, w)])
 }
 
 fn train_logfmt_arm(rows: &[&[u8]], plan: &mut ModelPlan) {
@@ -472,7 +442,7 @@ fn train_logfmt_arm(rows: &[&[u8]], plan: &mut ModelPlan) {
 
 fn train_csv_if_tabular(rows: &[&[u8]], plan: &mut ModelPlan) -> bool {
     for delim in [b',', b'\t'] {
-        let mut counts: HashMap<usize, usize> = HashMap::new();
+        let mut counts: BTreeMap<usize, usize> = BTreeMap::new();
         let probe = rows.len().min(128);
         for &r in rows.iter().take(probe) {
             let approx_n = r.iter().filter(|&&b| b == delim).count() + 1;
@@ -516,14 +486,7 @@ fn pin_constant_slots(
     if k == 0 || matched_lines.len() < 6 {
         return (literals, classes);
     }
-    let dummy_slots: Vec<u16> = (0..k as u16).collect();
-    let min_len: usize = literals.iter().map(|l| l.len()).sum();
-    let tv = TemplateVariant {
-        literals: literals.clone(),
-        slots: dummy_slots,
-        anchor_idx: 0,
-        min_len,
-    };
+    let tv = TemplateVariant::new(literals.clone(), (0..k as u16).collect());
 
     let mut first_vals: Vec<Option<&[u8]>> = vec![None; k];
     let mut varies = vec![false; k];
@@ -583,7 +546,8 @@ fn sanitize_ctx_bytes(slice: &[u8]) -> String {
 
 fn train_templates_arm<'a>(rows: &[&'a [u8]], opts: &TrainOptions, plan: &mut ModelPlan) {
     let min_cluster = if rows.len() >= 64 { 4usize } else { 2usize };
-    let mut clusters: HashMap<(Vec<Vec<u8>>, Vec<SlotClass>), Vec<&'a [u8]>> = HashMap::new();
+    // Ordered maps here and below: the plan must not depend on hash iteration order.
+    let mut clusters: BTreeMap<(Vec<Vec<u8>>, Vec<SlotClass>), Vec<&'a [u8]>> = BTreeMap::new();
     let mut unclustered = Vec::<&'a [u8]>::new();
 
     for &line in rows {
@@ -694,27 +658,13 @@ fn train_templates_arm<'a>(rows: &[&'a [u8]], opts: &TrainOptions, plan: &mut Mo
             slots.push(cid);
         }
 
-        let mut min_len = 0usize;
-        let mut anchor_idx = 0usize;
-        let mut best_alen = 0usize;
-        for (li, l) in literals.iter().enumerate() {
-            min_len += l.len();
-            if li > 0 && li < literals.len() - 1 && l.len() > best_alen {
-                best_alen = l.len();
-                anchor_idx = li;
-            }
-        }
         let already = plan.variants.iter().any(|v| match v {
             PlanVariant::Template(tv) => tv.literals == literals,
             _ => false,
         });
         if !already {
-            plan.variants.push(PlanVariant::Template(TemplateVariant {
-                literals,
-                slots,
-                anchor_idx,
-                min_len,
-            }));
+            plan.variants
+                .push(PlanVariant::Template(TemplateVariant::new(literals, slots)));
         }
     }
 }
@@ -723,7 +673,7 @@ fn refine_variable_word_templates<'a>(
     lines: &[&'a [u8]],
     min_cluster: usize,
 ) -> Vec<((Vec<Vec<u8>>, Vec<SlotClass>), Vec<&'a [u8]>)> {
-    let mut by_len: HashMap<usize, Vec<(&'a [u8], Vec<&'a [u8]>)>> = HashMap::new();
+    let mut by_len: BTreeMap<usize, Vec<(&'a [u8], Vec<&'a [u8]>)>> = BTreeMap::new();
     for &line in lines {
         if line.contains(&b'\t') || line.len() > 1024 {
             continue;
@@ -738,7 +688,7 @@ fn refine_variable_word_templates<'a>(
         if group.len() < min_cluster {
             continue;
         }
-        let mut subgroups: HashMap<Vec<u8>, Vec<&(&'a [u8], Vec<&'a [u8]>)>> = HashMap::new();
+        let mut subgroups: BTreeMap<Vec<u8>, Vec<&(&'a [u8], Vec<&'a [u8]>)>> = BTreeMap::new();
         for item in &group {
             let w = &item.1;
             let mut key = Vec::new();
@@ -890,5 +840,38 @@ fn discover_horizontal_candidates(samples: &[&[u8]], plan: &mut ModelPlan) {
         cands.sort_by(|a, b| b.1.cmp(&a.1));
         cands.truncate(6);
         plan.columns[target].horiz_candidates = cands.into_iter().map(|x| x.0).collect();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn binary_fields_split_where_halves_encode_smaller() {
+        // A slowly rising double, then a tag, a counter and a float from a small set.
+        let rows: Vec<Vec<u8>> = (0..2000u32)
+            .map(|i| {
+                let mix = i.wrapping_mul(2_654_435_761);
+                let mut r = (1.0 + f64::from(i) * 1e-5 + f64::from(mix) * 1e-16)
+                    .to_le_bytes()
+                    .to_vec();
+                r.extend([b'G', b'0' + (i % 8) as u8]);
+                r.extend((400 + (i % 650) as u16).to_le_bytes());
+                r.extend((f32::from((mix >> 24) as u8) * 1e-8).to_le_bytes());
+                r
+            })
+            .collect();
+        let rows: Vec<&[u8]> = rows.iter().map(|r| r.as_slice()).collect();
+        assert_eq!(binary_fields(&rows, 0, 8).1, [(0, 8)]);
+        assert_eq!(binary_fields(&rows, 8, 8).1, [(8, 4), (12, 4)]);
+
+        let mut plan = ModelPlan::default();
+        train_binary_stride(&rows, 16, &mut plan);
+        let Some(PlanVariant::BinaryStride(spec)) = plan.variants.last() else {
+            panic!("no stride variant");
+        };
+        let fields = spec.slices.iter().map(|&(off, w, _)| (off, w));
+        assert_eq!(fields.collect::<Vec<_>>(), [(0, 8), (8, 4), (12, 4)]);
     }
 }

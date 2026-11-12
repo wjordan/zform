@@ -4,17 +4,21 @@
 
 use crate::cells::{Cells, Col, NULL_CELL, ends_of};
 use crate::lex::{
-    format_exact_decimal, format_exact_int, format_hex_bytes, format_ipv4_or_port,
-    format_traceparent, format_ulid, format_uuid, parse_exact_decimal, parse_exact_int,
-    parse_hex_exact, parse_ipv4_or_port, parse_timestamp, parse_traceparent, parse_ulid,
-    parse_uuid, split_email, split_hierarchical,
+    format_base64, format_exact_decimal, format_exact_int, format_hex_bytes, format_ipv4_or_port,
+    format_traceparent, format_ulid, format_uuid, parse_base64, parse_exact_decimal,
+    parse_exact_int, parse_hex_exact, parse_ipv4_or_port, parse_timestamp, parse_traceparent,
+    parse_ulid, parse_uuid, split_email, split_hierarchical,
 };
 use crate::wire::{
     Cursor, DecodeBudget, EntropyBackend, Error, Result, compress_leaf, decompress_leaf,
     put_ivarint, put_uvarint,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+mod lcg;
+mod mt;
+pub(crate) use mt::{Seeds, with_seeds};
 
 // ============================================================================
 // 1. Per-Column Block Summary
@@ -179,8 +183,20 @@ fn bitunpack_u64(src: &[u8], count: usize, width: u8, budget: &DecodeBudget) -> 
     Ok(out)
 }
 
-/// Encodes a slice of `u32` ordinals/tags using the smallest of `Const`, `RLE`, `FOR bitpack`, or `uvarint`.
+/// Encodes a slice of `u32` ordinals/tags using the smallest of `Const`, `RLE`, `FOR bitpack`,
+/// byte planes, delta or bytes with a continued tail.
 pub fn encode_u32_seq(vals: &[u32], backend: EntropyBackend, level: i32, out: &mut Vec<u8>) {
+    encode_u32_seq_with(vals, backend, level, true, out);
+}
+
+/// `tail` allows the mode that nests a second sequence.
+fn encode_u32_seq_with(
+    vals: &[u32],
+    backend: EntropyBackend,
+    level: i32,
+    tail: bool,
+    out: &mut Vec<u8>,
+) {
     put_uvarint(out, vals.len() as u64);
     if vals.is_empty() {
         return;
@@ -281,11 +297,43 @@ pub fn encode_u32_seq(vals: &[u32], backend: EntropyBackend, level: i32, out: &m
         }
     }
 
+    // Candidate 5: one byte per value, those of 255 and over continued in a second sequence.
+    // Recency ranks and frequency-ordered ordinals have a long tail, whose low bytes are noise
+    // in a byte plane; here the common values keep a plane to themselves.
+    if tail && vals.len() >= 64 && span > 0xff {
+        let mut bytes = Vec::with_capacity(vals.len());
+        let mut over = Vec::new();
+        for &s in &shifted {
+            bytes.push(s.min(0xff) as u8);
+            if s >= 0xff {
+                over.push((s - 0xff) as u32);
+            }
+        }
+        if over.len() * 2 <= vals.len() {
+            let mut cand = Vec::new();
+            put_uvarint(&mut cand, min_v as u64);
+            compress_leaf(&mut cand, &bytes, backend, level);
+            encode_u32_seq_with(&over, backend, level, false, &mut cand);
+            if cand.len() < best_buf.len() {
+                best_mode = 5;
+                best_buf = cand;
+            }
+        }
+    }
+
     out.push(best_mode);
     out.extend_from_slice(&best_buf);
 }
 
 pub fn decode_u32_seq(cur: &mut Cursor<'_>, budget: &DecodeBudget) -> Result<Vec<u32>> {
+    decode_u32_seq_with(cur, budget, true)
+}
+
+fn decode_u32_seq_with(
+    cur: &mut Cursor<'_>,
+    budget: &DecodeBudget,
+    tail: bool,
+) -> Result<Vec<u32>> {
     let n = cur.uvar()? as usize;
     if n > budget.max_records_per_block * 4 {
         return Err(Error::BudgetExceeded("u32 sequence count"));
@@ -366,17 +414,61 @@ pub fn decode_u32_seq(cur: &mut Cursor<'_>, budget: &DecodeBudget) -> Result<Vec
             }
             Ok(out)
         }
+        5 if tail => {
+            let min_v = cur.uvar()? as u32;
+            let bytes = decompress_leaf(cur, budget)?;
+            let mut over = decode_u32_seq_with(cur, budget, false)?.into_iter();
+            if bytes.len() != n {
+                return Err(Error::Format("u32 byte buffer mismatch".into()));
+            }
+            budget.check_alloc(n * 4, "u32 byte seq")?;
+            let mut out = Vec::with_capacity(n);
+            for b in bytes {
+                let v = match b {
+                    0xff => {
+                        0xff + over
+                            .next()
+                            .ok_or_else(|| Error::Format("u32 tail underflow".into()))?
+                            as u64
+                    }
+                    b => b as u64,
+                };
+                out.push(min_v.wrapping_add(v as u32));
+            }
+            if over.next().is_some() {
+                return Err(Error::Format("u32 tail overflow".into()));
+            }
+            Ok(out)
+        }
         m => Err(Error::Format(format!("unknown u32 seq mode {m}"))),
     }
 }
 
+/// The transforms a sequence may apply. Each hands what it leaves to a nested sequence, which
+/// is allowed the rest.
+const ALLOW_RECENCY: u8 = 1;
+const ALLOW_GENERATOR: u8 = 2;
+
 /// Encodes `i64` sequences choosing the smallest of:
 /// `0 = Const`, `1 = Plain FOR`, `2 = GCD-scaled Delta-ZigZag`, `3 = GCD-scaled Delta-of-Delta`,
-/// `4 = MTF-4096 recency + unique i64 table` (crushes interleaved 64-bit block/request IDs!).
+/// `5 = FOR byte planes`, `6 = delta byte planes`, `7 = generator positions` and
+/// `8 = MTF-4096 recency`, whose new values are a sequence of their own (interleaved 64-bit
+/// block and request ids). Mode `4`, recency with raw new values, is only read.
 pub fn encode_i64_seq(vals: &[i64], backend: EntropyBackend, level: i32, out: &mut Vec<u8>) {
+    encode_i64_seq_with(vals, backend, level, ALLOW_RECENCY | ALLOW_GENERATOR, out);
+}
+
+/// Returns the mode it chose.
+fn encode_i64_seq_with(
+    vals: &[i64],
+    backend: EntropyBackend,
+    level: i32,
+    allow: u8,
+    out: &mut Vec<u8>,
+) -> u8 {
     put_uvarint(out, vals.len() as u64);
     if vals.is_empty() {
-        return;
+        return 0;
     }
     let first = vals[0];
     let mut min_v = first;
@@ -388,14 +480,40 @@ pub fn encode_i64_seq(vals: &[i64], backend: EntropyBackend, level: i32, out: &m
     if min_v == max_v {
         out.push(0);
         put_ivarint(out, first);
-        return;
+        return 0;
     }
+    let span = (max_v as i128) - (min_v as i128);
 
     let mut best_mode = 2u8;
     let mut best_payload = Vec::new();
 
+    // Candidates 8 and 7: MTF-4096 recency coding (repeated high-entropy 64-bit ids like HDFS
+    // `blk_<i64>`), else generator positions; behind recency those replace its new values and
+    // not every repeat. Generator outputs are noise to the candidates below, so a match is
+    // final and skips them.
+    if allow & ALLOW_RECENCY != 0
+        && vals.len() >= 32
+        && let Some((cand, new_values)) =
+            try_encode_i64_mtf(vals, backend, level, allow & !ALLOW_RECENCY)
+    {
+        best_mode = 8;
+        best_payload = cand;
+        if new_values == 7 {
+            out.push(best_mode);
+            out.extend_from_slice(&best_payload);
+            return best_mode;
+        }
+    } else if allow & ALLOW_GENERATOR != 0
+        && vals.len() >= 4
+        && span > (1i128 << 48)
+        && let Some(cand) = lcg::encode(vals, backend, level)
+    {
+        out.push(7);
+        out.extend_from_slice(&cand);
+        return 7;
+    }
+
     // Candidate 1: Plain FOR bitpack (if unsigned span fits u64 without wrapping ambiguity)
-    let span = (max_v as i128) - (min_v as i128);
     if span >= 0 && span <= u64::MAX as i128 {
         let span_u = span as u64;
         let width = if span_u == u64::MAX {
@@ -413,8 +531,10 @@ pub fn encode_i64_seq(vals: &[i64], backend: EntropyBackend, level: i32, out: &m
         put_ivarint(&mut cand, min_v);
         cand.push(width);
         compress_leaf(&mut cand, &pk, backend, level);
-        best_mode = 1;
-        best_payload = cand;
+        if best_payload.is_empty() || cand.len() < best_payload.len() {
+            best_mode = 1;
+            best_payload = cand;
+        }
     }
 
     // Candidate 2: GCD-normalized First-Order Delta
@@ -515,15 +635,6 @@ pub fn encode_i64_seq(vals: &[i64], backend: EntropyBackend, level: i32, out: &m
         }
     }
 
-    // Candidate 4: MTF-4096 Recency Coding (for repeated high-entropy 64-bit IDs like HDFS `blk_<i64>`)
-    if vals.len() >= 32
-        && let Some(cand) = try_encode_i64_mtf(vals, backend, level)
-        && cand.len() < best_payload.len()
-    {
-        best_mode = 4;
-        best_payload = cand;
-    }
-
     // Candidate 5 (`PACK_PLANES`): Byte-Plane Transposed FOR
     if vals.len() >= 24 && span >= 0 && span <= u64::MAX as i128 {
         let span_u = span as u64;
@@ -607,9 +718,16 @@ pub fn encode_i64_seq(vals: &[i64], backend: EntropyBackend, level: i32, out: &m
 
     out.push(best_mode);
     out.extend_from_slice(&best_payload);
+    best_mode
 }
 
 pub fn decode_i64_seq(cur: &mut Cursor<'_>, budget: &DecodeBudget) -> Result<Vec<i64>> {
+    decode_i64_seq_at(cur, budget, 0)
+}
+
+/// `depth` counts the sequences this one is nested in. Two deep is the limit, which bounds
+/// the recursion on untrusted input.
+fn decode_i64_seq_at(cur: &mut Cursor<'_>, budget: &DecodeBudget, depth: u8) -> Result<Vec<i64>> {
     let n = cur.uvar()? as usize;
     if n > budget.max_records_per_block * 4 {
         return Err(Error::BudgetExceeded("i64 sequence count"));
@@ -671,7 +789,25 @@ pub fn decode_i64_seq(cur: &mut Cursor<'_>, budget: &DecodeBudget) -> Result<Vec
             }
             Ok(out)
         }
-        4 => decode_i64_mtf(cur, n, budget),
+        4 => {
+            let codes = decode_u32_seq(cur, budget)?;
+            let m = cur.uvar()? as usize;
+            if m > n {
+                return Err(Error::Format("i64 MTF miss count > n".into()));
+            }
+            let planes = decompress_leaf(cur, budget)?;
+            if planes.len() != m * 8 {
+                return Err(Error::Format("i64 MTF miss byte length mismatch".into()));
+            }
+            let misses = (0..m).map(|i| {
+                let mut b = [0u8; 8];
+                for p in 0..8 {
+                    b[p] = planes[p * m + i];
+                }
+                i64::from_le_bytes(b)
+            });
+            decode_i64_mtf(codes, misses, n, budget)
+        }
         5 => {
             let min_v = cur.ivar()?;
             let bw = cur.u8()? as usize;
@@ -722,6 +858,12 @@ pub fn decode_i64_seq(cur: &mut Cursor<'_>, budget: &DecodeBudget) -> Result<Vec
                 out.push(acc);
             }
             Ok(out)
+        }
+        7 if depth < 2 => lcg::decode(cur, n, budget, depth),
+        8 if depth < 2 => {
+            let codes = decode_u32_seq(cur, budget)?;
+            let misses = decode_i64_seq_at(cur, budget, depth + 1)?;
+            decode_i64_mtf(codes, misses.into_iter(), n, budget)
         }
         m => Err(Error::Format(format!("unknown i64 seq mode {m}"))),
     }
@@ -781,16 +923,27 @@ impl<T: Copy + Default + PartialEq> Recency<T> {
 }
 
 /// Bounded Move-to-Front (`W = 4096`) recency coder for `i64` identifier streams:
-/// code `0` = miss (pop next literal from `misses` stream and insert at front);
+/// code `0` = miss (the next value of the nested `misses` sequence, inserted at the front);
 /// code `1..=W` = hit at 1-based recency rank `r` (move entry `r-1` to front).
-fn try_encode_i64_mtf(vals: &[i64], backend: EntropyBackend, level: i32) -> Option<Vec<u8>> {
+/// Returns the payload and the mode of the miss sequence.
+fn try_encode_i64_mtf(
+    vals: &[i64],
+    backend: EntropyBackend,
+    level: i32,
+    allow: u8,
+) -> Option<(Vec<u8>, u8)> {
     const W: usize = 4096;
     let mut ring = Recency::new(W, vals.len());
     let mut codes = Vec::<u32>::with_capacity(vals.len());
     let mut misses = Vec::<i64>::new();
     let mut hits = 0usize;
+    // A value seen for the first time is a miss without a search of the window, which is
+    // every value of a column of counters or timestamps.
+    let mut seen = HashSet::new();
     for &v in vals {
-        if let Some(pos) = ring.rank(v) {
+        if !seen.insert(v)
+            && let Some(pos) = ring.rank(v)
+        {
             hits += 1;
             codes.push((pos + 1) as u32);
             ring.hit(pos);
@@ -806,49 +959,28 @@ fn try_encode_i64_mtf(vals: &[i64], backend: EntropyBackend, level: i32) -> Opti
     }
     let mut out = Vec::new();
     encode_u32_seq(&codes, backend, level, &mut out);
-    // Encode misses via raw little-endian 8-byte lanes (byte-shuffled!) + entropy leaf
-    put_uvarint(&mut out, misses.len() as u64);
-    let mut planes = vec![0u8; misses.len() * 8];
-    let m = misses.len();
-    for (i, &v) in misses.iter().enumerate() {
-        let b = v.to_le_bytes();
-        for p in 0..8 {
-            planes[p * m + i] = b[p];
-        }
-    }
-    compress_leaf(&mut out, &planes, backend, level);
-    Some(out)
+    let mode = encode_i64_seq_with(&misses, backend, level, allow, &mut out);
+    Some((out, mode))
 }
 
-fn decode_i64_mtf(cur: &mut Cursor<'_>, n: usize, budget: &DecodeBudget) -> Result<Vec<i64>> {
+fn decode_i64_mtf(
+    codes: Vec<u32>,
+    mut misses: impl Iterator<Item = i64>,
+    n: usize,
+    budget: &DecodeBudget,
+) -> Result<Vec<i64>> {
     const W: usize = 4096;
-    let codes = decode_u32_seq(cur, budget)?;
     if codes.len() != n {
         return Err(Error::Format("i64 MTF code count mismatch".into()));
     }
-    let m = cur.uvar()? as usize;
-    if m > n {
-        return Err(Error::Format("i64 MTF miss count > n".into()));
-    }
-    let planes = decompress_leaf(cur, budget)?;
-    if planes.len() != m * 8 {
-        return Err(Error::Format("i64 MTF miss byte length mismatch".into()));
-    }
     let mut ring = Recency::new(W, n);
-    let mut miss_idx = 0usize;
     budget.check_alloc(n * 8, "i64 MTF output")?;
     let mut out = Vec::with_capacity(n);
     for c in codes {
         if c == 0 {
-            if miss_idx >= m {
-                return Err(Error::Format("i64 MTF miss underflow".into()));
-            }
-            let mut b = [0u8; 8];
-            for p in 0..8 {
-                b[p] = planes[p * m + miss_idx];
-            }
-            miss_idx += 1;
-            let v = i64::from_le_bytes(b);
+            let v = misses
+                .next()
+                .ok_or_else(|| Error::Format("i64 MTF miss underflow".into()))?;
             ring.push(v);
             out.push(v);
         } else {
@@ -857,6 +989,9 @@ fn decode_i64_mtf(cur: &mut Cursor<'_>, n: usize, budget: &DecodeBudget) -> Resu
                 .ok_or_else(|| Error::Format("i64 MTF rank out of bounds".into()))?;
             out.push(v);
         }
+    }
+    if misses.next().is_some() {
+        return Err(Error::Format("i64 MTF miss overflow".into()));
     }
     Ok(out)
 }
@@ -1143,6 +1278,7 @@ pub enum LeafCodecTag {
     QuotedOrNull = 15,
     HexId = 16,
     ProseSlice = 17,
+    Base64 = 18,
 }
 
 pub(crate) fn encode_present_slice(
@@ -1358,7 +1494,16 @@ pub(crate) fn encode_present_slice(
         best_num = (0, 0, 0);
     }
 
-    // 12. JSON Quoted-or-Null Wrapper (`"..."` lexemes + optional `null` literals -> unquoted typed codecs!)
+    // 12. Base64 (decoded bytes, which may in turn be a generator's)
+    if p0.len() >= 16
+        && let Some(cand) = try_encode_base64(vals, backend, level)
+        && cand.len() < best_body.len()
+    {
+        best_body = cand;
+        best_num = (0, 0, 0);
+    }
+
+    // 13. JSON Quoted-or-Null Wrapper (`"..."` lexemes + optional `null` literals -> unquoted typed codecs!)
     if depth == 0 && (p0.starts_with(b"\"") || p0 == b"null") {
         let mut null_count = 0usize;
         let mut str_count = 0usize;
@@ -1469,8 +1614,10 @@ fn try_encode_inline_dict(vals: &[&[u8]], backend: EntropyBackend, level: i32) -
     encode_u32_seq(&ords, backend, level, &mut ord_static);
 
     let mut best_ord = ord_static;
-    if table.entries.len() >= 16 && vals.len() >= 64 {
-        let mtf_ranks = mtf_transform_u32(&ords, 4096);
+    if table.entries.len() >= 16
+        && vals.len() >= 64
+        && let Some(mtf_ranks) = mtf_transform_u32(&ords, 4096)
+    {
         let mut ord_mtf = Vec::new();
         ord_mtf.push(1u8); // submode 1 = MTF-4096 transformed ordinals
         encode_u32_seq(&mtf_ranks, backend, level, &mut ord_mtf);
@@ -1509,19 +1656,33 @@ fn try_encode_inline_dict(vals: &[&[u8]], backend: EntropyBackend, level: i32) -
 /// Reversible Move-to-Front transform over `0..vocab_size` ordinals with bounded window `W`:
 /// `rank == 0..W` if found in `ring` at `rank` (encoded as `rank * 2 + 1`),
 /// or literal `ord` when not in `ring` (encoded as `ord * 2`, inserting `ord` at front).
-fn mtf_transform_u32(ords: &[u32], window: usize) -> Vec<u32> {
+///
+/// `None` when recency is no cheap predictor: few of the first ordinals repeat one of the 64
+/// before them, or ranks take over 64 steps to find on average.
+fn mtf_transform_u32(ords: &[u32], window: usize) -> Option<Vec<u32>> {
+    let head = &ords[..ords.len().min(4096)];
+    let near = |i: &usize| head[i.saturating_sub(64)..*i].contains(&head[*i]);
+    if (1..head.len()).filter(near).count() * 8 < head.len() {
+        return None;
+    }
     let mut ring = Recency::new(window, ords.len());
     let mut out = Vec::with_capacity(ords.len());
-    for &o in ords {
+    let mut steps = 0;
+    for (i, &o) in ords.iter().enumerate() {
+        if i % 4096 == 4095 && steps > 64 * i {
+            return None;
+        }
         if let Some(pos) = ring.rank(o) {
             out.push((pos as u32) * 2 + 1);
             ring.hit(pos);
+            steps += pos;
         } else {
             out.push(o.saturating_mul(2));
             ring.push(o);
+            steps += ring.len;
         }
     }
-    out
+    Some(out)
 }
 
 fn mtf_untransform_u32(codes: &[u32], window: usize, vocab: usize) -> Result<Vec<u32>> {
@@ -1578,7 +1739,14 @@ fn encode_fixed_bytes_mtf(
     put_uvarint(out, width as u64);
     encode_u32_seq(&codes, backend, level, out);
     put_uvarint(out, (misses.len() / width.max(1)) as u64);
-    compress_leaf(out, &misses, backend, level);
+    mt::encode_leaf(
+        out,
+        &misses,
+        width,
+        &[mt::Layout::Le, mt::Layout::Be],
+        backend,
+        level,
+    );
 }
 
 /// Decodes `n` rows of one byte width, returned back to back.
@@ -1597,7 +1765,7 @@ fn decode_fixed_bytes_mtf(
         return Err(Error::Format("fixed MTF code count mismatch".into()));
     }
     let n_miss = cur.uvar()? as usize;
-    let misses = decompress_leaf(cur, budget)?;
+    let misses = mt::decode_leaf(cur, budget)?;
     if misses.len() != n_miss.saturating_mul(width) {
         return Err(Error::Format("fixed MTF misses length mismatch".into()));
     }
@@ -1649,7 +1817,7 @@ fn try_encode_uuids(vals: &[&[u8]], backend: EntropyBackend, level: i32) -> Opti
             tails.extend_from_slice(&b[6..16]);
         }
         encode_i64_seq(&ts_ms, backend, level, &mut out);
-        compress_leaf(&mut out, &tails, backend, level);
+        mt::encode_leaf(&mut out, &tails, 10, &[mt::Layout::Uuid7], backend, level);
     } else {
         out.push(0); // General UUID + MTF-4096 recency!
         let refs: Vec<&[u8]> = raw16.iter().map(|b| b.as_slice()).collect();
@@ -1685,7 +1853,14 @@ fn try_encode_traceparents(vals: &[&[u8]], backend: EntropyBackend, level: i32) 
     let mut out = vec![LeafCodecTag::Traceparent as u8];
     let t_refs: Vec<&[u8]> = tids.iter().map(|t| t.as_slice()).collect();
     encode_fixed_bytes_mtf(&t_refs, 16, backend, level, &mut out);
-    compress_leaf(&mut out, &sids, backend, level);
+    mt::encode_leaf(
+        &mut out,
+        &sids,
+        8,
+        &[mt::Layout::Le, mt::Layout::Be],
+        backend,
+        level,
+    );
     encode_u32_seq(&flags, backend, level, &mut out);
     Some(out)
 }
@@ -1717,7 +1892,14 @@ fn try_encode_hex_id(vals: &[&[u8]], backend: EntropyBackend, level: i32) -> Opt
     encode_u32_seq(&uppers, backend, level, &mut out);
     encode_u32_seq(&codes, backend, level, &mut out);
     put_uvarint(&mut out, (misses.len() / byte_w.max(1)) as u64);
-    compress_leaf(&mut out, &misses, backend, level);
+    mt::encode_leaf(
+        &mut out,
+        &misses,
+        byte_w,
+        &[mt::Layout::Le, mt::Layout::Be],
+        backend,
+        level,
+    );
     Some(out)
 }
 
@@ -1739,6 +1921,20 @@ fn try_encode_hex_mtf(vals: &[&[u8]], backend: EntropyBackend, level: i32) -> Op
     encode_u32_seq(&uppers, backend, level, &mut out);
     let refs: Vec<&[u8]> = bins.iter().map(|b| b.as_slice()).collect();
     encode_fixed_bytes_mtf(&refs, byte_w, backend, level, &mut out);
+    Some(out)
+}
+
+fn try_encode_base64(vals: &[&[u8]], backend: EntropyBackend, level: i32) -> Option<Vec<u8>> {
+    let mut lens = Vec::with_capacity(vals.len());
+    let mut bytes = Vec::new();
+    for &v in vals {
+        let at = bytes.len();
+        parse_base64(v, &mut bytes)?;
+        lens.push((bytes.len() - at) as u32);
+    }
+    let mut out = vec![LeafCodecTag::Base64 as u8];
+    encode_u32_seq(&lens, backend, level, &mut out);
+    mt::encode_leaf(&mut out, &bytes, 4, &[mt::Layout::Le], backend, level);
     Some(out)
 }
 
@@ -1851,6 +2047,16 @@ fn try_encode_fixed_binary(
         compress_leaf(&mut cand, &delta_shuf, backend, level);
         if cand.len() < best_payload.len() {
             best_sub = 1;
+            best_payload = cand;
+        }
+        // Submode 3: doubles that step by draws of a generator.
+        let rows = vals.concat();
+        let mut cand = Vec::new();
+        if let Some(walk) = mt::Layout::walk(&rows)
+            && mt::try_leaf(&mut cand, &rows, 8, &[walk], backend, level)
+            && cand.len() < best_payload.len()
+        {
+            best_sub = 3;
             best_payload = cand;
         }
     } else if width == 4 {
@@ -2051,7 +2257,7 @@ pub(crate) fn decode_present_slice_ctx(
             }
             if cur.u8()? == 1 {
                 let ts_ms = decode_i64_seq(cur, budget)?;
-                let tails = decompress_leaf(cur, budget)?;
+                let tails = mt::decode_leaf(cur, budget)?;
                 if ts_ms.len() != n || tails.len() != n * 10 {
                     return Err(Error::Format("UUIDv7 length mismatch".into()));
                 }
@@ -2088,7 +2294,7 @@ pub(crate) fn decode_present_slice_ctx(
         }
         9 => {
             let (w, tids) = decode_fixed_bytes_mtf(cur, n, budget)?;
-            let sids = decompress_leaf(cur, budget)?;
+            let sids = mt::decode_leaf(cur, budget)?;
             let flags = decode_u32_seq(cur, budget)?;
             if w != 16 || sids.len() != n * 8 || flags.len() != n {
                 return Err(Error::Format("traceparent length mismatch".into()));
@@ -2150,11 +2356,18 @@ pub(crate) fn decode_present_slice_ctx(
         14 => {
             let width = cur.uvar()? as usize;
             let sub = cur.u8()?;
-            let shuf = decompress_leaf(cur, budget)?;
+            let shuf = match sub {
+                3 => mt::decode_leaf(cur, budget)?,
+                _ => decompress_leaf(cur, budget)?,
+            };
             if width == 0 || width > 64 || shuf.len() != n.saturating_mul(width) {
                 return Err(Error::Format("FixedBinary length mismatch".into()));
             }
             match sub {
+                3 => formatted(n, width, |r, out| {
+                    out.extend_from_slice(&shuf[r * width..][..width]);
+                    Ok(())
+                }),
                 0 => formatted(n, width, |r, out| {
                     out.extend((0..width).map(|b| shuf[b * n + r]));
                     Ok(())
@@ -2237,7 +2450,7 @@ pub(crate) fn decode_present_slice_ctx(
             let uppers = decode_u32_seq(cur, budget)?;
             let codes = decode_u32_seq(cur, budget)?;
             let n_miss = cur.uvar()? as usize;
-            let misses = decompress_leaf(cur, budget)?;
+            let misses = mt::decode_leaf(cur, budget)?;
             if uppers.len() != n
                 || codes.len() != n
                 || misses.len() != n_miss.saturating_mul(byte_w)
@@ -2288,6 +2501,22 @@ pub(crate) fn decode_present_slice_ctx(
                 pool,
                 base,
                 ends: ends_of(&lens, byte_len)?,
+            })
+        }
+        18 => {
+            let lens = decode_u32_seq(cur, budget)?;
+            let bytes = mt::decode_leaf(cur, budget)?;
+            let total: u64 = lens.iter().map(|&l| u64::from(l)).sum();
+            if lens.len() != n || total != bytes.len() as u64 {
+                return Err(Error::Format("Base64 length mismatch".into()));
+            }
+            budget.check_alloc(bytes.len() / 3 * 4 + 4 * n, "Base64 output")?;
+            let mut rest = bytes.as_slice();
+            formatted(n, bytes.len() / 3 * 4 / n.max(1) + 4, |i, out| {
+                let (cell, tail) = rest.split_at(lens[i] as usize);
+                format_base64(cell, out);
+                rest = tail;
+                Ok(())
             })
         }
         tag => Err(Error::Format(format!("unknown leaf codec tag {tag}"))),
@@ -2946,8 +3175,10 @@ pub fn encode_dense_block_columns(
                 let mut ord_static = vec![0u8];
                 encode_u32_seq(&ords, backend, level, &mut ord_static);
                 let mut best_ord = ord_static;
-                if table.entries.len() >= 16 && vals.len() >= 64 {
-                    let mtf_ranks = mtf_transform_u32(&ords, 4096);
+                if table.entries.len() >= 16
+                    && vals.len() >= 64
+                    && let Some(mtf_ranks) = mtf_transform_u32(&ords, 4096)
+                {
                     let mut ord_mtf = vec![1u8];
                     encode_u32_seq(&mtf_ranks, backend, level, &mut ord_mtf);
                     if ord_mtf.len() < best_ord.len() {
@@ -3360,6 +3591,21 @@ pub fn ensure_dense_block_column<'c>(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn mtf_ordinals_need_cheap_recency() {
+        let runs: Vec<u32> = (0..9000).map(|i| i / 40 % 300).collect();
+        let ranks = mtf_transform_u32(&runs, 4096).unwrap();
+        assert_eq!(mtf_untransform_u32(&ranks, 4096, 300).unwrap(), runs);
+        // No value near its last use.
+        let spread: Vec<u32> = (0..9000u32)
+            .map(|i| i.wrapping_mul(2_654_435_761) >> 22)
+            .collect();
+        assert!(mtf_transform_u32(&spread, 4096).is_none());
+        // Pairs, each 2000 values after the pair before it: half the ranks are deep.
+        let deep: Vec<u32> = (0..9000).map(|i| i / 2 % 2000).collect();
+        assert!(mtf_transform_u32(&deep, 4096).is_none());
+    }
+
+    #[test]
     fn recency_matches_a_shifted_list() {
         let (window, n) = (5usize, 400usize);
         let mut ring = super::Recency::<u32>::new(window, n);
@@ -3386,6 +3632,115 @@ mod tests {
     }
 
     use super::*;
+
+    const Z: EntropyBackend = EntropyBackend::Zstd;
+
+    fn noise(x: &mut u32) -> u32 {
+        *x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+        *x >> 16
+    }
+
+    #[test]
+    fn long_tailed_ordinals_keep_a_byte_plane() {
+        let budget = DecodeBudget::default();
+        // Small values with one in eight from a tail up to 4,000, as recency ranks are.
+        let mut x = 1u32;
+        let vals: Vec<u32> = (0..4000)
+            .map(|_| match noise(&mut x) % 8 {
+                0 => 255 + noise(&mut x) % 3745,
+                _ => noise(&mut x) % 40,
+            })
+            .collect();
+        let (mut enc, mut flat) = (Vec::new(), Vec::new());
+        encode_u32_seq(&vals, Z, 3, &mut enc);
+        encode_u32_seq_with(&vals, Z, 3, false, &mut flat);
+        assert_eq!(enc[2], 5);
+        assert!(
+            enc.len() * 10 < flat.len() * 9,
+            "{} {}",
+            enc.len(),
+            flat.len()
+        );
+        assert_eq!(
+            decode_u32_seq(&mut Cursor::new(&enc), &budget).unwrap(),
+            vals
+        );
+        for end in 0..enc.len() {
+            assert!(decode_u32_seq(&mut Cursor::new(&enc[..end]), &budget).is_err());
+        }
+
+        let build = |bytes: &[u8], over: &[u8]| {
+            let mut b = vec![bytes.len() as u8, 5, 0];
+            compress_leaf(&mut b, bytes, EntropyBackend::Raw, 3);
+            b.extend_from_slice(over);
+            b
+        };
+        // Two values past 254, continued as the constant 7.
+        let ok = build(&[1, 255, 255], &[2, 0, 7]);
+        assert_eq!(
+            decode_u32_seq(&mut Cursor::new(&ok), &budget).unwrap(),
+            [1, 262, 262]
+        );
+        for bad in [
+            build(&[1, 255, 255], &[1, 0, 7]),
+            build(&[1, 255, 255], &[3, 0, 7]),
+            build(&[1, 255], &[2, 0, 7]),
+            // The tail is not continued again.
+            [
+                build(&[1, 255, 255], &[2, 5, 0]),
+                build(&[9, 9], &[0])[3..].to_vec(),
+            ]
+            .concat(),
+        ] {
+            assert!(decode_u32_seq(&mut Cursor::new(&bad), &budget).is_err());
+        }
+    }
+
+    #[test]
+    fn recency_stores_new_values_as_a_sequence() {
+        let budget = DecodeBudget::default();
+        // 500 ids a thousand apart, each referenced eight times among its neighbours.
+        let mut x = 3u32;
+        let vals: Vec<i64> = (0..4000usize)
+            .map(|i| 1_000_000_000_000_000 + ((i / 8 + noise(&mut x) as usize % 6) as i64) * 1000)
+            .collect();
+        let mut enc = Vec::new();
+        assert_eq!(encode_i64_seq_with(&vals, Z, 3, ALLOW_RECENCY, &mut enc), 8);
+        assert!(enc.len() < 4000, "{}", enc.len());
+        assert_eq!(
+            decode_i64_seq(&mut Cursor::new(&enc), &budget).unwrap(),
+            vals
+        );
+        for end in 0..enc.len() {
+            assert!(decode_i64_seq(&mut Cursor::new(&enc[..end]), &budget).is_err());
+        }
+
+        // Codes: new, new, the older of the two, new.
+        let build = |mode: u8, new: &[i64]| {
+            let mut b = vec![4, mode];
+            encode_u32_seq(&[0, 0, 2, 0], Z, 3, &mut b);
+            if mode == 4 {
+                b.push(new.len() as u8);
+                let planes: Vec<u8> = (0..8)
+                    .flat_map(|p| new.iter().map(move |v| v.to_le_bytes()[p]))
+                    .collect();
+                compress_leaf(&mut b, &planes, Z, 3);
+            } else {
+                encode_i64_seq_with(new, Z, 3, 0, &mut b);
+            }
+            b
+        };
+        for mode in [4, 8] {
+            let ok = build(mode, &[5, -6, 7]);
+            assert_eq!(
+                decode_i64_seq(&mut Cursor::new(&ok), &budget).unwrap(),
+                [5, -6, 5, 7]
+            );
+            for new in [&[5, -6][..], &[5, -6, 7, 8]] {
+                assert!(decode_i64_seq(&mut Cursor::new(&build(mode, new)), &budget).is_err());
+            }
+        }
+    }
 
     #[test]
     fn dense_columns_roundtrip_through_horizontal_modes() {

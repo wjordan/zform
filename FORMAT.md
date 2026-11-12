@@ -127,16 +127,43 @@ Tag `2` is unused and rejected.
 ### Column codecs
 Each column has a horizontal mode (`0 = Standalone`, `1 = ExactCopy`, `2 = SubstringInterp` over up to 3 source columns, `3 = AffineInt` `c = a ± b + residual`, `4 = NestedPlan`, `5 = CrossHexId`, a hex id found in another column) and a leaf codec:
 - `0 = Const`, `1 = Raw`, `2 = InlineDict` (plain, front-coded, FSST front-coded or integer-valued, with direct or move-to-front ordinals), `3 = SharedDictRef` (ordinals into a shared dictionary),
-- `4 = IntExact` (constant, bit-packed frame of reference, byte planes, GCD-normalized delta, delta of delta, or move-to-front; keeps `-0`, `+42`, `007`),
+- `4 = IntExact` (constant, bit-packed frame of reference, byte planes, GCD-normalized delta, delta of delta, move-to-front, or generator positions; keeps `-0`, `+42`, `007`),
 - `5 = DecimalExact` (scaled integer mantissa with exact decimal places and sign),
 - `6 = Timestamp` (ISO-8601/RFC 3339, Apache CLF, syslog RFC 3164: epoch deltas and a format descriptor),
 - `7 = Uuid` (16 bytes, the UUIDv7 timestamp split off as deltas),
 - `8 = Ulid` (48-bit ms timestamp deltas and an 80-bit payload),
 - `9 = Traceparent` (16-byte `trace_id`, 8-byte `span_id`, flags),
-- `10 = HexMtf`, `11 = Ipv4Port` (4-byte address and a `u32_seq` port), `12 = EmailSplit`, `13 = HierarchicalSplit` (`/` in URLs, `-` in pod names), `14 = FixedBinary` (byte shuffle; IEEE-754 `f64`/`f32` bit deltas),
+- `10 = HexMtf`, `11 = Ipv4Port` (4-byte address and a `u32_seq` port), `12 = EmailSplit`, `13 = HierarchicalSplit` (`/` in URLs, `-` in pod names), `14 = FixedBinary` (byte shuffle; IEEE-754 `f64`/`f32` bit deltas; submode `3`, the rows as a generator leaf of layout `3`),
 - `15 = QuotedOrNull` (`submode: u8`: `0` every value is a quoted string; `1` each is a quoted string or `null`, by a `u32_seq` of flags; the strings' inner bytes go to another codec),
 - `16 = HexId` (nibble-packed hex ids with back-references within the column, for commit and tree SHAs),
-- `17 = ProseSlice` (a slice of the block's prose pool).
+- `17 = ProseSlice` (a slice of the block's prose pool),
+- `18 = Base64` (a `u32_seq` of decoded lengths and the decoded bytes of padded standard Base64).
+
+### Nested integer sequences
+
+A `u32_seq` or `i64_seq` is its value count (`uvarint`) and, unless that is zero, a mode byte and the mode's payload. Three modes hold further sequences:
+
+- `u32_seq` mode `5`: `min: uvarint | bytes: EntropyLeaf | tail: u32_seq`, one byte per value. A byte below 255 is `value - min`. Each 255 takes the next value of `tail`, which is `value - min - 255`. `tail` has one value per 255 and does not use mode `5`.
+- `i64_seq` mode `8`: `codes: u32_seq | new: i64_seq`, over a move-to-front list of the last 4,096 distinct values. Code `0` takes the next value of `new` and puts it at the front; code `r` takes the value at rank `r`, the front being 1, and moves it there. `new` has one value per `0`. Mode `4` is the same with `new` stored as `count: uvarint` and a leaf of eight byte planes; encoders no longer write it.
+- `i64_seq` mode `7`: `anchor: [u8; 6] LE | rows: u32_seq | [others: i64_seq] | steps: i64_seq`, for outputs of `java.util.Random.nextLong()`. With `next(s) = (s * 0x5DEECE66D + 11) mod 2^48`, the output of a state `s` is `(s >> 16) << 32` plus the sign-extended `i32(next(s) >> 16)`, in wrapping 64-bit arithmetic. A value of `steps` stands for the output of the state that many applications of `next` after `anchor`, counted modulo 2^48. `rows` lists in ascending order the rows that hold some other value; those values are `others`, present when `rows` is not empty, and the remaining rows take `steps` in order.
+
+An `i64_seq` nested in two others uses neither mode `7` nor mode `8`.
+
+Every instance of the generator walks one cycle of 2^48 states and an output determines its state, so mode `7` needs no seed: ids drawn one after another (Hadoop block ids before 2.1) are a few steps apart, and an output of an unrelated instance still costs 48 bits, not 64.
+
+### Generator leaves
+
+Where a codec stores id bytes as they are (span ids and first-seen trace ids of `Traceparent`, the ten bytes after a UUIDv7's timestamp, first-seen values of `Uuid`, `HexMtf` and `HexId`, the bytes of `Base64`, the doubles of `FixedBinary`) the leaf may have `backend = 3`. Its rows of `width` bytes are made from the outputs of a Mersenne Twister (MT19937), the generator behind Python's `random`:
+
+```text
+3: u8 | raw_len: uvarint | body_len: uvarint | layout: u8 | [a: f64 LE | b: f64 LE] | width: uvarint | stream | rows: u32_seq | at: i64_seq | [spare: EntropyLeaf] | tail
+```
+
+- `stream` is `0: u8 | seed: uvarint`, the generator of `random.Random(seed)` (`init_by_array` with the seed as a one-word key), or `1: u8 | 624 × u32 LE`, the stream's first 624 outputs, which fix every later one.
+- `rows` lists in ascending order the rows held in `spare`, which is present when `rows` is not empty. Each other row takes the next value of `at`, the index in the stream of its first output, at most 2^22 less the outputs it uses. `tail` is the last `raw_len mod width` bytes.
+- `layout = 0`: `width / 4` outputs, each little-endian (`randbytes`). `1`: those outputs as one big-endian integer, the first lowest (`getrandbits` in hex). `width` is then a multiple of 4 up to 64. `2`: `width = 10` and outputs `a, b, c` give `0x7000 | a >> 20` as `u16` BE, then `2 << 62 | (c >> 2) << 32 | b` as `u64` BE (a UUIDv7's `rand_a` and `rand_b` from `getrandbits(12)` and `getrandbits(62)`). `3`: `width = 8`, `a` and `b` are present, and outputs `x, y` give the little-endian double `prev + (a + (b - a) * r)` in IEEE-754 double arithmetic, where `r = ((x >> 5) << 26 | y >> 6) / 2^53` (`random()`) and `prev` is the row before, or `0.0` if that is NaN or there is none (a running sum of `uniform(a, b)`).
+
+`at` uses neither mode `7` nor `8`, and `spare` is not a generator leaf. Draws the leaf does not hold only widen the gaps in `at`, so ids interleaved with other uses of the generator cost a few bits each.
 
 ---
 
