@@ -5,16 +5,18 @@
 //! state kept between calls is a per-thread zstd context. The `ZFM1` stream is one such container.
 //! A block read this way is read whole; `file` reads parts of blocks through an index.
 
-use crate::container::{decode_single_block_records, encode_block_fit};
+use crate::container::{decode_single_block_records, encode_block_fit, learn_library};
 use crate::framing::ResolvedFraming;
 use crate::grammar::ModelPlan;
+use crate::packs::PackRegistry;
 use crate::plan::{TrainOptions, train_from_records};
 use crate::wire::{DecodeBudget, EntropyBackend, Result};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct BlockOptions {
     pub backend: EntropyBackend,
     pub level: i32,
+    pub packs: PackRegistry,
 }
 
 impl Default for BlockOptions {
@@ -22,6 +24,7 @@ impl Default for BlockOptions {
         Self {
             backend: EntropyBackend::Zstd,
             level: 3,
+            packs: PackRegistry::default(),
         }
     }
 }
@@ -49,20 +52,28 @@ impl Fit {
     }
 }
 
-/// Learns a model from sample records, keeping what `prior` already covers.
+/// Learns a model from sample records, keeping what `prior` already covers. The model carries
+/// the decode programs the samples' columns use, so each block names them instead of storing them.
 pub fn train(samples: &[&[u8]], opts: &TrainOptions, prior: Option<&ModelPlan>) -> ModelPlan {
-    train_from_records(
+    let mut model = train_from_records(
         samples,
         ResolvedFraming::Lf { open_end: false },
         opts,
         prior,
-    )
+    );
+    let block = BlockOptions::default();
+    let sample = &samples[..samples.len().min(LIBRARY_SAMPLE_ROWS)];
+    model.library = learn_library(sample, &model, &block.packs, block.backend, block.level);
+    model
 }
+
+/// Rows of the training sample encoded to see which programs its columns use.
+const LIBRARY_SAMPLE_ROWS: usize = 4096;
 
 /// Encodes `records` under `model`. A record the model cannot place is stored verbatim, so any
 /// model encodes any input; `Fit` reports how much fell through.
 pub fn encode_block(records: &[&[u8]], model: &ModelPlan, opts: &BlockOptions) -> (Vec<u8>, Fit) {
-    let eb = encode_block_fit(records, model, opts.backend, opts.level, None);
+    let eb = encode_block_fit(records, model, &opts.packs, opts.backend, opts.level, None);
     let fit = Fit {
         rows: records.len(),
         residual_rows: eb.residual_rows,

@@ -12,10 +12,13 @@ pub use zform_core::block;
 pub use zform_core::file;
 pub use zform_core::file::{RowSet, Stats};
 pub use zform_core::json_tree::JsonDoc;
+pub use zform_core::packs;
+pub use zform_core::payload;
 pub use zform_core::{
-    DecodeBudget, EntropyBackend, Error, FrameFit, FramingSpec, InspectReport, ModelPlan,
-    PackOptions, Predicate, Profile, ResolvedFraming, Result, StreamEncoder, TrainOptions,
-    eval_raw_record, inspect_stream, logical, pack_stream, raw_field_values,
+    CodecPack, ColumnProfile, CoreDecoder, DecodeBudget, EntropyBackend, Error, FrameFit,
+    FramingSpec, InspectReport, ModelPlan, PackOptions, PackRegistry, PayloadGraph, Predicate,
+    Profile, ResolvedFraming, Result, StreamEncoder, TrainOptions, eval_raw_record, inspect_stream,
+    logical, pack_stream, raw_field_values,
 };
 
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -488,6 +491,26 @@ mod tests {
             assert!(got.iter().map(Vec::as_slice).eq(part.iter().copied()));
         }
 
+        // The model carries the programs its columns decode with, so a small block does not.
+        let mut bare = model.clone();
+        bare.library = Default::default();
+        assert!(!model.library.is_empty());
+        let few = &recs[40..104];
+        let (shared, _) = encode_block(few, &model, &opts);
+        let (alone, _) = encode_block(few, &bare, &opts);
+        assert!(
+            shared.len() * 5 < alone.len() * 4,
+            "{} sharing, {} alone",
+            shared.len(),
+            alone.len()
+        );
+        for (bytes, model) in [(&shared, &model), (&alone, &bare)] {
+            let got = decode_block(model, bytes, few.len(), &budget).unwrap();
+            assert!(got.iter().map(Vec::as_slice).eq(few.iter().copied()));
+        }
+        // Read against the wrong library, a block is refused or differs; it is never trusted.
+        assert!(decode_block(&bare, &shared, few.len(), &budget).is_err());
+
         // A model that fits nothing still encodes exactly, and says so.
         let noise: Vec<String> = (0..64)
             .map(|i| format!("\u{1}{i:x}\u{2} ~{}", i * 7919))
@@ -714,6 +737,49 @@ mod tests {
     }
 
     /// Records of several shapes; `i / 700` picks the service, so most blocks hold one.
+    #[test]
+    fn blocks_of_a_stream_share_their_programs() {
+        let mut raw = Vec::new();
+        for i in 0..6000u64 {
+            raw.extend_from_slice(
+                format!(
+                    "2026-11-10T11:{:02}:{:02}Z req={} bytes={} took={}.{:03}\n",
+                    i / 60 % 60,
+                    i % 60,
+                    100_000 + i * 7,
+                    i * 37 % 5000,
+                    i % 9,
+                    i * 13 % 1000
+                )
+                .as_bytes(),
+            );
+        }
+        // 94 blocks in one frame, then the same rows over several frames that reuse the model.
+        let small = PackOptions {
+            block_rows: 64,
+            ..Default::default()
+        };
+        let framed = PackOptions {
+            chunk_bytes: 64 << 10,
+            ..small.clone()
+        };
+        for opts in [&small, &framed] {
+            let comp = assert_roundtrip(&raw, opts);
+            let mut enc = StreamEncoder::new(opts.clone());
+            enc.encode_frame(&raw, &mut Vec::new()).unwrap();
+            let mut library = Vec::new();
+            enc.active_plan().unwrap().library.encode(&mut library);
+            // Were the programs in every block, they alone would outweigh the whole file.
+            assert!(library.len() > 500, "library of {} bytes", library.len());
+            assert!(
+                comp.len() < library.len() * 94 / 2,
+                "{} bytes, library {}",
+                comp.len(),
+                library.len()
+            );
+        }
+    }
+
     fn mixed_record(i: usize) -> String {
         let svc = ["auth", "cart", "search", "billing", "gateway", "ledger"][(i / 700) % 6];
         let ts = format!(

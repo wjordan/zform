@@ -1,8 +1,6 @@
 //! Decoded columns. Most codecs keep their compact form and produce a cell's bytes on demand, so
 //! decoding a block costs little for the rows nobody reads.
 
-use crate::codecs::DictTable;
-use crate::lex::{format_exact_int, format_timestamp};
 use crate::wire::{Error, Result};
 use std::sync::Arc;
 
@@ -24,6 +22,42 @@ impl Cells {
     /// Cells of the given lengths laid out in `buf`, which they must exactly cover.
     pub fn from_lens(buf: Vec<u8>, lens: &[u32]) -> Result<Self> {
         let ends = ends_of(lens, buf.len())?;
+        Ok(Self { buf, ends })
+    }
+
+    /// Cells with precomputed monotonic cumulative `ends`, which must end at `buf.len()`.
+    pub fn from_parts(buf: Vec<u8>, ends: Vec<u32>) -> Result<Self> {
+        if buf.len() > u32::MAX as usize {
+            return Err(Error::BudgetExceeded("column bytes"));
+        }
+        let mut prev = 0u32;
+        for &e in &ends {
+            if e < prev {
+                return Err(Error::Format("non-monotonic cell ends".into()));
+            }
+            prev = e;
+        }
+        if prev as usize != buf.len() {
+            return Err(Error::Format("cell ends do not cover their bytes".into()));
+        }
+        Ok(Self { buf, ends })
+    }
+
+    /// `rows` fixed-width cells of `width` bytes laid back to back in `buf`.
+    pub fn from_fixed(rows: usize, width: usize, buf: Vec<u8>) -> Result<Self> {
+        let total = rows
+            .checked_mul(width)
+            .ok_or(Error::BudgetExceeded("column bytes"))?;
+        if total != buf.len() || total > u32::MAX as usize {
+            return Err(Error::Format("fixed-width buffer length mismatch".into()));
+        }
+        let mut ends = Vec::with_capacity(rows);
+        let w = width as u32;
+        let mut pos = 0u32;
+        for _ in 0..rows {
+            pos += w;
+            ends.push(pos);
+        }
         Ok(Self { buf, ends })
     }
 
@@ -100,7 +134,7 @@ pub enum Col {
     },
     /// `ords` are checked against the dictionary when the column is decoded.
     Dict {
-        dict: Arc<DictTable>,
+        dict: Arc<Cells>,
         ords: Vec<u32>,
     },
     /// Cells laid back to back in the block's text pool from `base`.
@@ -108,14 +142,6 @@ pub enum Col {
         pool: Arc<Vec<u8>>,
         base: usize,
         ends: Vec<u32>,
-    },
-    Int {
-        vals: Vec<i64>,
-        fmts: Vec<u32>,
-    },
-    Ts {
-        ns: Vec<i64>,
-        layouts: Vec<u32>,
     },
     /// `"inner"` per cell. With a non-empty `map`, cell `i` is `inner[map[i]]`, or `null`.
     Quoted {
@@ -135,8 +161,6 @@ impl Col {
             Col::Const { n, .. } => *n,
             Col::Dict { ords, .. } => ords.len(),
             Col::Pool { ends, .. } => ends.len(),
-            Col::Int { vals, .. } => vals.len(),
-            Col::Ts { ns, .. } => ns.len(),
             Col::Quoted { inner, map } => {
                 if map.is_empty() {
                     inner.len()
@@ -165,7 +189,7 @@ impl Col {
             }
             Col::Dict { dict, ords } => ords
                 .get(i)
-                .map(|&o| dict.entries[o as usize].as_slice())
+                .and_then(|&o| dict.get(o as usize))
                 .ok_or_else(underflow),
             Col::Pool { pool, base, ends } => match ends.get(i) {
                 Some(&e) => {
@@ -174,7 +198,7 @@ impl Col {
                 }
                 None => Err(underflow()),
             },
-            _ => return None,
+            Col::Quoted { .. } => return None,
         })
     }
 
@@ -195,14 +219,6 @@ impl Col {
             return Ok(());
         }
         match self {
-            Col::Int { vals, fmts } => {
-                let v = *vals.get(i).ok_or_else(underflow)?;
-                format_exact_int(v, fmts[i] as u8, out);
-            }
-            Col::Ts { ns, layouts } => {
-                let v = *ns.get(i).ok_or_else(underflow)?;
-                format_timestamp(v, layouts[i], out);
-            }
             Col::Quoted { inner, map } => {
                 let j = if map.is_empty() {
                     i

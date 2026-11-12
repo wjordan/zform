@@ -160,10 +160,10 @@ All at zstd level 6 on one thread.
 
 | Block | GitHub Archive hour, 499 MB | HDFS logs, 256 MiB | Writer peak, with a profile |
 |---|---:|---:|---:|
-| 8 MiB | 31.8 MB | 6.49 MB | 32–37 MiB |
-| 16 MiB | 28.6 MB | 6.49 MB | |
-| 32 MiB | 26.6 MB | 6.56 MB | 75–112 MiB |
-| 64 MiB | 25.3 MB | 6.27 MB | 137–215 MiB |
+| 8 MiB | 32.8 MB | 6.69 MB | 32–37 MiB |
+| 16 MiB | 29.4 MB | 6.63 MB | |
+| 32 MiB | 27.2 MB | 6.61 MB | 75–112 MiB |
+| 64 MiB | 25.9 MB | 6.35 MB | 137–215 MiB |
 
 A whole block decodes at 0.6–1.0 GB/s on the GitHub hour and about 250 MB/s on HDFS, which
 bounds a selective read at 8–32 ms for an 8 MiB block and 65–250 ms for a 64 MiB one. Without a
@@ -208,8 +208,10 @@ simulated on two hours of that day at 8 MiB blocks. Chosen in a first pass over 
 saves 6–7% of the file, and reading a whole block then needs 3–7x its own text in table pages;
 16 MiB blocks save 6% with no table. Chosen on a value's second appearance it saves under 2%.
 
-**Small blocks.** Against 65,536-row blocks, an HDFS file is 1.15x the size at 4,096 rows
-per block, 1.8x at 512 and 4.2x at 64.
+**Small blocks.** Against 65,536-row blocks, an HDFS file is 1.19x the size at 4,096 rows
+per block, 2.0x at 512 and 4.9x at 64. A block names the decode programs in its model's
+library and stores only the constants that differ; with the programs in every block the
+figures were 1.5x, 2.9x and 7.3x.
 
 **The index is paged by block.** The GitHub model has about 780 columns, and a block's
 directory lists only those with a value in some row: 1.2 MB for the day's 1,141 blocks.

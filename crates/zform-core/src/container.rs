@@ -17,12 +17,16 @@ use crate::index::{
 };
 use crate::json_tree::{decode_json_struct_streams, encode_json_struct_streams};
 use crate::lex::parse_base64;
+use crate::packs::{EncodedDenseBlock, PackRegistry};
+use crate::payload::graph::{NESTED_COLUMN_TAG, PayloadGraph};
+use crate::payload::library::{Harvest, Library, with_code_pricing};
 use crate::plan::{ProbeBackoff, Profile, TrainOptions, sample_strided, train_from_records};
 use crate::wire::{
     Cursor, DecodeBudget, EntropyBackend, Error, Result, compress_leaf, crc32, decompress_leaf,
     put_bytes, put_uvarint, xxh64,
 };
 use std::io::{Read, Write};
+use std::sync::Arc;
 
 pub const FRAME_MAGIC: &[u8; 4] = b"ZFM1";
 
@@ -55,6 +59,8 @@ pub struct PackOptions {
     /// Build the index region; `StreamEncoder::finish` writes it after the last frame.
     pub index: bool,
     pub filter_bits: usize,
+    /// Pluggable writer-side codec packs evaluated on columns.
+    pub packs: PackRegistry,
 }
 
 impl Default for PackOptions {
@@ -74,6 +80,7 @@ impl Default for PackOptions {
             checksum: true,
             index: true,
             filter_bits: DEFAULT_FILTER_BITS,
+            packs: PackRegistry::default(),
         }
     }
 }
@@ -255,6 +262,37 @@ impl StreamEncoder {
         if use_passthrough {
             compress_leaf(&mut payload, raw, self.opts.backend, self.opts.level);
         } else {
+            // The blocks come first: a sync frame's model is written with the library they make.
+            let code = if reuse_prev {
+                CodeSharing::Reuse
+            } else {
+                // A chunk well short of full is taken for the stream's last.
+                let goes_on = raw.len() * 2 >= self.opts.chunk_bytes;
+                let frames = if goes_on {
+                    self.opts.sync_interval_frames.max(1)
+                } else {
+                    1
+                };
+                CodeSharing::Build { frames }
+            };
+            let mut body = Vec::new();
+            let plan = self.active_plan.as_ref().unwrap();
+            let (frame_blocks, library) = with_seeds(&mut self.seeds, || {
+                encode_structural_blocks(
+                    &all_recs,
+                    plan,
+                    &self.opts.packs,
+                    self.opts.backend,
+                    self.opts.level,
+                    self.opts.block_rows,
+                    self.opts.block_bytes,
+                    filter_bits,
+                    code,
+                    &mut body,
+                )
+            });
+            blocks = frame_blocks;
+            self.active_plan.as_mut().unwrap().library = library;
             let plan = self.active_plan.as_ref().unwrap();
             if !reuse_prev {
                 let mut raw_plan = Vec::new();
@@ -276,18 +314,10 @@ impl StreamEncoder {
             if fc.framing == ResolvedFraming::JsonArray {
                 compress_leaf(&mut payload, fc.sep(), self.opts.backend, self.opts.level);
             }
-            blocks = with_seeds(&mut self.seeds, || {
-                encode_structural_blocks(
-                    &all_recs,
-                    plan,
-                    self.opts.backend,
-                    self.opts.level,
-                    self.opts.block_rows,
-                    self.opts.block_bytes,
-                    filter_bits,
-                    &mut payload,
-                )
-            });
+            for b in &mut blocks {
+                b.off += payload.len();
+            }
+            payload.extend_from_slice(&body);
             fit.residual_rows = blocks.iter().map(|b| b.residual_rows).sum();
             fit.residual_bytes = blocks.iter().map(|b| b.residual_bytes).sum();
         }
@@ -423,14 +453,16 @@ pub(crate) struct FrameBlock {
 fn encode_structural_blocks(
     all_recs: &[&[u8]],
     plan: &ModelPlan,
+    packs: &PackRegistry,
     backend: EntropyBackend,
     level: i32,
     max_block_rows: usize,
     max_block_bytes: usize,
     filter_bits: Option<usize>,
+    code: CodeSharing,
     out: &mut Vec<u8>,
-) -> Vec<FrameBlock> {
-    let mut encoded = Vec::new();
+) -> (Vec<FrameBlock>, Arc<Library>) {
+    let mut bounds = Vec::new();
     let mut s = 0usize;
     while s < all_recs.len() {
         let mut e = s;
@@ -443,12 +475,39 @@ fn encode_structural_blocks(
             b += rl;
             e += 1;
         }
-        encoded.push((
-            e - s,
-            encode_block_fit(&all_recs[s..e], plan, backend, level, filter_bits),
-        ));
+        bounds.push((s, e));
         s = e;
     }
+    // A library this frame makes is shared by its blocks and, when the stream goes on, by the
+    // frames that reuse the model: code is priced as that many uses.
+    let (keep_single, share) = match code {
+        CodeSharing::Reuse => (false, 1),
+        CodeSharing::Build { frames } => (frames > 1, bounds.len() * frames),
+    };
+    let mut pending: Vec<PendingBlock> =
+        with_code_pricing(plan.library.clone(), share as u32, || {
+            bounds
+                .iter()
+                .map(|&(s, e)| {
+                    encode_block_columns(&all_recs[s..e], plan, packs, backend, level, filter_bits)
+                })
+                .collect()
+        });
+    let library = match code {
+        CodeSharing::Reuse => plan.library.clone(),
+        CodeSharing::Build { .. } => {
+            let mut harvest = Harvest::default();
+            for p in &mut pending {
+                p.harvest(plan, &mut harvest);
+            }
+            Arc::new(harvest.into_library(keep_single))
+        }
+    };
+    let encoded: Vec<(usize, EncodedBlock)> = bounds
+        .iter()
+        .zip(pending)
+        .map(|(&(s, e), p)| (e - s, p.finish(plan, &library, backend, level)))
+        .collect();
 
     put_uvarint(out, encoded.len() as u64);
     for (nrows, eb) in &encoded {
@@ -467,7 +526,16 @@ fn encode_structural_blocks(
         });
         out.extend_from_slice(&eb.bytes);
     }
-    blocks
+    (blocks, library)
+}
+
+/// Where a frame's blocks get their library.
+#[derive(Clone, Copy)]
+enum CodeSharing {
+    /// From the model as it stands: the frame reuses the model of a frame before it.
+    Reuse,
+    /// From the frame's own blocks, to be written with its model and reused by `frames` frames.
+    Build { frames: usize },
 }
 
 pub(crate) struct EncodedBlock {
@@ -500,14 +568,166 @@ fn row_kinds(plan: &ModelPlan, variant_ids: &[u32]) -> u16 {
     kinds
 }
 
-/// Encodes one block. `filter_bits` asks for its index pages as well.
+/// Encodes one block against the library its model already has. `filter_bits` asks for its
+/// index pages as well.
 pub(crate) fn encode_block_fit(
     recs: &[&[u8]],
     plan: &ModelPlan,
+    packs: &PackRegistry,
     backend: EntropyBackend,
     level: i32,
     filter_bits: Option<usize>,
 ) -> EncodedBlock {
+    with_code_pricing(plan.library.clone(), 1, || {
+        encode_block_columns(recs, plan, packs, backend, level, filter_bits)
+    })
+    .finish(plan, &plan.library, backend, level)
+}
+
+/// The library for a model whose blocks will look like `recs`: the code one block of them uses.
+pub(crate) fn learn_library(
+    recs: &[&[u8]],
+    plan: &ModelPlan,
+    packs: &PackRegistry,
+    backend: EntropyBackend,
+    level: i32,
+) -> Arc<Library> {
+    if recs.is_empty() {
+        return plan.library.clone();
+    }
+    // Priced as shared by many blocks: the sample stands for all of them.
+    let mut block = with_code_pricing(plan.library.clone(), 64, || {
+        encode_block_columns(recs, plan, packs, backend, level, None)
+    });
+    let mut harvest = Harvest::default();
+    block.harvest(plan, &mut harvest);
+    Arc::new(harvest.into_library(true))
+}
+
+/// A block whose columns are encoded with their code inline, before it is laid out. A frame holds
+/// its blocks like this until it knows which code they share.
+pub(crate) struct PendingBlock {
+    /// The row structure, which leads the block.
+    out: Vec<u8>,
+    dir: BlockDir,
+    enc: EncodedDenseBlock,
+    per_row: Vec<bool>,
+    residual_rows: usize,
+    residual_bytes: usize,
+    /// Filter page and row kinds, when a filter size was given.
+    index: Option<(Vec<u8>, u16)>,
+}
+
+impl PendingBlock {
+    /// The payloads that are column graphs: the shared dictionaries and every column but the
+    /// nested ones, which hold blocks of their own.
+    fn graphs<'a>(&'a mut self, plan: &'a ModelPlan) -> impl Iterator<Item = &'a mut Vec<u8>> {
+        let cols = self
+            .enc
+            .col_blobs
+            .iter_mut()
+            .zip(&plan.columns)
+            .filter(|(_, c)| c.nested_plan.is_none())
+            .map(|(b, _)| b);
+        self.enc.shared_dict_blobs.iter_mut().chain(cols)
+    }
+
+    fn harvest(&mut self, plan: &ModelPlan, into: &mut Harvest) {
+        for blob in self.graphs(plan) {
+            into.add_blob(blob);
+        }
+    }
+
+    /// Lays the block out, naming the code `lib` holds instead of carrying it.
+    fn finish(
+        mut self,
+        plan: &ModelPlan,
+        lib: &Library,
+        backend: EntropyBackend,
+        level: i32,
+    ) -> EncodedBlock {
+        if !lib.is_empty() {
+            let budget = DecodeBudget::default();
+            for blob in self.graphs(plan) {
+                if let Ok(g) = PayloadGraph::decode(blob, &budget)
+                    && g.has_code()
+                {
+                    *blob = g.encode_linked(Some(lib));
+                }
+            }
+        }
+        let Self {
+            mut out,
+            mut dir,
+            enc,
+            per_row,
+            residual_rows,
+            residual_bytes,
+            index,
+        } = self;
+        put_uvarint(&mut out, enc.shared_dict_blobs.len() as u64);
+        for db in &enc.shared_dict_blobs {
+            put_uvarint(&mut out, db.len() as u64);
+            dir.dicts.push((out.len() as u32, db.len() as u32));
+            out.extend_from_slice(db);
+        }
+        if let Some(pl) = &enc.prose_pool_leaf {
+            out.push(1);
+            put_uvarint(&mut out, pl.len() as u64);
+            dir.pool = Some((out.len() as u32, pl.len() as u32));
+            out.extend_from_slice(pl);
+        } else {
+            out.push(0);
+        }
+        for blob in &enc.col_blobs {
+            put_uvarint(&mut out, blob.len() as u64);
+        }
+        let cols_off = out.len() as u32;
+        let mut cols = Vec::with_capacity(enc.col_blobs.len());
+        for (((blob, mut summary), col), per_row) in enc
+            .col_blobs
+            .iter()
+            .zip(enc.summaries)
+            .zip(&plan.columns)
+            .zip(per_row)
+        {
+            summary.per_row = per_row;
+            // A nested cell is shown escaped, with letters its stored bytes lack.
+            if col.nested_plan.is_some() && !summary.all_null {
+                summary.letters = ANY_LETTERS;
+            }
+            cols.push(ColEntry {
+                len: blob.len() as u32,
+                summary,
+                deps: column_deps(blob),
+            });
+            out.extend_from_slice(blob);
+        }
+        dir.set_cols(cols_off, cols);
+
+        let index = index.map(|(filter, kinds)| {
+            let mut page = Vec::new();
+            dir.encode(backend, level, &mut page);
+            (page, filter, kinds)
+        });
+        EncodedBlock {
+            bytes: out,
+            residual_rows,
+            residual_bytes,
+            index,
+        }
+    }
+}
+
+/// Splits `recs` into columns and encodes each, under the code pricing in effect.
+fn encode_block_columns(
+    recs: &[&[u8]],
+    plan: &ModelPlan,
+    packs: &PackRegistry,
+    backend: EntropyBackend,
+    level: i32,
+    filter_bits: Option<usize>,
+) -> PendingBlock {
     let split = split_records_with_plan(recs, plan);
     let n_cols = plan.columns.len();
 
@@ -533,6 +753,7 @@ pub(crate) fn encode_block_fit(
                 &occ_views[cid],
                 is_json_tagged,
                 child_plan,
+                packs,
                 backend,
                 level,
             ));
@@ -564,6 +785,7 @@ pub(crate) fn encode_block_fit(
         &horiz_cands,
         &mut preencoded_nested,
         &standalone,
+        packs,
         backend,
         level,
     );
@@ -583,58 +805,18 @@ pub(crate) fn encode_block_fit(
         out.extend_from_slice(&js_buf);
     }
     dir.struct_len = out.len() as u32;
-    put_uvarint(&mut out, enc.shared_dict_blobs.len() as u64);
-    for db in &enc.shared_dict_blobs {
-        put_uvarint(&mut out, db.len() as u64);
-        dir.dicts.push((out.len() as u32, db.len() as u32));
-        out.extend_from_slice(db);
-    }
-    if let Some(pl) = &enc.prose_pool_leaf {
-        out.push(1);
-        put_uvarint(&mut out, pl.len() as u64);
-        dir.pool = Some((out.len() as u32, pl.len() as u32));
-        out.extend_from_slice(pl);
-    } else {
-        out.push(0);
-    }
-    for blob in &enc.col_blobs {
-        put_uvarint(&mut out, blob.len() as u64);
-    }
-    let cols_off = out.len() as u32;
-    let mut cols = Vec::with_capacity(enc.col_blobs.len());
-    let per_row = split.per_row.iter();
-    for (((blob, mut summary), col), &per_row) in enc
-        .col_blobs
-        .iter()
-        .zip(enc.summaries)
-        .zip(&plan.columns)
-        .zip(per_row)
-    {
-        summary.per_row = per_row;
-        // A nested cell is shown escaped, with letters its stored bytes lack.
-        if col.nested_plan.is_some() && !summary.all_null {
-            summary.letters = ANY_LETTERS;
-        }
-        cols.push(ColEntry {
-            len: blob.len() as u32,
-            summary,
-            deps: column_deps(blob),
-        });
-        out.extend_from_slice(blob);
-    }
-    dir.set_cols(cols_off, cols);
-
     let index = filter_bits.map(|bits| {
         let mut fb = FilterBuilder::new(bits);
         for r in recs {
             tokens(r, |t, _| fb.add(t));
         }
-        let mut page = Vec::new();
-        dir.encode(backend, level, &mut page);
-        (page, fb.finish(), row_kinds(plan, &split.variant_ids))
+        (fb.finish(), row_kinds(plan, &split.variant_ids))
     });
-    EncodedBlock {
-        bytes: out,
+    PendingBlock {
+        out,
+        dir,
+        enc,
+        per_row: split.per_row.clone(),
         residual_rows: split.residual_rows,
         residual_bytes: split.residual_bytes,
         index,
@@ -647,6 +829,7 @@ fn encode_nested_column_tagged(
     vals: &[&[u8]],
     is_json_tagged: bool,
     child_plan: &ModelPlan,
+    packs: &PackRegistry,
     backend: EntropyBackend,
     level: i32,
 ) -> (ColSummary, Vec<u8>) {
@@ -662,7 +845,7 @@ fn encode_nested_column_tagged(
     if occ_len == 0 {
         return (summary, out);
     }
-    out.push(4u8); // h_mode = 4 (NestedPlan)
+    out.push(NESTED_COLUMN_TAG);
     out.push(u8::from(is_json_tagged));
 
     // `row_modes[i]`: `1 = ChildPlan (no trailing \n)`, `2 = ChildPlan (had trailing \n)`, `3 = Fallback raw`
@@ -693,7 +876,7 @@ fn encode_nested_column_tagged(
 
     encode_u32_seq(&row_modes, backend, level, &mut out);
     let child_blob = if !child_recs.is_empty() {
-        encode_block_fit(&child_recs, child_plan, backend, level, None).bytes
+        encode_block_fit(&child_recs, child_plan, packs, backend, level, None).bytes
     } else {
         Vec::new()
     };
@@ -719,8 +902,8 @@ fn decode_nested_column_tagged(
         return Err(Error::BudgetExceeded("nested column occurrence count"));
     }
     let h_mode = cur.u8()?;
-    if h_mode != 4 {
-        return Err(Error::Format("expected h_mode=4 for nested column".into()));
+    if h_mode != NESTED_COLUMN_TAG {
+        return Err(Error::Format("expected nested column tag".into()));
     }
     let is_json_tagged = cur.u8()? != 0;
     let row_modes = decode_u32_seq(&mut cur, budget)?;
@@ -1164,7 +1347,7 @@ impl<'a> BlockRows<'a> {
         Ok(Self {
             plan,
             variant_ids,
-            ctx: BlockDecodeCtx::new(parts.cols, parts.dicts, parts.pool),
+            ctx: BlockDecodeCtx::new(parts.cols, parts.dicts, parts.pool, plan.library.clone()),
             recon: BlockReconstructor::new(plan, json_streams),
             next: 0,
         })

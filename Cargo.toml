@@ -21,7 +21,6 @@ too_many_arguments = "allow"
 type_complexity = "allow"
 
 [workspace.dependencies]
-fsst-rs = "0.6"
 lz4_flex = "0.14"
 memchr = "2.8"
 same-file = "1.0"

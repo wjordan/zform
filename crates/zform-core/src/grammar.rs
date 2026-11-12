@@ -15,9 +15,11 @@ use crate::lex::{
     parse_exact_decimal, parse_exact_int, parse_hex_exact, parse_ipv4_or_port, parse_timestamp,
     parse_traceparent, parse_ulid, parse_uuid, split_email,
 };
+use crate::payload::library::Library;
 use crate::wire::{Cursor, DecodeBudget, Error, Result, put_bytes, put_uvarint};
 use memchr::memmem::Finder;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Column metadata in a `ModelPlan`.
 #[derive(Debug, Clone)]
@@ -127,6 +129,8 @@ pub struct ModelPlan {
     pub logfmt: Option<LogfmtSpec>,
     /// Cached variant indices for fast template matching.
     pub template_indices: Vec<u32>,
+    /// The programs and tables blocks under this model name instead of carrying.
+    pub library: Arc<Library>,
 }
 
 impl Default for ModelPlan {
@@ -148,6 +152,7 @@ impl ModelPlan {
             json_tree: None,
             logfmt: None,
             template_indices: Vec::new(),
+            library: Arc::default(),
         }
     }
 
@@ -278,6 +283,7 @@ impl ModelPlan {
                 }
             }
         }
+        self.library.encode(out);
     }
 
     pub fn decode(cur: &mut Cursor<'_>, depth: u8) -> Result<Self> {
@@ -408,6 +414,7 @@ impl ModelPlan {
             json_tree,
             logfmt,
             template_indices: Vec::new(),
+            library: Arc::new(Library::decode(cur)?),
         };
         plan.rebuild_indexes();
         Ok(plan)

@@ -447,8 +447,6 @@ pub(crate) struct NeedlePlan {
     word: bool,
     /// The needle can match a `"` or the bare token `null`, which a quoted column adds to cells.
     quote_sensitive: bool,
-    /// The needle can match inside a formatted integer.
-    int_like: bool,
 }
 
 /// True when a match of `needle` could lie partly in one of `lits` and partly outside it, or two
@@ -666,9 +664,6 @@ impl NeedlePlan {
             word,
             quote_sensitive: needle.contains(&b'"')
                 || memchr::memmem::find(b"null", needle).is_some(),
-            int_like: needle
-                .iter()
-                .all(|b| b.is_ascii_digit() || matches!(b, b'+' | b'-')),
         }
     }
 
@@ -998,9 +993,7 @@ fn cell_verdicts(col: &Col, escapes: bool, test: &Test<'_>) -> Result<Option<Vec
             None => test.ok(e),
         };
         let cells: Vec<bool> = match &**inner {
-            Col::Dict { dict, ords } => {
-                by_entry(ords, dict.entries.iter().map(|e| ok(e)).collect())
-            }
+            Col::Dict { dict, ords } => by_entry(ords, dict.iter().map(&mut ok).collect()),
             c => each(c, &mut ok)?,
         };
         if map.is_empty() {
@@ -1020,7 +1013,7 @@ fn cell_verdicts(col: &Col, escapes: bool, test: &Test<'_>) -> Result<Option<Vec
         test.ok(&logical(lex))
     };
     let cells: Vec<bool> = match col {
-        Col::Dict { dict, ords } => by_entry(ords, dict.entries.iter().map(|e| ok(e)).collect()),
+        Col::Dict { dict, ords } => by_entry(ords, dict.iter().map(&mut ok).collect()),
         _ => each(col, &mut ok)?,
     };
     Ok((!array).then_some(cells))
@@ -1244,11 +1237,12 @@ fn scan_col(
             }
         }
         Col::Dict { dict, ords } => {
-            let mut verdict = vec![0u8; dict.entries.len()];
+            let mut verdict = vec![0u8; dict.len()];
             for (i, &o) in ords.iter().enumerate() {
+                let entry = dict.get(o as usize).ok_or_else(underflow)?;
                 let v = &mut verdict[o as usize];
                 if *v == 0 {
-                    *v = 1 + u8::from(np.found(&dict.entries[o as usize]));
+                    *v = 1 + u8::from(np.found(entry));
                 }
                 if *v == 2 {
                     hit(i);
@@ -1260,7 +1254,6 @@ fn scan_col(
             let len = ends.last().map_or(0, |&e| e as usize);
             scan_buf(&pool[*base..*base + len], ends, hit)
         }
-        Col::Int { .. } if !np.int_like => {}
         Col::Quoted { inner, map } if !np.quote_sensitive => {
             if map.is_empty() {
                 return scan_col(inner, false, needle, np, hit);
@@ -1388,7 +1381,7 @@ pub(crate) fn field_events(
      -> Result<()> {
         let (doc, buf) = (&mut cell_doc, &mut cell_buf);
         let entry = match c {
-            Col::Dict { dict, ords } => Some((col, ords[occ as usize], dict.entries.len() as u32)),
+            Col::Dict { dict, ords } => Some((col, ords[occ as usize], dict.len() as u32)),
             _ => None,
         };
         let lex = c.get(occ as usize, buf)?;

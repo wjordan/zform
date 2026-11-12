@@ -6,7 +6,7 @@
 2. **`ZFIX` / `ZFIE`**: the index region over a data region, appended to it or stored apart.
 3. **`ZFP1`**: a trained model saved as a profile (`.zfp`).
 
-This document fixes the container: leaves, frames, the parts of a block, the index region and the profile file. It lists the model's record families and the column codecs with their tags. The serialized model and the payload of each codec are so far defined only by the reference implementation in `crates/zform-core`. The format is not frozen: until 1.0 a release may change it.
+This document describes the container: leaves, frames, the parts of a block, the index region and the profile file. It lists the model's record families, the nodes of a column payload and how blocks share programs. The serialized model, the operands of each node and the program instruction set are so far defined only by the reference implementation in `crates/zform-core`. The format is experimental and changes without notice.
 
 Fixed-width integers are little-endian (`LE`). `uvarint` is 7-bit LEB128 (up to 10 bytes for a `u64`); `ivarint` is the `uvarint` of the ZigZag mapping `(x << 1) ^ (x >> 63)`.
 
@@ -110,7 +110,7 @@ Each object path has a shape stream (one shape id per occurrence, `0` for a valu
 
 ---
 
-## 4. Model and column codecs
+## 4. Model and column payloads
 
 ### `ModelPlan` variants
 A model routes each record to one variant, by tag:
@@ -124,46 +124,51 @@ A model routes each record to one variant, by tag:
 
 Tag `2` is unused and rejected.
 
-### Column codecs
-Each column has a horizontal mode (`0 = Standalone`, `1 = ExactCopy`, `2 = SubstringInterp` over up to 3 source columns, `3 = AffineInt` `c = a ± b + residual`, `4 = NestedPlan`, `5 = CrossHexId`, a hex id found in another column) and a leaf codec:
-- `0 = Const`, `1 = Raw`, `2 = InlineDict` (plain, front-coded, FSST front-coded or integer-valued, with direct or move-to-front ordinals), `3 = SharedDictRef` (ordinals into a shared dictionary),
-- `4 = IntExact` (constant, bit-packed frame of reference, byte planes, GCD-normalized delta, delta of delta, move-to-front, or generator positions; keeps `-0`, `+42`, `007`),
-- `5 = DecimalExact` (scaled integer mantissa with exact decimal places and sign),
-- `6 = Timestamp` (ISO-8601/RFC 3339, Apache CLF, syslog RFC 3164: epoch deltas and a format descriptor),
-- `7 = Uuid` (16 bytes, the UUIDv7 timestamp split off as deltas),
-- `8 = Ulid` (48-bit ms timestamp deltas and an 80-bit payload),
-- `9 = Traceparent` (16-byte `trace_id`, 8-byte `span_id`, flags),
-- `10 = HexMtf`, `11 = Ipv4Port` (4-byte address and a `u32_seq` port), `12 = EmailSplit`, `13 = HierarchicalSplit` (`/` in URLs, `-` in pod names), `14 = FixedBinary` (byte shuffle; IEEE-754 `f64`/`f32` bit deltas; submode `3`, the rows as a generator leaf of layout `3`),
-- `15 = QuotedOrNull` (`submode: u8`: `0` every value is a quoted string; `1` each is a quoted string or `null`, by a `u32_seq` of flags; the strings' inner bytes go to another codec),
-- `16 = HexId` (nibble-packed hex ids with back-references within the column, for commit and tree SHAs),
-- `17 = ProseSlice` (a slice of the block's prose pool),
-- `18 = Base64` (a `u32_seq` of decoded lengths and the decoded bytes of padded standard Base64).
-
-### Nested integer sequences
-
-A `u32_seq` or `i64_seq` is its value count (`uvarint`) and, unless that is zero, a mode byte and the mode's payload. Three modes hold further sequences:
-
-- `u32_seq` mode `5`: `min: uvarint | bytes: EntropyLeaf | tail: u32_seq`, one byte per value. A byte below 255 is `value - min`. Each 255 takes the next value of `tail`, which is `value - min - 255`. `tail` has one value per 255 and does not use mode `5`.
-- `i64_seq` mode `8`: `codes: u32_seq | new: i64_seq`, over a move-to-front list of the last 4,096 distinct values. Code `0` takes the next value of `new` and puts it at the front; code `r` takes the value at rank `r`, the front being 1, and moves it there. `new` has one value per `0`. Mode `4` is the same with `new` stored as `count: uvarint` and a leaf of eight byte planes; encoders no longer write it.
-- `i64_seq` mode `7`: `anchor: [u8; 6] LE | rows: u32_seq | [others: i64_seq] | steps: i64_seq`, for outputs of `java.util.Random.nextLong()`. With `next(s) = (s * 0x5DEECE66D + 11) mod 2^48`, the output of a state `s` is `(s >> 16) << 32` plus the sign-extended `i32(next(s) >> 16)`, in wrapping 64-bit arithmetic. A value of `steps` stands for the output of the state that many applications of `next` after `anchor`, counted modulo 2^48. `rows` lists in ascending order the rows that hold some other value; those values are `others`, present when `rows` is not empty, and the remaining rows take `steps` in order.
-
-An `i64_seq` nested in two others uses neither mode `7` nor mode `8`.
-
-Every instance of the generator walks one cycle of 2^48 states and an output determines its state, so mode `7` needs no seed: ids drawn one after another (Hadoop block ids before 2.1) are a few steps apart, and an output of an unrelated instance still costs 48 bits, not 64.
-
-### Generator leaves
-
-Where a codec stores id bytes as they are (span ids and first-seen trace ids of `Traceparent`, the ten bytes after a UUIDv7's timestamp, first-seen values of `Uuid`, `HexMtf` and `HexId`, the bytes of `Base64`, the doubles of `FixedBinary`) the leaf may have `backend = 3`. Its rows of `width` bytes are made from the outputs of a Mersenne Twister (MT19937), the generator behind Python's `random`:
+### Program library
+A `ModelPlan`, nested ones included, ends with the programs and tables its blocks share:
 
 ```text
-3: u8 | raw_len: uvarint | body_len: uvarint | layout: u8 | [a: f64 LE | b: f64 LE] | width: uvarint | stream | rows: u32_seq | at: i64_seq | [spare: EntropyLeaf] | tail
+n_entries: uvarint | entries: [(kind: u8, body_len: uvarint, body); n_entries]
 ```
 
-- `stream` is `0: u8 | seed: uvarint`, the generator of `random.Random(seed)` (`init_by_array` with the seed as a one-word key), or `1: u8 | 624 × u32 LE`, the stream's first 624 outputs, which fix every later one.
-- `rows` lists in ascending order the rows held in `spare`, which is present when `rows` is not empty. Each other row takes the next value of `at`, the index in the stream of its first output, at most 2^22 less the outputs it uses. `tail` is the last `raw_len mod width` bytes.
-- `layout = 0`: `width / 4` outputs, each little-endian (`randbytes`). `1`: those outputs as one big-endian integer, the first lowest (`getrandbits` in hex). `width` is then a multiple of 4 up to 64. `2`: `width = 10` and outputs `a, b, c` give `0x7000 | a >> 20` as `u16` BE, then `2 << 62 | (c >> 2) << 32 | b` as `u64` BE (a UUIDv7's `rand_a` and `rand_b` from `getrandbits(12)` and `getrandbits(62)`). `3`: `width = 8`, `a` and `b` are present, and outputs `x, y` give the little-endian double `prev + (a + (b - a) * r)` in IEEE-754 double arithmetic, where `r = ((x >> 5) << 26 | y >> 6) / 2^53` (`random()`) and `prev` is the row before, or `0.0` if that is NaN or there is none (a running sum of `uniform(a, b)`).
+`kind` is `0` for a program, `1` for a recurrence and `2` for a table of bytes. A library holds at most 4,096 entries. Blocks name an entry by its index, so a block needs nothing beyond the model it is already read with. The blocks of a nested column use the nested plan's library.
 
-`at` uses neither mode `7` nor `8`, and `spare` is not a generator leaf. Draws the leaf does not hold only widen the gaps in `at`, so ids interleaved with other uses of the generator cost a few bits each.
+### Column payloads
+A column's payload is a graph the reader evaluates without knowing what the column holds. A timestamp, a UUID or a generator's output is a writer's choice of nodes and programs, not a codec the reader has:
+
+```text
+rows: uvarint | flags: u8 | [dict_id: uvarint] | [n_src: uvarint | src: [uvarint; n_src]] | n_nodes: uvarint | nodes | root: uvarint
+```
+
+A column with no rows is the single byte `0`. `flags` bit `0x01` says the column reads the prose pool, `0x02` that `dict_id` follows, `0x04` that the source columns follow. A node is a kind byte and operands that name earlier nodes; `root` is the node whose cells are the column.
+
+| Kind | Node | Kind | Node |
+|---:|---|---:|---|
+| `0` | `Bytes`, an entropy leaf | `11` | `MtfInts`, move-to-front integers |
+| `1` | `IntStream`, an integer sequence | `12` | `SliceBuf`, cells cut from a buffer |
+| `2` | `ByteChunks` | `13` | `IndexCells`, cells picked by index |
+| `3` | `MtfFixed` | `14` | `TemplateCells` |
+| `4` | `DictCells` | `15` | `ConstCells` |
+| `5` | `RecurBuf`, a recurrence's output | `16` | `QuoteOrNull` |
+| `6` | `ProgramI64`, a program giving integers | `17` | `ParseAsciiInt` |
+| `7` | `ProgramCells`, a program giving cells | `18` | `ExtPool`, the prose pool |
+| `8` | `PatchCells`, cells with exceptions | `19` | `ExtDict`, the shared dictionary |
+| `9` | `ConcatCells` | `20` | `ExtPeer`, a source column |
+| `10` | `ByteUnshuffle` | `21` | `LibraryBytes` |
+
+A program is a straight-line list of instructions over 32- or 64-bit lanes, one lane per row; a recurrence makes each word from earlier words of its own output. The operands of each node, the modes of an integer sequence and the instruction set are so far defined only by `payload/graph.rs`, `payload/ir.rs` and `payload/recur.rs`.
+
+### Code references
+Nodes `5`, `6` and `7` hold their recurrence or program as a code reference `t: uvarint`:
+
+- `t` even: the code follows inline, in `t >> 1` bytes.
+- `t` odd: the code is entry `t >> 1` of the library, which must be of the node's kind. For a program, overrides follow: `n: uvarint`, then `n` pairs `(skip: uvarint, value: ivarint)`.
+
+A program's values are the immediates of its instructions in order, then the widths of its fixed-width outputs in order. An override replaces one value: the first pair names value `skip`, each later pair the value `skip + 1` after the one before it. The program that results is checked as an inline one is. So a program that differs between blocks only in its constants (a starting state, a field width) is stored once, and each block stores the constants.
+
+Node `21` is `id: uvarint` and stands for a `Bytes` node holding library table `id`.
+
+A writer builds the library of a sync frame from the programs that frame's blocks use and writes it with the frame's model; the frames that reuse the model reuse the library. Code a library lacks is stored inline.
 
 ---
 

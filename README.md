@@ -2,15 +2,15 @@
 
 `zform` is a lossless compression CLI and Rust library for structured logs and event streams: JSON and NDJSON, OpenTelemetry metrics/logs/traces, `logfmt`, Kubernetes CRI and syslog lines, plain-text application logs, CSV/TSV, and fixed-stride binary records.
 
-Byte-stream compressors (`gzip`, `zstd`, `xz`) match repeated byte sequences and never see record structure. Columnar formats (`Parquet`, `Arrow`) exploit field types, but require an upfront schema, discard the original bytes, and treat columns independently.
+Byte-stream compressors (`gzip`, `zstd`, `xz`) match repeated byte sequences and never see record structure. Columnar formats (`Parquet`, `Arrow`) exploit field types and support selective reads, but require an upfront schema, discard the original bytes, and treat columns independently.
 
-`zform` keeps the drop-in contract of a stream compressor—arbitrary bytes in, identical bytes out, no schema—while learning a structural model of the input: record shapes and templates, typed columns, and cross-field relationships (such as `end = start + dur` or URLs built from other fields). Storing that model plus only the residual it cannot predict yields:
+`zform` keeps the drop-in contract of a stream compressor—arbitrary bytes in, identical bytes out, no schema—while learning a structural model of the input: record shapes and templates, typed columns, and cross-field relationships (such as `end = start + dur` or URLs built from other fields). It stores that model plus only the residual it cannot predict, in indexed columnar blocks:
 
 - **Higher density:** **1.4–4.6x smaller** than `zstd -3` and **1.2–3.0x smaller** than `zstd -19` on structured corpora ([benchmarks](#benchmarks)), built-in query index included.
-- **Queries on the compressed file:** `zform select` and `zform grep` filter and project `.zfm` archives directly, pruning blocks by index and decoding only the columns a query touches.
 - **Byte-exact fidelity on messy inputs:** Preserves exact formatting (`12.300`, `007`, `-0`, key order, whitespace). Mixed formats can share a file, unrecognized lines fall back to verbatim storage, and incompressible data passes straight through to `zstd`.
+- **Selective reads, as in a columnar format:** `zform select` and `zform grep` filter and project `.zfm` archives without unpacking them, pruning blocks by index and decoding only the columns a query touches.
 
-The tradeoff is CPU: on a single core, `zform` compresses logs at **20–61 MB/s** (`zstd -3`: 520–620 MB/s; `zstd -19`: 4–6 MB/s) and decompresses them at **470–560 MB/s** (`zstd`: 1,100–1,600 MB/s).
+The tradeoff is CPU: on a single core, `zform` compresses logs at **21–44 MB/s** (`zstd -3`: 550–620 MB/s; `zstd -19`: 4–6 MB/s) and decompresses them at **360–510 MB/s** (`zstd`: 1,000–1,600 MB/s).
 
 ## Benchmarks
 
@@ -18,20 +18,20 @@ Compressed size and ratio (`raw size / compressed size`):
 
 | Corpus | Raw | `zstd -3` | `zstd -19` | `xz -6` | `zform` |
 |---|---:|---:|---:|---:|---:|
-| HDFS DataNode logs | 8.00 MiB | 0.72 MiB (11.1x) | 0.47 MiB (17.0x) | 0.49 MiB (16.2x) | **0.16 MiB (51.0x)** |
-| GitHub Archive NDJSON | 8.00 MiB | 0.89 MiB (8.9x) | 0.69 MiB (11.6x) | 0.69 MiB (11.6x) | **0.56 MiB (14.2x)** |
-| Silesia `sao` star catalog (binary) | 6.92 MiB | 5.29 MiB (1.31x) | 4.77 MiB (1.45x) | 4.21 MiB (1.64x) | **3.72 MiB (1.86x)** |
+| HDFS DataNode logs | 8.00 MiB | 0.72 MiB (11.1x) | 0.47 MiB (17.0x) | 0.49 MiB (16.2x) | **0.16 MiB (49.8x)** |
+| GitHub Archive NDJSON | 8.00 MiB | 0.89 MiB (8.9x) | 0.69 MiB (11.6x) | 0.69 MiB (11.6x) | **0.60 MiB (13.4x)** |
+| Silesia `sao` star catalog (binary) | 6.92 MiB | 5.29 MiB (1.31x) | 4.77 MiB (1.45x) | 4.21 MiB (1.64x) | **3.57 MiB (1.94x)** |
 
-`zform` outputs include the trailing query index, which accounts for 7% of the single-block, 766-column GitHub Archive file (`0.52 MiB` / `15.3x` with `--no-index`) and ~3% on multi-block files. Larger-scale archive and cold-query benchmarks are in [`DESIGN.md`](DESIGN.md#evidence).
+`zform` outputs include the trailing query index, which accounts for 7% of the single-block, 766-column GitHub Archive file (`0.56 MiB` / `14.4x` with `--no-index`) and ~3% on multi-block files. Larger-scale archive and cold-query benchmarks are in [`DESIGN.md`](DESIGN.md#evidence).
 
 Single-core throughput and peak memory on the two log corpora:
 
 | Codec | Compress MB/s | Decompress MB/s | Compress RSS MiB | Decompress RSS MiB |
 |---|---:|---:|---:|---:|
-| `zstd -3` | 520–620 | 1,400–1,600 | 6.6–6.7 | 6.0–6.3 |
-| `zstd -19` | 3.6–6.4 | 1,100 | 92 | 11 |
-| `xz -6` | 8.8–9.7 | 360–420 | 79–90 | 10 |
-| `zform` | 20–61 | 470–560 | 29–180 | 16 |
+| `zstd -3` | 550–620 | 1,300–1,600 | 6.6–6.7 | 5.3–5.7 |
+| `zstd -19` | 3.6–6.1 | 1,000–1,100 | 92 | 11 |
+| `xz -6` | 8.7–9.2 | 360–440 | 79–90 | 10 |
+| `zform` | 21–44 | 360–510 | 31–170 | 15–16 |
 
 ### Where it fits
 
@@ -145,7 +145,7 @@ Codecs are selected per block; `zform inspect -v` shows the compressed byte brea
 Models are plain data interpreted by a single fixed decoder (specified in [`FORMAT.md`](FORMAT.md)) and built from two kinds of primitives:
 
 - **Structural families** describe record layout: nested JSON trees, flat `logfmt` pairs, CSV/TSV rows, fixed-width binary structs, Kubernetes CRI or syslog envelopes around inner payloads, and literal text templates with variable slots. Templates serve as a general fallback for line-oriented text, splitting custom log formats into columns without dedicated parsers.
-- **Value codecs** encode column contents: timestamps, integers, decimals, UUIDs/ULIDs, network addresses, per-column and shared dictionaries, pooled free text, hex IDs, cross-column derivations (copies, affine sums, interpolated strings), and pseudo-random values stored as positions in their generator's output (`java.util.Random`, Python's Mersenne Twister).
+- **Value codecs** encode column contents: timestamps, integers, decimals, UUIDs/ULIDs, network addresses, per-column and shared dictionaries, pooled free text, hex IDs, cross-column derivations (copies, affine sums, interpolated strings), and pseudo-random values stored as positions in their generator's output (`java.util.Random`, Python's Mersenne Twister). A column's payload spells out the steps that rebuild it, so the decoder has no code per value type; steps the blocks of a model share are stored once with the model.
 
 Regardless of how records are modeled, decoding preserves exact byte representation: key order, whitespace, `null` versus `"null"`, trailing zeros (`12.300`), leading zeros and signs (`007`, `-0`, `+42`), and timestamp separators and zones.
 
@@ -160,7 +160,7 @@ The `.zfm` container is designed for both streaming pipelines and indexed archiv
 
 ## Status
 
-Version `0.1` (pre-1.0). The wire format is not yet frozen and may change between `0.x` releases—keep original copies of data you cannot repack. Known limitations are tracked in [`DESIGN.md`](DESIGN.md#status).
+Experimental. The wire format is not frozen and changes without notice; keep original copies of data you cannot repack. Known limitations are tracked in [`DESIGN.md`](DESIGN.md#status).
 
 ## Repository layout
 
