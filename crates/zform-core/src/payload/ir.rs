@@ -283,7 +283,40 @@ impl Program {
         self.ops.iter().any(|i| i.op == Op::Gather)
     }
 
+    fn is_linear_lane(&self) -> bool {
+        self.width == Width::W64
+            && self.n_in == 1
+            && self.n_bufs == 0
+            && self.luts.is_empty()
+            && self.sinks == [(self.ops.len() as u32, Len::Fixed(8))]
+            && self.ops.iter().enumerate().all(|(i, ins)| {
+                ins.op.arity() == 1
+                    && ins.a == i as u32
+                    && !matches!(ins.op, Op::NibbleLut | Op::ByteLut32 | Op::Gather)
+            })
+    }
+
     pub fn encode(&self) -> Vec<u8> {
+        // A unary chain has implicit operands and a single final lane. Keep its actual
+        // opcodes and constants on the wire, without repeating that graph structure.
+        if self.is_linear_lane() {
+            let mut out = vec![0x81];
+            put_uv(&mut out, self.ops.len() as u64);
+            for ins in &self.ops {
+                out.push(ins.op as u8);
+                if ins.op.is_shift_imm() {
+                    out.push(ins.imm as u8);
+                } else if matches!(
+                    ins.op,
+                    Op::F64AddI | Op::F64MulI | Op::F64DivI | Op::ScanF64Add
+                ) {
+                    put_uv(&mut out, (ins.imm as u64).swap_bytes());
+                } else if ins.op.has_imm() {
+                    put_iv(&mut out, ins.imm);
+                }
+            }
+            return out;
+        }
         let mut out = Vec::new();
         let hdr = (self.width as u8) | ((self.n_bufs.min(63)) << 1);
         out.push(hdr);
@@ -332,6 +365,56 @@ impl Program {
         let b = &mut b;
         let (&hdr, rest) = b.split_first().ok_or(Invalid("empty program"))?;
         *b = rest;
+        if hdr == 0x81 {
+            let n = get_uv(b)?;
+            if n > 1 << 14 {
+                return Err(Invalid("program too large"));
+            }
+            let mut ops = Vec::with_capacity(n as usize);
+            for i in 0..n as u32 {
+                let (&code, rest) = b.split_first().ok_or(Invalid("truncated op"))?;
+                *b = rest;
+                let op = *ALL_OPS
+                    .get(code as usize)
+                    .ok_or(Invalid("unknown opcode"))?;
+                if op.arity() != 1 || matches!(op, Op::NibbleLut | Op::ByteLut32 | Op::Gather) {
+                    return Err(Invalid("nonlinear opcode in lane chain"));
+                }
+                let imm = if op.is_shift_imm() {
+                    let (&shift, rest) = b.split_first().ok_or(Invalid("truncated shift"))?;
+                    *b = rest;
+                    if shift >= 64 {
+                        return Err(Invalid("shift count out of range"));
+                    }
+                    shift as i64
+                } else if matches!(op, Op::F64AddI | Op::F64MulI | Op::F64DivI | Op::ScanF64Add) {
+                    get_uv(b)?.swap_bytes() as i64
+                } else if op.has_imm() {
+                    get_iv(b)?
+                } else {
+                    0
+                };
+                ops.push(Ins {
+                    op,
+                    a: i,
+                    b: 0,
+                    c: 0,
+                    aux: 0,
+                    imm,
+                });
+            }
+            if !b.is_empty() {
+                return Err(Invalid("trailing bytes in program"));
+            }
+            return Ok(Self {
+                width: Width::W64,
+                n_in: 1,
+                n_bufs: 0,
+                luts: vec![],
+                ops,
+                sinks: vec![(n as u32, Len::Fixed(8))],
+            });
+        }
         if hdr & 0x80 != 0 {
             return Err(Invalid("reserved header bit"));
         }

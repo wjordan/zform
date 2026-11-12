@@ -257,7 +257,8 @@ impl Library {
         let mut inline = p.encode();
         let len = inline.len() as u64;
         put_uvarint(&mut inline, len << 1);
-        let link = (inline.len(), found.then_some(reference));
+        let smaller = found && reference.len() < inline.len();
+        let link = (inline.len(), smaller.then_some(reference));
         if links.len() >= 4096 {
             links.clear();
         }
@@ -265,7 +266,7 @@ impl Library {
         link
     }
 
-    /// Writes `p` as a reference to the entry nearest it, or `false` if no entry has its shape.
+    /// Writes a smaller reference to the nearest entry, or returns false to keep code inline.
     pub(crate) fn write_program(&self, p: &Program, out: &mut Vec<u8>) -> bool {
         match self.link(p).1 {
             Some(reference) => {

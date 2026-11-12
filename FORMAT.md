@@ -142,6 +142,19 @@ rows: uvarint | flags: u8 | [dict_id: uvarint] | [n_src: uvarint | src: [uvarint
 
 A column with no rows is the single byte `0`. `flags` bit `0x01` says the column reads the prose pool, `0x02` that `dict_id` follows, `0x04` that the source columns follow. A node is a kind byte and operands that name earlier nodes; `root` is the node whose cells are the column.
 
+Two standalone numeric graph forms omit the node directory. Their flags are exact
+values, not bits to combine with external dependencies:
+
+- `flags = 0x08`: one `IntStream`, which is the root.
+- `flags = 0x10`: one `IntStream`, followed by the program bytes through the end of
+  the payload. The root is a `ProgramI64` with that stream as its sole input and no
+  buffers. Its only output is an eight-byte lane. The stream length must equal `rows`.
+
+`IntStream` kind `7` stores a shifted constant as `length: uvarint`, `shift: u8`,
+`coefficient: ivarint`. Its value is `coefficient << shift`. The shift is 1–63 and
+must not discard significant signed bits. This is selected only when it is shorter
+than the ordinary constant representation.
+
 | Kind | Node | Kind | Node |
 |---:|---|---:|---|
 | `0` | `Bytes`, an entropy leaf | `11` | `MtfInts`, move-to-front integers |
@@ -158,6 +171,14 @@ A column with no rows is the single byte `0`. `flags` bit `0x01` says the column
 
 A program is a straight-line list of instructions over 32- or 64-bit lanes, one lane per row; a recurrence makes each word from earlier words of its own output. The operands of each node, the modes of an integer sequence and the instruction set are so far defined only by `payload/graph.rs`, `payload/ir.rs` and `payload/recur.rs`.
 
+A program header of `0x81` encodes a linear 64-bit lane program: `n_ops: uvarint`,
+then each opcode and its immediate, if any. There is one input and no tables or
+buffers; each instruction takes the previous lane and the last lane is the sole
+eight-byte output. Only unary opcodes that need no table or buffer are allowed.
+Shift immediates are one byte in 0–63, integer immediates are `ivarint`, and floating
+immediates are `uvarint` of their byte-swapped IEEE-754 bits. All other program
+headers retain explicit input, table, operand and output information.
+
 ### Code references
 Nodes `5`, `6` and `7` hold their recurrence or program as a code reference `t: uvarint`:
 
@@ -168,7 +189,7 @@ A program's values are the immediates of its instructions in order, then the wid
 
 Node `21` is `id: uvarint` and stands for a `Bytes` node holding library table `id`.
 
-A writer builds the library of a sync frame from the programs that frame's blocks use and writes it with the frame's model; the frames that reuse the model reuse the library. Code a library lacks is stored inline.
+A writer builds the library of a sync frame from the programs that frame's blocks use and writes it with the frame's model; the frames that reuse the model reuse the library. Code a library lacks, or whose reference and overrides would be larger, is stored inline.
 
 ---
 

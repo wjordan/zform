@@ -72,7 +72,12 @@ pub(crate) struct FastHasher(u64);
 impl core::hash::Hasher for FastHasher {
     #[inline]
     fn finish(&self) -> u64 {
-        self.0
+        // Hash-table buckets use low bits. Big-endian text suffixes must influence them,
+        // otherwise zero-padded identifiers collide despite differing upper hash bits.
+        let mut h = self.0;
+        h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        h ^ (h >> 31)
     }
     #[inline]
     fn write(&mut self, mut bytes: &[u8]) {
@@ -397,9 +402,23 @@ impl IntStream {
     pub fn encode(&self, out: &mut Vec<u8>) {
         match self {
             Self::Const { val, len } => {
-                out.push(0);
-                put_uvarint(out, *len as u64);
-                put_ivarint(out, *val);
+                let shift = val.trailing_zeros().min(63);
+                let coefficient = *val >> shift;
+                let size = |v: i64| {
+                    (64 - (((v << 1) ^ (v >> 63)) as u64).leading_zeros())
+                        .max(1)
+                        .div_ceil(7)
+                };
+                if shift > 0 && 1 + size(coefficient) < size(*val) {
+                    out.push(7);
+                    put_uvarint(out, *len as u64);
+                    out.push(shift as u8);
+                    put_ivarint(out, coefficient);
+                } else {
+                    out.push(0);
+                    put_uvarint(out, *len as u64);
+                    put_ivarint(out, *val);
+                }
             }
             Self::Rle { len, leaf } => {
                 out.push(1);
@@ -477,6 +496,18 @@ impl IntStream {
         }
         let len = len_u64 as u32;
         match kind {
+            7 => {
+                let shift = cur.u8()?;
+                if shift == 0 || shift >= 64 {
+                    return Err(Error::Format("invalid constant shift".into()));
+                }
+                let coefficient = cur.ivar()?;
+                let val = coefficient.wrapping_shl(shift as u32);
+                if val >> shift != coefficient {
+                    return Err(Error::Format("constant shift overflow".into()));
+                }
+                Ok(Self::Const { val, len })
+            }
             0 => {
                 let val = cur.ivar()?;
                 Ok(Self::Const { val, len })
@@ -1137,6 +1168,26 @@ impl PayloadGraph {
         }
         let mut out = Vec::with_capacity(64);
         put_uvarint(&mut out, self.rows as u64);
+        if lib.is_none() && !self.ext_pool && self.ext_dict.is_none() && self.ext_peers.is_empty() {
+            match self.nodes.as_slice() {
+                [GraphNode::IntStream(stream)] if self.root == 0 => {
+                    out.push(8);
+                    stream.encode(&mut out);
+                    return out;
+                }
+                [
+                    GraphNode::IntStream(stream),
+                    GraphNode::ProgramI64 { prog, inputs, bufs },
+                ] if self.root == 1 && inputs == &[0] && bufs.is_empty() => {
+                    out.push(16);
+                    stream.encode(&mut out);
+                    out.extend(prog.encode());
+                    return out;
+                }
+                _ => {}
+            }
+        }
+
         let flags = (u8::from(self.ext_pool))
             | (u8::from(self.ext_dict.is_some()) << 1)
             | (u8::from(!self.ext_peers.is_empty()) << 2);
@@ -1193,6 +1244,32 @@ impl PayloadGraph {
         }
         let rows = rows_u64 as u32;
         let flags = cur.u8()?;
+        if matches!(flags, 8 | 16) {
+            let stream = IntStream::decode_wire(&mut cur, budget, 0)?;
+            if stream.len() != rows as usize {
+                return Err(Error::Format("numeric graph row count mismatch".into()));
+            }
+            let mut nodes = vec![GraphNode::IntStream(stream)];
+            if flags == 16 {
+                let prog = decode_lane_program(cur.slice(cur.remaining())?)?;
+                nodes.push(GraphNode::ProgramI64 {
+                    prog: prog.into(),
+                    inputs: vec![0],
+                    bufs: vec![],
+                });
+            }
+            if cur.remaining() != 0 {
+                return Err(Error::Format("trailing numeric graph bytes".into()));
+            }
+            return Ok(Self {
+                rows,
+                ext_pool: false,
+                ext_dict: None,
+                ext_peers: vec![],
+                root: (nodes.len() - 1) as u16,
+                nodes,
+            });
+        }
         if flags & !0x07 != 0 {
             return Err(Error::Format("unknown PayloadGraph ext_flags".into()));
         }
@@ -1589,6 +1666,22 @@ impl GraphBuilder {
         let w = width as usize;
         assert!(w >= 1 && flat_items.len().is_multiple_of(w));
         let count = flat_items.len() / w;
+        // High-cardinality wide cells almost never hit the recent-item table. Sample
+        // across the column before paying for a 64-entry search for every item.
+        if w >= 8 && count >= 256 {
+            let hits = (0..128)
+                .filter(|&sample| {
+                    let i = sample * (count - 1) / 127;
+                    let item = &flat_items[i * w..(i + 1) * w];
+                    flat_items[i.saturating_sub(64) * w..i * w]
+                        .chunks_exact(w)
+                        .any(|prior| prior == item)
+                })
+                .count();
+            if hits < 8 {
+                return self.add_bytes(flat_items);
+            }
+        }
         let mut table: Vec<Vec<u8>> = Vec::with_capacity(64);
         let mut codes = Vec::with_capacity(count);
         let mut fallback = Vec::new();
@@ -2301,6 +2394,37 @@ impl CoreDecoder {
     pub fn decode_ints_bytes(bytes: &[u8], budget: &DecodeBudget) -> Result<Vec<i64>> {
         let mut cursor = Cursor::new(bytes);
         let rows = cursor.uvar()?;
+        let mut compact = Cursor::new(bytes);
+        compact.uvar()?;
+        if rows > 0 && rows <= budget.max_records_per_block as u64 {
+            let flags = compact.u8()?;
+            if matches!(flags, 8 | 16) {
+                let stream = IntStream::decode_wire(&mut compact, budget, 0)?;
+                if stream.len() as u64 != rows {
+                    return Err(Error::Format("numeric graph row count mismatch".into()));
+                }
+                let prog = if flags == 16 {
+                    Some(decode_lane_program(compact.slice(compact.remaining())?)?)
+                } else {
+                    None
+                };
+                if compact.remaining() != 0 {
+                    return Err(Error::Format("trailing numeric graph bytes".into()));
+                }
+                let values = stream.unpack(budget)?;
+                if let Some(prog) = prog {
+                    budget.check_alloc(values.len().saturating_mul(8), "numeric lane output")?;
+                    let mut out = vec![0; values.len()];
+                    if !super::engine::eval_numeric_chain(&prog, &values, &mut out) {
+                        CompiledProgram::with(&prog.into(), |cp| {
+                            cp.eval_i64(&[&values], &[], &mut out)
+                        });
+                    }
+                    return Ok(out);
+                }
+                return Ok(values);
+            }
+        }
         if rows > 0
             && rows <= budget.max_records_per_block as u64
             && cursor.u8()? == 0
@@ -3401,4 +3525,17 @@ fn bitunpack_u64(bytes: &[u8], bits: u8, len: usize, min: i64) -> Vec<i64> {
         bit_pos += b;
     }
     out
+}
+
+fn decode_lane_program(bytes: &[u8]) -> Result<Program> {
+    let prog = Program::decode(bytes)?;
+    if prog.width != Width::W64
+        || prog.n_in != 1
+        || prog.n_bufs != 0
+        || prog.sinks.len() != 1
+        || prog.sinks[0].1 != Len::Fixed(8)
+    {
+        return Err(Error::Format("numeric lane program shape mismatch".into()));
+    }
+    Ok(prog)
 }
