@@ -2274,6 +2274,11 @@ pub(crate) fn eval_numeric_chain(p: &Program, input: &[i64], out: &mut [i64]) ->
     } else {
         0
     };
+    let factor = if ops.peek().is_some_and(|i| i.op == Op::MulI) {
+        ops.next().unwrap().imm
+    } else {
+        1
+    };
     let add = if ops.peek().is_some_and(|i| i.op == Op::AddI) {
         ops.next().unwrap().imm
     } else {
@@ -2307,7 +2312,7 @@ pub(crate) fn eval_numeric_chain(p: &Program, input: &[i64], out: &mut [i64]) ->
             }
         }
     }
-    let integer = |v: i64| v.wrapping_shl(shift).wrapping_add(add);
+    let integer = |v: i64| v.wrapping_shl(shift).wrapping_mul(factor).wrapping_add(add);
     match (float, scale) {
         (false, _) => run(input, out, scan, integer),
         (true, None) => run(input, out, scan, |v| (integer(v) as f64).to_bits() as i64),

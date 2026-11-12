@@ -7,6 +7,7 @@ pub mod graph;
 pub mod ir;
 pub mod library;
 pub mod recur;
+mod rice;
 pub mod simd_arch;
 
 #[cfg(test)]

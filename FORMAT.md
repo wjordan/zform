@@ -155,6 +155,17 @@ values, not bits to combine with external dependencies:
 must not discard significant signed bits. This is selected only when it is shorter
 than the ordinary constant representation.
 
+`IntStream` kind `8` stores centered Rice codes as `length: uvarint`,
+`byte_length: uvarint`, then the framed bytes: `center: ivarint`, `k: u8`,
+and a least-significant-bit-first bitstream. Each signed difference from `center`
+is zigzag encoded, then written as `code >> k` zero bits, one bit, and the low
+`k` bits. `k` is 0–63. Decoders reject arithmetic overflow, truncation, trailing
+bytes and nonzero padding. The encoder compares exact byte costs for short lanes.
+
+Numeric normalization uses ordinary programs: `MulI`/`AddI` reconstruct a common
+integer factor and offset; floating decimal reconstruction may use `F64DivI`,
+`F64MulI`, or consecutive divisions to preserve the original rounding order.
+
 | Kind | Node | Kind | Node |
 |---:|---|---:|---|
 | `0` | `Bytes`, an entropy leaf | `11` | `MtfInts`, move-to-front integers |

@@ -142,6 +142,10 @@ pub enum IntStream {
         len: u32,
         leaf: Vec<u8>,
     },
+    Rice {
+        len: u32,
+        bytes: Vec<u8>,
+    },
     ForPlanes {
         len: u32,
         min: i64,
@@ -354,7 +358,7 @@ impl IntStream {
                 ((64 - (((v << 1) ^ (v >> 63)) as u64).leading_zeros()).max(1) as usize).div_ceil(7)
             })
             .sum::<usize>();
-        if varbytes + 8 < vals.len() * bits as usize / 8 {
+        let candidate = if varbytes + 8 < vals.len() * bits as usize / 8 {
             let mut head = Vec::with_capacity(vals.len());
             let mut tail = Vec::new();
             for &v in vals {
@@ -364,29 +368,40 @@ impl IntStream {
                     tail.push((z - 255) as i64);
                 }
             }
-            return Self::ZigZagBytes {
+            Self::ZigZagBytes {
                 len,
                 head_leaf: pack_leaf(&head),
                 tail: Box::new(Self::auto_encode(&tail)),
-            };
+            }
+        } else {
+            let raw = bitpack_u64(
+                vals.iter().map(|&v| (v as u64).wrapping_sub(min as u64)),
+                bits,
+                vals.len(),
+            );
+            Self::ForBitpack {
+                len,
+                min,
+                bits,
+                leaf: pack_leaf(&raw),
+            }
+        };
+        if vals.len() <= 1024 {
+            let mut framed = Vec::new();
+            candidate.encode(&mut framed);
+            // The Rice stream needs its kind, count and byte-length prefix too.
+            if let Some(bytes) = super::rice::encode(vals, framed.len().saturating_sub(6)) {
+                return Self::Rice { len, bytes };
+            }
         }
-        let raw = bitpack_u64(
-            vals.iter().map(|&v| (v as u64).wrapping_sub(min as u64)),
-            bits,
-            vals.len(),
-        );
-        Self::ForBitpack {
-            len,
-            min,
-            bits,
-            leaf: pack_leaf(&raw),
-        }
+        candidate
     }
 
     pub fn len(&self) -> usize {
         match *self {
             Self::Const { len, .. }
             | Self::Rle { len, .. }
+            | Self::Rice { len, .. }
             | Self::ForBitpack { len, .. }
             | Self::ZigZagVarint { len, .. }
             | Self::ForPlanes { len, .. }
@@ -419,6 +434,12 @@ impl IntStream {
                     put_uvarint(out, *len as u64);
                     put_ivarint(out, *val);
                 }
+            }
+            Self::Rice { len, bytes } => {
+                out.push(8);
+                put_uvarint(out, *len as u64);
+                put_uvarint(out, bytes.len() as u64);
+                out.extend_from_slice(bytes);
             }
             Self::Rle { len, leaf } => {
                 out.push(1);
@@ -496,6 +517,10 @@ impl IntStream {
         }
         let len = len_u64 as u32;
         match kind {
+            8 => Ok(Self::Rice {
+                len,
+                bytes: cur.bytes()?.to_vec(),
+            }),
             7 => {
                 let shift = cur.u8()?;
                 if shift == 0 || shift >= 64 {
@@ -577,6 +602,7 @@ impl IntStream {
         budget.check_alloc(n.saturating_mul(8), "IntStream")?;
         match self {
             Self::Const { val, len } => Ok(vec![*val; *len as usize]),
+            Self::Rice { len, bytes } => super::rice::decode(bytes, *len as usize, budget),
             Self::Rle { len, leaf } => {
                 let n = *len as usize;
                 let raw = unpack_leaf(leaf, budget)?;
@@ -1602,25 +1628,6 @@ impl GraphBuilder {
         if runs * 16 < vals.len() {
             return self.push(GraphNode::IntStream(IntStream::encode_fast(vals)));
         }
-        let min = *vals.iter().min().unwrap();
-        let common = vals
-            .iter()
-            .fold(0u64, |mask, &v| mask | (v as u64).wrapping_sub(min as u64));
-        let shift = common.trailing_zeros();
-        if shift >= 2 && shift < 64 && vals.len() * shift as usize > 256 {
-            let normalized: Vec<_> = vals
-                .iter()
-                .map(|&v| ((v as u64).wrapping_sub(min as u64) >> shift) as i64)
-                .collect();
-            let input = self.add_ints_fast(&normalized);
-            let b = Builder::new(1);
-            let output = b.ri(
-                super::ir::Op::AddI,
-                b.ri(super::ir::Op::ShlI, b.input(0), shift as i64),
-                min,
-            );
-            return self.add_prog_i64(b.finish(&[(output, 8)]), vec![input], vec![]);
-        }
         let step = vals[1].wrapping_sub(vals[0]);
         if vals.windows(2).all(|w| w[1].wrapping_sub(w[0]) == step) {
             let input = self.push(GraphNode::IntStream(IntStream::Const {
@@ -1631,13 +1638,45 @@ impl GraphBuilder {
             let output = b.scan_add(b.input(0), vals[0].wrapping_sub(step));
             return self.add_prog_i64(b.finish(&[(output, 8)]), vec![input], vec![]);
         }
+        let min = *vals.iter().min().unwrap();
+        let mut factor = 0u64;
+        for &v in vals {
+            let mut delta = (v as u64).wrapping_sub(min as u64);
+            while delta != 0 {
+                (factor, delta) = (delta, factor % delta);
+            }
+            if factor == 1 {
+                break;
+            }
+        }
+        let saved_bits = 63 - factor.max(1).leading_zeros();
+        if factor > 1 && vals.len() * saved_bits as usize > 256 {
+            let normalized: Vec<_> = vals
+                .iter()
+                .map(|&v| ((v as u64).wrapping_sub(min as u64) / factor) as i64)
+                .collect();
+            let input = self.add_ints_fast(&normalized);
+            let b = Builder::new(1);
+            let value = if factor.is_power_of_two() {
+                b.ri(
+                    super::ir::Op::ShlI,
+                    b.input(0),
+                    factor.trailing_zeros() as i64,
+                )
+            } else {
+                b.ri(super::ir::Op::MulI, b.input(0), factor as i64)
+            };
+            let output = b.ri(super::ir::Op::AddI, value, min);
+            return self.add_prog_i64(b.finish(&[(output, 8)]), vec![input], vec![]);
+        }
         let span = |v: &[i64]| {
             let lo = *v.iter().min().unwrap();
             let hi = *v.iter().max().unwrap();
             64 - (hi as u64).wrapping_sub(lo as u64).leading_zeros()
         };
         let mut deltas = Vec::with_capacity(vals.len());
-        deltas.push(0);
+        // Use a real step in the first lane so centering sees no artificial outlier.
+        deltas.push(vals[1].wrapping_sub(vals[0]));
         deltas.extend(vals.windows(2).map(|w| w[1].wrapping_sub(w[0])));
         let delta_bytes = deltas
             .iter()
@@ -1650,7 +1689,7 @@ impl GraphBuilder {
         {
             let input = self.push(GraphNode::IntStream(IntStream::encode_fast(&deltas)));
             let b = Builder::new(1);
-            let output = b.scan_add(b.input(0), vals[0]);
+            let output = b.scan_add(b.input(0), vals[0].wrapping_sub(deltas[0]));
             self.add_prog_i64(b.finish(&[(output, 8)]), vec![input], vec![])
         } else {
             self.push(GraphNode::IntStream(IntStream::encode_fast(vals)))

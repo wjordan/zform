@@ -795,33 +795,68 @@ fn numeric_chains_match_reference_for_extremes_and_short_tails() {
     for rows in [0, 1, 2, 7, 15, 31, 65] {
         let input: Vec<_> = (0..rows).map(|i| values[i % values.len()]).collect();
         for scan in [false, true] {
-            for scale in [
-                None,
-                Some((Op::F64DivI, 1000.)),
-                Some((Op::F64MulI, -0.001)),
-            ] {
-                let b = Builder::new(1);
-                let mut v = b.input(0);
-                if scan {
-                    v = b.scan_add(v, i64::MAX);
-                }
-                v = b.ri(Op::AddI, b.ri(Op::ShlI, v, 2), -17);
-                v = b.r(Op::I64ToF64, v);
-                if let Some((op, factor)) = scale {
-                    v = b.rf(op, v, factor);
-                }
-                let p = b.finish(&[(v, 8)]);
-                let want = eval_reference(&p, &[&input], &[]);
-                let mut fast = vec![0; rows];
-                assert!(super::engine::eval_numeric_chain(&p, &input, &mut fast));
-                let mut general = vec![0; rows];
-                CompiledProgram::compile(&p).eval_i64(&[&input], &[], &mut general);
-                assert_eq!(fast, general);
-                for (got, expected) in fast.iter().zip(want) {
-                    assert_eq!(got.to_le_bytes().as_slice(), expected);
+            for factor in [1, 1000, -1, i64::MIN] {
+                for scale in [
+                    None,
+                    Some((Op::F64DivI, 1000.)),
+                    Some((Op::F64MulI, -0.001)),
+                ] {
+                    let b = Builder::new(1);
+                    let mut v = b.input(0);
+                    if scan {
+                        v = b.scan_add(v, i64::MAX);
+                    }
+                    v = b.ri(Op::ShlI, v, 2);
+                    if factor != 1 {
+                        v = b.ri(Op::MulI, v, factor);
+                    }
+                    v = b.ri(Op::AddI, v, -17);
+                    if let Some((op, divisor)) = scale {
+                        v = b.rf(op, b.r(Op::I64ToF64, v), divisor);
+                    }
+                    let p = b.finish(&[(v, 8)]);
+                    let want = eval_reference(&p, &[&input], &[]);
+                    let mut fast = vec![0; rows];
+                    assert!(super::engine::eval_numeric_chain(&p, &input, &mut fast));
+                    let mut general = vec![0; rows];
+                    CompiledProgram::compile(&p).eval_i64(&[&input], &[], &mut general);
+                    assert_eq!(fast, general);
+                    for (got, expected) in fast.iter().zip(want) {
+                        assert_eq!(got.to_le_bytes().as_slice(), expected);
+                    }
                 }
             }
         }
+    }
+}
+
+#[test]
+fn common_factor_normalization_handles_signed_range_and_wrapping_products() {
+    use super::graph::{CoreDecoder, ExtInputs, GraphBuilder};
+    let budget = DecodeBudget::default();
+    for (base, factor, span) in [
+        (i64::MIN, 1000u64, 127),
+        (-17001, 3000, 127),
+        (i64::MIN, u64::MAX, 2),
+        (i64::MIN, 1 << 63, 2),
+    ] {
+        let values: Vec<_> = (0..128u64)
+            .map(|i| {
+                (base as u64).wrapping_add(((i * 17 + i * i * 2) % span).wrapping_mul(factor))
+                    as i64
+            })
+            .collect();
+        let mut builder = GraphBuilder::new(values.len());
+        let root = builder.add_ints_fast(&values);
+        let graph = builder.finish(root).fuse_numeric_programs();
+        assert_eq!(
+            CoreDecoder::decode_ints(&graph, &ExtInputs::empty(), &budget).unwrap(),
+            values
+        );
+        assert_eq!(
+            CoreDecoder::decode_ints_bytes(&graph.encode(), &budget).unwrap(),
+            values
+        );
     }
 }
 
@@ -945,4 +980,50 @@ fn shifted_constant_transport_preserves_extremes_and_rejects_overflow() {
     for bytes in [&[7, 1, 0, 2][..], &[7, 1, 64, 2], &[7, 1, 63, 4]] {
         assert!(IntStream::decode_wire(&mut Cursor::new(bytes), &budget, 0).is_err());
     }
+}
+
+#[test]
+fn rice_integer_transport_validates_counts_framing_and_allocation_budget() {
+    use super::graph::IntStream;
+    let values: Vec<_> = (0..65).map(|i| (i * 17 % 31) - 15).collect();
+    let bytes = super::rice::encode(&values, usize::MAX).unwrap();
+    let stream = IntStream::Rice {
+        len: values.len() as u32,
+        bytes,
+    };
+    let mut wire = Vec::new();
+    stream.encode(&mut wire);
+    let budget = DecodeBudget::default();
+    assert_eq!(
+        IntStream::decode_wire(&mut Cursor::new(&wire), &budget, 0)
+            .unwrap()
+            .unpack(&budget)
+            .unwrap(),
+        values
+    );
+    for end in 0..wire.len() {
+        assert!(
+            IntStream::decode_wire(&mut Cursor::new(&wire[..end]), &budget, 0)
+                .and_then(|s| s.unpack(&budget))
+                .is_err()
+        );
+    }
+    for count in [0, 1, 64, 66, 127] {
+        let mut bad = wire.clone();
+        bad[1] = count;
+        assert!(
+            IntStream::decode_wire(&mut Cursor::new(&bad), &budget, 0)
+                .and_then(|s| s.unpack(&budget))
+                .is_err()
+        );
+    }
+    let tight = DecodeBudget {
+        max_single_alloc_bytes: 64,
+        ..budget
+    };
+    assert!(
+        IntStream::decode_wire(&mut Cursor::new(&wire), &tight, 0)
+            .and_then(|s| s.unpack(&tight))
+            .is_err()
+    );
 }

@@ -21,9 +21,16 @@ pub fn decode_i64(bytes: &[u8], count: usize, budget: &DecodeBudget) -> Result<V
     Ok(values)
 }
 
+#[derive(Clone, Copy)]
+enum Scale {
+    Divide,
+    Multiply,
+    MilliTwice,
+}
+
 #[derive(Clone, Default)]
 pub struct FloatHint {
-    scale: Option<(u8, bool)>,
+    scale: Option<(u8, Scale)>,
     failures: u8,
     skip: u8,
 }
@@ -52,7 +59,7 @@ impl FloatEncoder {
         if runs * 16 < values.len() {
             return encode_i64(&self.bits);
         }
-        let fits = |e: u8, multiply: bool| {
+        let fits = |e: u8, mode: Scale| {
             let scale = 10f64.powi(e as i32);
             let probe = values.len().min(32);
             let exact = values
@@ -63,21 +70,43 @@ impl FloatEncoder {
                     i.is_finite()
                         && i >= i64::MIN as f64
                         && i < -(i64::MIN as f64)
-                        && reconstruct(i as i64, scale, multiply).to_bits() == v.to_bits()
+                        && reconstruct(i as i64, scale, mode).to_bits() == v.to_bits()
                 })
                 .count();
-            exact * 8 >= probe * 7
+            (exact, probe)
         };
-        let scale = hint.scale.filter(|&(e, m)| fits(e, m)).or_else(|| {
-            if hint.skip > 0 {
-                hint.skip -= 1;
-                return None;
-            }
-            (0..=9)
-                .flat_map(|e| [(e, false), (e, true)])
-                .find(|&(e, m)| fits(e, m))
-        });
-        let Some((exponent, multiply)) = scale else {
+        let scale = hint
+            .scale
+            .filter(|&(e, m)| {
+                let (exact, n) = fits(e, m);
+                exact == n
+            })
+            .or_else(|| {
+                if hint.skip > 0 {
+                    hint.skip -= 1;
+                    return None;
+                }
+                let mut fallback = None;
+                for e in 0..=9 {
+                    for mode in [Scale::Divide, Scale::Multiply, Scale::MilliTwice] {
+                        if matches!(mode, Scale::MilliTwice) && e != 6 {
+                            continue;
+                        }
+                        let (exact, n) = fits(e, mode);
+                        if exact == n {
+                            return Some((e, mode));
+                        }
+                        if fallback.is_none() && exact * 8 >= n * 7 {
+                            fallback = Some((e, mode));
+                        }
+                    }
+                    if fallback.is_some() {
+                        return fallback;
+                    }
+                }
+                None
+            });
+        let Some((exponent, mode)) = scale else {
             hint.scale = None;
             hint.failures = hint.failures.saturating_add(1).min(6);
             hint.skip = (1 << hint.failures) - 1;
@@ -93,7 +122,7 @@ impl FloatEncoder {
             let i = (v * factor).round() as i64;
             self.integers.push(i);
             self.residuals
-                .push((v.to_bits() ^ reconstruct(i, factor, multiply).to_bits()) as i64);
+                .push((v.to_bits() ^ reconstruct(i, factor, mode).to_bits()) as i64);
         }
         let mut graph = GraphBuilder::new(values.len());
         let ints = graph.add_ints_fast(&self.integers);
@@ -101,11 +130,11 @@ impl FloatEncoder {
         let b = Builder::new(if exceptions { 2 } else { 1 });
         let mut output = b.r(Op::I64ToF64, b.input(0));
         if exponent != 0 {
-            output = b.rf(
-                if multiply { Op::F64MulI } else { Op::F64DivI },
-                output,
-                if multiply { 1.0 / factor } else { factor },
-            );
+            output = match mode {
+                Scale::Divide => b.rf(Op::F64DivI, output, factor),
+                Scale::Multiply => b.rf(Op::F64MulI, output, 1.0 / factor),
+                Scale::MilliTwice => b.rf(Op::F64DivI, b.rf(Op::F64DivI, output, 1000.), 1000.),
+            };
         }
         let mut inputs = vec![ints];
         if exceptions {
@@ -142,11 +171,11 @@ impl FloatEncoder {
     }
 }
 
-fn reconstruct(i: i64, scale: f64, multiply: bool) -> f64 {
-    if multiply {
-        i as f64 * (1.0 / scale)
-    } else {
-        i as f64 / scale
+fn reconstruct(i: i64, scale: f64, mode: Scale) -> f64 {
+    match mode {
+        Scale::Divide => i as f64 / scale,
+        Scale::Multiply => i as f64 * (1.0 / scale),
+        Scale::MilliTwice => i as f64 / 1000. / 1000.,
     }
 }
 
@@ -173,6 +202,45 @@ pub fn decode_f64(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn decimal_recipes_avoid_residuals_and_revalidate_hints() {
+        let mut encoder = FloatEncoder::default();
+        let mut hint = FloatHint::default();
+        for mode in [
+            Scale::Divide,
+            Scale::Multiply,
+            Scale::MilliTwice,
+            Scale::Divide,
+        ] {
+            let values: Vec<_> = (0..128)
+                .map(|i| reconstruct(5_620_066_438 + (i * 7919 % 12347), 1e6, mode))
+                .collect();
+            let bytes = encoder.encode(&values, &mut hint);
+            assert!(
+                matches!(hint.scale, Some((6, actual)) if std::mem::discriminant(&actual) == std::mem::discriminant(&mode))
+            );
+            let decoded = decode_f64(
+                &bytes,
+                values.len(),
+                0..values.len(),
+                &DecodeBudget::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                decoded.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                values.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+            let graph =
+                zform_core::payload::graph::PayloadGraph::decode(&bytes, &DecodeBudget::default())
+                    .unwrap();
+            assert_eq!(
+                graph.nodes.len(),
+                2,
+                "exact scaling should need one integer stream and one program"
+            );
+        }
+    }
+
     #[test]
     fn exact_bits_survive_decimal_hints_exceptions_and_precision_drift() {
         let mut encoder = FloatEncoder::default();
