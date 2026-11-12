@@ -1,20 +1,15 @@
 # `zform` Benchmarks
 
-`run.py` builds `zform` in release mode, generates deterministic synthetic corpora, and compares it with `gzip`, `zstd` and `xz` on ratio, throughput and peak RSS, checking a SHA-256 roundtrip for every codec:
-
-```bash
-python3 bench/run.py
-```
-
-Every codec runs on one thread. Timings are the best of `--repeats` runs (default 3) and include process startup and file I/O. Peak RSS comes from GNU `time` and prints as `n/a` without it. `--markdown` appends the tables used in the top-level README.
-
-To include local real-world archives (such as Loghub `HDFS.log` or GitHub Archive `.json.gz`):
+`run.py` builds `zform` in release mode and compares it with `gzip`, `zstd` and `xz` on ratio, throughput and peak RSS, checking a SHA-256 roundtrip for every codec. It runs on whichever of these local corpora it is given: Loghub `HDFS.log` and a GitHub Archive hour, each cut to `--slice-mb` (default 8) at a line, and the Silesia corpus's `sao`, taken whole:
 
 ```bash
 python3 bench/run.py \
   --hdfs /path/to/HDFS.log \
-  --gharchive /path/to/2020-06-17-16.json.gz
+  --gharchive /path/to/2020-06-17-16.json.gz \
+  --sao /path/to/silesia/sao
 ```
+
+Every codec runs on one thread. Timings are the best of `--repeats` runs (default 3) and include process startup and file I/O. Peak RSS comes from GNU `time` and prints as `n/a` without it. `--markdown` appends the tables used in the top-level README.
 
 ## Queries
 
