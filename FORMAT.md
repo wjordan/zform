@@ -6,13 +6,13 @@
 2. **`ZFIX` / `ZFIE`**: the index region over a data region, appended to it or stored apart.
 3. **`ZFP1`**: a trained model saved as a profile (`.zfp`).
 
-This document describes the container: leaves, frames, the parts of a block, the index region and the profile file. It lists the model's record families, the nodes of a column payload and how blocks share programs. The serialized model, the operands of each node and the program instruction set are so far defined only by the reference implementation in `crates/zform-core`. The format is experimental and changes without notice.
+The container holds structural models and self-describing column payloads. [§4](#4-model-and-column-payloads) describes how those payloads reconstruct values, with a worked example, graph operands, integer encodings, lane instructions, recurrences, and shared code. The serialized structural model is defined by the implementation in [`grammar.rs`](crates/zform-core/src/grammar.rs) and [`json_tree.rs`](crates/zform-core/src/json_tree.rs). The format is experimental and changes without notice.
 
 Fixed-width integers are little-endian (`LE`). `uvarint` is 7-bit LEB128 (up to 10 bytes for a `u64`); `ivarint` is the `uvarint` of the ZigZag mapping `(x << 1) ^ (x >> 63)`.
 
 ---
 
-## 1. Entropy leaf
+## 1. entropy leaf
 
 Every compressed buffer in a frame, an index region or a profile is a leaf that names its own backend:
 
@@ -63,7 +63,7 @@ A `.zfm` file is one or more `ZFM1` frames, optionally followed by a `ZFIX` inde
 
 `content_xxh64` is the XXH64 of the frame's uncompressed bytes with seed `0x5A464D31`.
 
-### Frame flags (`u16`)
+### frame flags (`u16`)
 | Bit | Name | Meaning |
 |---:|---|---|
 | `0x0001` | `FLAG_HAS_CHECKSUM` | The trailing `content_xxh64` is present. |
@@ -74,7 +74,7 @@ A `.zfm` file is one or more `ZFM1` frames, optionally followed by a `ZFIX` inde
 
 A dictionary frame comes first in its stream. Its payload is one entropy leaf holding the dictionary's content, `raw_len` is the content's length, and `content_xxh64`, which is required, is the dictionary's id. The `ZstdDict` leaves of the frames after it, up to the next index region, decode against that content. Content that begins with Zstandard's dictionary magic `37 A4 30 EC` is not valid; a writer puts a zero byte before it.
 
-### Record framing (`ResolvedFraming`)
+### record framing (`ResolvedFraming`)
 - `0` (`Lf { open_end: u8 }`): `\n`-delimited lines (`open_end = 1` if the last byte is not `\n`).
 - `1` (`Crlf { open_end: u8 }`): `\r\n`-delimited lines.
 - `2` (`Nul { open_end: u8 }`): `\0`-delimited records.
@@ -84,7 +84,7 @@ A dictionary frame comes first in its stream. Its payload is one entropy leaf ho
 
 ---
 
-## 3. Block
+## 3. block
 
 Rows of a block stay in arrival order. A column holds a value only for the rows or array elements where its path or template slot occurs, so an absent field costs nothing per row.
 
@@ -95,116 +95,256 @@ Rows of a block stay in arrival order. A column holds a value only for the rows 
 | [n_struct_streams]: uvarint                                       |
 | [json_struct]:      [u32_seq; n_struct_streams]                   |
 | n_shared_dicts:     uvarint                                       |
-| shared_dicts:       [(len: uvarint, DictTable); n_shared_dicts]   |
+| shared_dicts:       [(len: uvarint, PayloadGraph); n_shared_dicts]|
 | has_prose_pool:     u8 (0 or 1)                                   |
 | [prose_pool]:       len: uvarint, EntropyLeaf                     |
 | col_lengths:        [uvarint; n_cols]                             |
-| col_blobs:          [(occ_count: uvarint, DenseColPayload); N]    |
+| col_blobs:          [ColumnPayload; n_cols]                      |
 +-------------------------------------------------------------------+
 ```
 
-Every part decodes on its own once the parts it depends on are present: a column names the shared dictionary, the prose pool and the source columns it reads in its header. A column no row has a value in is the single byte `0`.
+`u32_seq` is an `IntStream` (§4) whose decoded values must fit `u32`. Each `ColumnPayload` starts with its occurrence count: this is the graph's `rows` field, not a separate prefix. An empty column is the single byte `0`. Nonempty columns hold a `PayloadGraph` or the [nested-column wrapper](#nested-columns).
+
+Every part decodes once its dependencies are present: a graph declares the shared dictionary, prose pool, and source columns it reads in its header. Code references resolve against the model's library.
 
 ### JSON structure streams
 Each object path has a shape stream (one shape id per occurrence, `0` for a value stored as a cell), each array path a count stream, and each path with derivation candidates a selector stream. At a path that has a table of its own, a non-object value such as `null` is a slot of the parent's shape whose value the child stores as a cell, and an empty `[]` is an array slot with count `0`, so neither adds a shape to the parent.
 
-### Shared tables
-- **Shared dictionaries** (`shared_dicts`): columns whose string values overlap (GitHub `actor.login`, `user.login`, `owner.login`; source and destination addresses) share one `DictTable` per block and each store a stream of ordinals into it. The table is the smallest of a frequency-sorted, a first-seen and a sorted front-coded FSST encoding.
-- **Prose pool** (`prose_pool`): free-text columns whose cells average 40 bytes or more (`body`, commit messages) are concatenated into one buffer compressed as a whole, when at least two columns qualify and the pool makes the block smaller. Each such column becomes a `ProseSlice`: its offset and length in the pool and a `u32_seq` of cell lengths. Columns that hold raw JSON subtrees stay out of it, so a field read inside one does not fetch the pool.
+### shared tables
+- **Shared dictionaries** (`shared_dicts`): columns whose string values overlap (GitHub `actor.login`, `user.login`, `owner.login`; source and destination addresses) share a table of cells per block. Each table is itself a `PayloadGraph`. A consuming graph uses `ExtDict` and `IndexCells` with a stream of ordinals.
+- **Prose pool** (`prose_pool`): free-text columns whose cells average 40 bytes or more (`body`, commit messages) share one compressed buffer. Pooling requires at least two qualifying columns and must make the block smaller. A consuming graph uses `ExtPool` and `SliceBuf` with its base offset and a stream of cell lengths. Columns that hold raw JSON subtrees stay out of it, so a field read inside one does not fetch the pool.
 
 ---
 
-## 4. Model and column payloads
+## 4. model and column payloads
+
+Payload reference: [overview](#column-payloads), [example](#worked-example), [graph layout](#graph-layout), [nodes](#node-operands), [integer streams](#integer-streams), [programs](#lane-programs), [recurrences](PROGRAMS.md#recurrences), [shared code](#program-library).
 
 ### `ModelPlan` variants
-A model routes each record to one variant, by tag:
-- `0 = Residual`: the record verbatim, in the `$residual` column.
+
+A model routes each record to one variant; the block's `variant_ids` name it per record. A reader knows three kinds, by tag:
+
+- `0 = Shape`: `n: uvarint`, then `n + 1` literals (`blob` each), then `n` slot column ids (`uvarint` each). The record is `lit[0] cell lit[1] cell ... lit[n]`, each cell being the next unread cell of its slot's column. A column may fill several slots of a shape and slots of many shapes.
 - `1 = JsonTree`: a tree of JSON paths. Objects have shape tables with inline constant fields, arrays have count streams (`$.payload.commits[]`), scalars are typed cells, a string holding JSON may carry a nested plan one level deep, and a value may be derived from other paths by `Copy`, `Affix` or `MultiConcat` candidates. The trainer keeps up to 1,024 paths and a decoder accepts 2,048.
-- `3 = Envelope`: a Kubernetes CRI (`<ts> stdout|stderr F|P <inner>`) or syslog (`[<pri>]<ts> <host> <tag>: <inner>`) prefix around an inner `ModelPlan`.
-- `4 = Logfmt`: `key=value` pairs in any key order, through `$logfmt.recipe` and `$logfmt.overflow`.
-- `5 = Template`: literal text with typed slots (`IPv4`, `:port`, `blk_<i64>`, timestamps, UUIDs); slots of the same kind and context share a column (`$ts`, `$traceparent`, `$ip.<ctx>`, `$blk_id`, `lvl`).
-- `6 = Csv`: `,` or `\t` separated fields and a per-row quote bitmask.
-- `7 = BinaryStride`: field slices of fixed-stride binary records.
+- `2 = ShapeCell`: `col: uvarint`. The next cell of `col` holds a shape in the encoding above and the record follows it. This carries layouts that vary by row: key order, optional fields, per-field quoting.
 
-Tag `2` is unused and rejected.
+Variant `0` of every model is a one-slot shape with empty literals over `$residual`: the record verbatim. Other tags are rejected. A slot id outside the column table is rejected when the model is decoded; a `ShapeCell` shape is checked when its cell is read and may not name its own column.
 
-### Program library
+Record syntax is the writer's business. Its front ends (a template miner, Kubernetes CRI and syslog prefixes, logfmt, CSV, fixed-stride binary) choose columns and emit shapes: separators, keys and quotes are literals, and a field's name is its column's name. A new syntax needs a front end and no reader change. After the variants comes `hints: blob`, which a reader skips: per variant, the front end that made it and its parameters, so a profile splits new records the same way.
+
+### column payloads
+
+A `PayloadGraph` describes how to reconstruct one column. Writer-side `CodecPack`s recognize value patterns and emit graphs; `PackRegistry` compares their encoded costs. The reader executes the selected graph with `CoreDecoder`. No pack name or domain-specific codec id is stored in the payload.
+
+The graph has three kinds of intermediate values:
+
+| Value | Contents | Uses |
+|---|---|---|
+| Buffer | A byte sequence | Literal data, dictionary bytes, lookup tables, recurrence output |
+| Integers | A sequence of 64-bit lanes | Ordinals, lengths, residuals, arithmetic inputs, native numeric output |
+| Cells | A sequence of byte strings | Exact field spellings, including quotes, signs, and padding |
+
+Nodes form a directed acyclic graph, serialized in dependency order. A node refers only to earlier nodes by zero-based index. The root supplies the result: cells for a record column, or integers for a native numeric column. Intermediate sequences may have different lengths, such as dictionary entries and exception values. The root's length must equal `rows`, which counts field occurrences rather than records. A field in an array can occur several times per record; an absent field contributes no cell.
+
+The structural model maps those occurrences back to records and assembles record bytes. It also supplies any shared code library. A standalone graph with inline code and no external dependencies decodes without a structural model.
+
+A new writer-side pack can use existing primitives without changing readers. A new node kind, instruction, or entropy backend requires reader support.
+
+### worked example
+
+One possible graph for the cells `auth`, `auth`, `cart` is:
+
+```text
+rows = 3, flags = 0
+
+node 0: IntStream [0, 0, 1]              -> integers (row ordinals)
+node 1: Bytes "authcart"                 -> buffer
+node 2: DictCells(codes = 0,
+                  dict_ends = [4, 8],
+                  dict_bytes = 1)       -> cells ["auth", "auth", "cart"]
+root = 2
+```
+
+`dict_ends` is an inline `IntStream` of cumulative byte offsets, so the dictionary is `auth`, then `cart`. `CoreDecoder` needs only the node semantics to reconstruct the column. The writer may select a different graph if it is smaller.
+
+A complete payload for three copies of `ok` is nine bytes:
+
+```text
+03 00 01 0f 03 02 6f 6b 00
+|  |  |  |  |  |  ----- |
+|  |  |  |  |  |   "ok" root = 0
+|  |  |  |  |  byte length = 2
+|  |  |  |  count = 3
+|  |  |  ConstCells tag = 15
+|  |  node count = 1
+|  flags = 0
+rows = 3
+```
+
+The public API builds and decodes the same format without a record container:
+
+```rust
+use zform::{CoreDecoder, DecodeBudget, PackRegistry};
+
+fn main() -> zform::Result<()> {
+    let values: &[&[u8]] = &[b"auth", b"auth", b"cart"];
+    let payload = PackRegistry::default().encode_best(values);
+    let cells = CoreDecoder::decode_bytes(&payload, &DecodeBudget::default())?;
+    assert_eq!(cells.iter().collect::<Vec<_>>(), values);
+
+    let repeated = [0x03, 0x00, 0x01, 0x0f, 0x03, 0x02, b'o', b'k', 0x00];
+    let cells = CoreDecoder::decode_bytes(&repeated, &DecodeBudget::default())?;
+    assert_eq!(cells.iter().collect::<Vec<_>>(), vec![&b"ok"[..]; 3]);
+    Ok(())
+}
+```
+
+### graph layout
+
+```text
+rows: uvarint | flags: u8 | [dict_id: uvarint] | [n_src: uvarint | src: [uvarint; n_src]] | n_nodes: uvarint | nodes | root: uvarint
+```
+
+A graph with no rows is exactly one byte, `0`, with no flags or nodes. Nonempty general graphs have 1–4,096 nodes. Their dependency flags combine as follows:
+
+| Flag | Following header fields | Dependency |
+|---:|---|---|
+| `0x01` | None | The block's prose pool |
+| `0x02` | `dict_id: uvarint` | One shared dictionary of cells in the block |
+| `0x04` | `n_src: uvarint`, then `src: [uvarint; n_src]` | 1–64 peer column ids in the block |
+
+`ExtPeer.slot` indexes the header's `src` list; it is not a column id. `ExtDict.dict_id` must match the header's dictionary id. These declarations let a reader fetch dependencies without evaluating nodes. The model's library supplies code references separately. A missing external input returns `Error::NotLoaded`; an undeclared input is a format error.
+
+All node references must point backward. `root` must name a node. Unknown flags, unknown node kinds, and trailing graph bytes are rejected. Graphs have no separate magic, version, or checksum; the enclosing column length bounds their bytes and frame checksums protect the record stream.
+
+Two standalone numeric graph forms omit the node directory. Their flags are exact
+values, not bits to combine with external dependencies:
+
+- `flags = 0x08`: one `IntStream`, which is the root.
+- `flags = 0x10`: one `IntStream`, followed by a `Program` through the end of
+  the payload. The root is a `ProgramI64` with that stream as its sole input and no
+  buffers. Its only output is an eight-byte lane. The stream length must equal `rows`.
+
+These forms have inline code and no external dependencies or library references. General numeric graphs can also end at `IntStream` or `ProgramI64` nodes. `CoreDecoder::decode_ints_bytes` returns their native lanes; `decode_bytes` expects byte-string cells.
+
+### node operands
+
+Each node starts with `tag: u8`. The low seven bits select its kind. Bit `0x80` means `include_seed` for `RecurBuf` and `has_map` for `QuoteOrNull`; writers leave it clear for other kinds.
+
+Unless typed otherwise, operands are `uvarint`. `ref` names an earlier node; `refs` is a count followed by that many references. `blob` is a byte length followed by those bytes. A `leaf_blob` is a `blob` containing one complete entropy leaf (§1). `IntStream` and code references have their own layouts below.
+
+| Kind | Node | Operands, in wire order | Result |
+|---:|---|---|---|
+| `0` | `Bytes` | `leaf_blob` | Buffer expanded from the leaf |
+| `1` | `IntStream` | `stream: IntStream` | Integers |
+| `2` | `ByteChunks` | `buf: ref`, `chunk_bytes: u8` | Integers from 1–8 byte LE chunks; short chunks are zero-extended |
+| `3` | `MtfFixed` | `codes: ref`, `fallback_buf: ref`, `width: u8` | Buffer of fixed-width items, width 1–64 |
+| `4` | `DictCells` | `codes: ref`, `dict_ends: IntStream`, `dict_bytes: ref` | Cells selected by zero-based dictionary ordinals |
+| `5` | `RecurBuf` | `spec: code_ref`, `seed: ref`, `cols: refs`, `out_words` | Buffer of recurrence output words, optionally prefixed with seed bytes |
+| `6` | `ProgramI64` | `prog: code_ref`, `inputs: refs`, `bufs: refs` | Integer lanes from one eight-byte output of a 64-bit program |
+| `7` | `ProgramCells` | `prog: code_ref`, `inputs: refs`, `bufs: refs` | One cell per input row, concatenating the program's outputs |
+| `8` | `PatchCells` | `base: ref`, `indices: ref`, `values: ref` | Base cells with exception cells substituted |
+| `9` | `ConcatCells` | `parts: refs` | Row-wise concatenation of 1–32 cell sequences |
+| `10` | `ByteUnshuffle` | `buf: ref`, `width: u8` | Buffer interleaving byte planes into items of width 1–64 |
+| `11` | `MtfInts` | `codes: ref`, `misses: ref`, `window` | Integer move-to-front decoding, window 1–4,096 |
+| `12` | `SliceBuf` | `buf: ref`, `base`, `lens: ref` | Consecutive cells of the given lengths, starting at byte offset `base` |
+| `13` | `IndexCells` | `source: ref`, `indices: ref` | Cells selected by zero-based indices |
+| `14` | `TemplateCells` | `template: ref`, `slots: refs` | Templates with same-row slot values inserted; 1–64 slots |
+| `15` | `ConstCells` | `count`, `value: blob` | `count` copies of the literal cell |
+| `16` | `QuoteOrNull` | `inner: ref`, `[map: ref]` | Double-quoted inner cells, or literal `null` for negative map entries |
+| `17` | `ParseAsciiInt` | `cells: ref` | Integers parsed from optionally quoted ASCII, with optional sign; invalid cells produce zero |
+| `18` | `ExtPool` | None | The declared external prose buffer |
+| `19` | `ExtDict` | `dict_id` | The declared external dictionary cells |
+| `20` | `ExtPeer` | `slot` | Cells from that slot in the declared peer list |
+| `21` | `LibraryBytes` | `id` | Buffer from a byte-table library entry |
+
+`MtfFixed` keeps the last 64 items, most recent first. Code `0` consumes the next `width` fallback bytes and inserts that item. Code `k > 0` selects rank `k - 1` and moves it to the front. `MtfInts` uses the same code convention with integer misses and its explicit window.
+
+`DictCells.dict_ends` contains cumulative byte offsets, ending at the buffer's length. `PatchCells.indices` holds the first absolute occurrence index followed by nonnegative differences from the previous patch index. `ConcatCells` concatenates bytes within each row, not whole columns end to end.
+
+`TemplateCells` copies literal bytes until `0x1f`. The next byte is either `0xff`, meaning a literal `0x1f`, or `(slot << 1) | strip`. A slot inserts that row's cell; `strip = 1` removes its first and last byte when it has at least two bytes. All template and slot sequences have the same row count.
+
+`QuoteOrNull` adds quotes without escaping the inner bytes. With a map, a nonnegative value selects an inner cell and a negative value emits `null`. Without a map, inner cell `i` supplies output cell `i`. The writer applies it only when this preserves the original bytes.
+
+### integer streams
+
+An `IntStream` starts with `kind: u8`, then `length: uvarint`, followed by the operands below. Its result is `length` signed 64-bit lanes. This transport is also used for block structure streams and embedded dictionary ends.
+
+| Kind | Encoding | Following operands |
+|---:|---|---|
+| `0` | Constant | `value: ivarint` |
+| `1` | Run length | `leaf_blob` |
+| `2` | Frame of reference, bit-packed | `min: ivarint`, `bits: u8`, `leaf_blob` |
+| `3` | ZigZag varints | `leaf_blob` |
+| `4` | Frame of reference, byte planes | `min: ivarint`, `width: u8`, `leaf_blob` |
+| `5` | Frame of reference, byte head and exceptions | `min: ivarint`, `head: leaf_blob`, `tail: IntStream` |
+| `6` | ZigZag byte head and exceptions | `head: leaf_blob`, `tail: IntStream` |
+| `7` | Shifted constant | `shift: u8`, `coefficient: ivarint` |
+| `8` | Centered Rice | `bytes: blob` |
+
+- **Constant:** repeat `value`. A shifted constant repeats `coefficient << shift`; the shift is 1–63 and must preserve the signed coefficient without overflow.
+- **Run length:** the expanded leaf holds `n_runs: uvarint`, then `(value: ivarint, count: uvarint)` pairs. Counts sum to `length`.
+- **Bit-packed:** the expanded leaf holds unsigned offsets from `min`, each in `bits` bits, least-significant bit first. `bits` is 0–64. Add `min` with 64-bit wrapping arithmetic to reconstruct each lane.
+- **ZigZag varints:** the expanded leaf holds exactly `length` `ivarint` values.
+- **Byte planes:** `width` is 1, 2, 4, or 8. The expanded leaf holds `length * width` bytes: all low bytes of unsigned offsets from `min`, then all second bytes, and so on. Interleave and add `min` with 64-bit wrapping arithmetic.
+- **Byte head and exceptions:** the expanded head holds one byte per lane. Bytes 0–254 represent offsets from `min` (kind `5`) or ZigZag codes (kind `6`). Byte 255 consumes the next tail value and adds 255 to obtain the offset or ZigZag code. Each exception consumes exactly one tail value. Kind `5` tails must be nonnegative; kind `6` tails carry unsigned bit patterns in signed lanes. Tail nesting permits at most four edges from the outer stream.
+- **Centered Rice:** `bytes` contains `center: ivarint`, `k: u8`, then a least-significant-bit-first bitstream. ZigZag-encode each signed difference from `center`. Write `code >> k` zero bits, one bit, then the low `k` bits. `k` is 0–63. Decoders reject arithmetic overflow, truncation, trailing bytes, and nonzero padding.
+
+Delta reconstruction, common integer factors, floating-point scaling, and formatting are programs around these transports. They have no separate `IntStream` mode or domain tag.
+
+### lane programs
+
+`ProgramI64` and `ProgramCells` run a `Program`: a straight-line sequence of instructions over 32- or 64-bit lanes, evaluated once per row. `RecurBuf` runs a recurrence, whose next state word depends on earlier ones. [`PROGRAMS.md`](PROGRAMS.md) specifies both: the encoding, the instruction set, the compact form, and recurrences.
+
+### program library
+
 A `ModelPlan`, nested ones included, ends with the programs and tables its blocks share:
 
 ```text
 n_entries: uvarint | entries: [(kind: u8, body_len: uvarint, body); n_entries]
 ```
 
-`kind` is `0` for a program, `1` for a recurrence and `2` for a table of bytes. A library holds at most 4,096 entries. Blocks name an entry by its index, so a block needs nothing beyond the model it is already read with. The blocks of a nested column use the nested plan's library.
+`kind` is `0` for a `Program`, `1` for a recurrence specification, and `2` for raw table bytes. A library holds at most 4,096 entries. Blocks name an entry by its zero-based index. The blocks of a nested column use the nested plan's library.
 
-### Column payloads
-A column's payload is a graph the reader evaluates without knowing what the column holds. A timestamp, a UUID or a generator's output is a writer's choice of nodes and programs, not a codec the reader has:
+### code references
 
-```text
-rows: uvarint | flags: u8 | [dict_id: uvarint] | [n_src: uvarint | src: [uvarint; n_src]] | n_nodes: uvarint | nodes | root: uvarint
-```
-
-A column with no rows is the single byte `0`. `flags` bit `0x01` says the column reads the prose pool, `0x02` that `dict_id` follows, `0x04` that the source columns follow. A node is a kind byte and operands that name earlier nodes; `root` is the node whose cells are the column.
-
-Two standalone numeric graph forms omit the node directory. Their flags are exact
-values, not bits to combine with external dependencies:
-
-- `flags = 0x08`: one `IntStream`, which is the root.
-- `flags = 0x10`: one `IntStream`, followed by the program bytes through the end of
-  the payload. The root is a `ProgramI64` with that stream as its sole input and no
-  buffers. Its only output is an eight-byte lane. The stream length must equal `rows`.
-
-`IntStream` kind `7` stores a shifted constant as `length: uvarint`, `shift: u8`,
-`coefficient: ivarint`. Its value is `coefficient << shift`. The shift is 1–63 and
-must not discard significant signed bits. This is selected only when it is shorter
-than the ordinary constant representation.
-
-`IntStream` kind `8` stores centered Rice codes as `length: uvarint`,
-`byte_length: uvarint`, then the framed bytes: `center: ivarint`, `k: u8`,
-and a least-significant-bit-first bitstream. Each signed difference from `center`
-is zigzag encoded, then written as `code >> k` zero bits, one bit, and the low
-`k` bits. `k` is 0–63. Decoders reject arithmetic overflow, truncation, trailing
-bytes and nonzero padding. The encoder compares exact byte costs for short lanes.
-
-Numeric normalization uses ordinary programs: `MulI`/`AddI` reconstruct a common
-integer factor and offset; floating decimal reconstruction may use `F64DivI`,
-`F64MulI`, or consecutive divisions to preserve the original rounding order.
-
-| Kind | Node | Kind | Node |
-|---:|---|---:|---|
-| `0` | `Bytes`, an entropy leaf | `11` | `MtfInts`, move-to-front integers |
-| `1` | `IntStream`, an integer sequence | `12` | `SliceBuf`, cells cut from a buffer |
-| `2` | `ByteChunks` | `13` | `IndexCells`, cells picked by index |
-| `3` | `MtfFixed` | `14` | `TemplateCells` |
-| `4` | `DictCells` | `15` | `ConstCells` |
-| `5` | `RecurBuf`, a recurrence's output | `16` | `QuoteOrNull` |
-| `6` | `ProgramI64`, a program giving integers | `17` | `ParseAsciiInt` |
-| `7` | `ProgramCells`, a program giving cells | `18` | `ExtPool`, the prose pool |
-| `8` | `PatchCells`, cells with exceptions | `19` | `ExtDict`, the shared dictionary |
-| `9` | `ConcatCells` | `20` | `ExtPeer`, a source column |
-| `10` | `ByteUnshuffle` | `21` | `LibraryBytes` |
-
-A program is a straight-line list of instructions over 32- or 64-bit lanes, one lane per row; a recurrence makes each word from earlier words of its own output. The operands of each node, the modes of an integer sequence and the instruction set are so far defined only by `payload/graph.rs`, `payload/ir.rs` and `payload/recur.rs`.
-
-A program header of `0x81` encodes a linear 64-bit lane program: `n_ops: uvarint`,
-then each opcode and its immediate, if any. There is one input and no tables or
-buffers; each instruction takes the previous lane and the last lane is the sole
-eight-byte output. Only unary opcodes that need no table or buffer are allowed.
-Shift immediates are one byte in 0–63, integer immediates are `ivarint`, and floating
-immediates are `uvarint` of their byte-swapped IEEE-754 bits. All other program
-headers retain explicit input, table, operand and output information.
-
-### Code references
 Nodes `5`, `6` and `7` hold their recurrence or program as a code reference `t: uvarint`:
 
 - `t` even: the code follows inline, in `t >> 1` bytes.
-- `t` odd: the code is entry `t >> 1` of the library, which must be of the node's kind. For a program, overrides follow: `n: uvarint`, then `n` pairs `(skip: uvarint, value: ivarint)`.
+- `t` odd: entry `t >> 1` of the library supplies the code. Node `5` requires a recurrence entry; nodes `6` and `7` require a program entry. Program overrides follow: `n: uvarint`, then `n` pairs `(skip: uvarint, value: ivarint)`.
 
-A program's values are the immediates of its instructions in order, then the widths of its fixed-width outputs in order. An override replaces one value: the first pair names value `skip`, each later pair the value `skip + 1` after the one before it. The program that results is checked as an inline one is. So a program that differs between blocks only in its constants (a starting state, a field width) is stored once, and each block stores the constants.
+A program's values are the immediates of its instructions in order, then the widths of its fixed-width outputs in order. The first override replaces value `skip`. Each later override advances by `skip + 1` values from the previous override. The resulting constants receive the same validation as inline code. A program shared across blocks is stored once; each block stores only the constants it changes, such as a starting state or field width.
 
 Node `21` is `id: uvarint` and stands for a `Bytes` node holding library table `id`.
 
-A writer builds the library of a sync frame from the programs that frame's blocks use and writes it with the frame's model; the frames that reuse the model reuse the library. Code a library lacks, or whose reference and overrides would be larger, is stored inline.
+A writer builds a sync frame's library from its blocks' programs and writes it with the model. Frames reusing that model also reuse the library. Code stays inline when the library lacks it or a reference and overrides would be larger.
+
+### nested columns
+
+A column whose model supplies a nested plan uses a container wrapper instead of a graph:
+
+```text
+rows: uvarint | 0x80: u8 | is_json_tagged: u8
+row_modes: u32_seq | child_block: blob | [fallback_graph: blob]
+```
+
+`row_modes` has one entry per occurrence. Mode `1` consumes a child record. Mode `2` consumes a child record and restores a trailing newline for JSON-tagged values. Mode `3` consumes a fallback cell. The fallback graph is present only when mode `3` occurs. JSON-tagged values receive an internal `1` byte for child records or `0` for fallbacks. The structural model uses these tags when restoring the enclosing JSON string. Envelope inner records use untagged values. The child block decodes with the nested model and its library. `0x80` is not a `PayloadGraph` flag accepted by `CoreDecoder`.
+
+### decoding and implementation map
+
+`PayloadGraph::decode` parses standalone graphs against an empty library; `decode_linked` resolves references against a supplied library. `CoreDecoder` takes the parsed graph, declared external inputs, and a `DecodeBudget`. Node input types, lengths, indices, program arity, output widths, and allocation limits are checked while parsing or executing. `decode_col` preserves lazy constant, dictionary, pool, and quoted views where possible; `decode_cells` materializes cells and `decode_ints` returns integer lanes.
+
+| Contract | Implementation |
+|---|---|
+| Graph wire layout, nodes, integer streams, evaluation | [`payload/graph.rs`](crates/zform-core/src/payload/graph.rs) |
+| Program encoding and instruction validation | [`payload/ir.rs`](crates/zform-core/src/payload/ir.rs) |
+| Program execution | [`payload/engine.rs`](crates/zform-core/src/payload/engine.rs) |
+| Recurrence encoding and execution | [`payload/recur.rs`](crates/zform-core/src/payload/recur.rs) |
+| Centered Rice bitstream | [`payload/rice.rs`](crates/zform-core/src/payload/rice.rs) |
+| Library entries and constant overrides | [`payload/library.rs`](crates/zform-core/src/payload/library.rs) |
+| Writer-side pattern recognition and graph selection | [`packs.rs`](crates/zform-core/src/packs.rs) |
+| Block dependency loading | [`codecs.rs`](crates/zform-core/src/codecs.rs) |
+| Nested-column wrapper | [`container.rs`](crates/zform-core/src/container.rs) |
 
 ---
 

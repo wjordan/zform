@@ -1,9 +1,9 @@
 # `zform` design: queryable files and embedding
 
-The wire layout is in [`FORMAT.md`](FORMAT.md). [Status](#status) lists what is built and what
-is not, and [Evidence](#evidence) the measurements the decisions rest on.
+The wire layout, including column graphs, is in [`FORMAT.md`](FORMAT.md); the instruction set
+graphs compute with is in [`PROGRAMS.md`](PROGRAMS.md). Benchmark commands are in [`bench/README.md`](bench/README.md).
 
-## Scope
+## scope
 
 `zform` stores records, which are byte strings, and returns them byte-exact. A file answers three
 questions without being unpacked: which rows match a predicate, what those records are, and what
@@ -13,11 +13,12 @@ Its peers are compressed log stores (CLP, LogGrep) and seekable zstd. It has no 
 bytes rather than typed vectors, and has no aggregation kernels, so against Parquet or Vortex the
 comparison that applies is file size and the bytes and round trips of a selective read.
 
-## Layers
+## layers
 
 | Layer | Owns | API |
 |---|---|---|
 | Model | how records split into columns and how columns relate | `train`, `Profile` |
+| Payload | how column values are reconstructed from generic operations | `PayloadGraph`, `CoreDecoder` |
 | Block | a run of records as column parts | `zform::block` |
 | File | a stream of blocks and the index over them | `zform::file` |
 | Host | where bytes live, and all data that is not record bytes | the host's code |
@@ -25,7 +26,38 @@ comparison that applies is file size and the bytes and round trips of a selectiv
 A host is the `zform` CLI reading a `.zfm` file, or a database that keeps a zform file inside its
 own object next to its own columns and indexes.
 
-## File layout
+## self-describing payloads
+
+The structural model routes records into columns and describes how to assemble them again.
+Each column's payload carries the graph that reconstructs its values. Graph nodes produce
+byte buffers, integer lanes, or byte-string cells; the root supplies the column's output.
+The payload's row count counts field occurrences, which can differ from the block's record count.
+
+`CodecPack` and `PackRegistry` belong to the writer. Packs recognize value patterns and emit
+candidate graphs; the writer compares their encoded costs, including code sharing. A pack
+for a timestamp can emit integer residuals, arithmetic, and a program that formats bytes.
+`CoreDecoder` executes those primitives without knowing the timestamp format or the pack.
+A new pack using existing nodes and instructions needs no reader changes. Adding a node or
+instruction changes the decoder's contract; the format is experimental and is not frozen.
+
+Each model carries a library of shared programs, recurrences, and byte tables. Column graphs
+can name library entries and override a program's constants for the block, so code does not
+repeat with every column or block. Inline code handles programs absent from the library.
+The library travels with the model in streams and profiles; it needs no external registry.
+
+A column header declares its dependencies on the block's prose pool, one shared dictionary,
+and peer columns. The index records those dependencies so a selective read fetches the parts
+needed to evaluate the graph. Shared code in the model and shared data in the block have
+separate lifetimes. Neither creates a dependency on another block's column data.
+
+`CoreDecoder::decode_col` preserves constant, dictionary, pooled, and quoted columns as lazy
+views when the graph root permits it. This avoids copying repeated cell bytes and lets a
+predicate run once per dictionary value. `decode_cells` materializes byte strings;
+`decode_ints` returns native integer lanes for numeric roots. The `zform::column` and
+`zform::numeric` APIs use the same payload format outside record files.
+[`FORMAT.md` §4](FORMAT.md#4-model-and-column-payloads) specifies the wire representation.
+
+## file layout
 
 A file is two byte regions. Offsets inside each are relative to its start, so a host can place
 the regions anywhere and pass their bases to the reader.
@@ -48,9 +80,9 @@ default is 65,536 rows or 8 MiB.
 or more blocks hold, each once, stored ahead of the blocks, and every part is compressed
 against it. Columns, queries and decode speed are as without one. The price is fixed per file
 instead of per block: whoever reads any block reads the whole dictionary first, in the round
-trip that fetches the block's parts, and holds it expanded. The writer is handed the dictionary;
-`DictionaryBuilder` chooses one within a byte budget in a pass over the records before they
-are written.
+trip that fetches the block's parts, and holds it expanded. The writer is handed the dictionary.
+`DictionaryBuilder` needs a profile and chooses values within a byte budget in a pass before
+writing. The CLI streams its input and writes no file dictionary.
 
 **The index region is derived data.** Scanning the data region rebuilds it.
 
@@ -71,13 +103,17 @@ with `zform`. A host with its own row ranges (one per stream, say) maps them ont
 number. The writer accepts extra cuts, but small blocks are expensive and a host should let
 short runs share a block.
 
-## Reading
+Concatenated streams unpack in order. Their index regions are separate, so `grep` and
+`select` require a file with a single-run index.
+
+## reading
 
 The reader does no IO. It is given a source that returns a byte range or reports it absent. An
 operation that lacks bytes returns every range it found missing, the host fetches them, and the
 operation runs again. Caching, request coalescing and concurrency belong to the host.
 
-A cold selective query costs three round trips: the root; directory and filter pages; parts.
+A cold selective query fetches the root, then directory and filter pages, then parts.
+Cached or coalesced ranges can reduce round trips; column dependencies can require more.
 Fetching whole blocks needs no pages, since the root has each block's byte range.
 
 Operations take and return row sets:
@@ -110,11 +146,17 @@ escapes included; absent; or unparsed, when the record was stored verbatim and t
 look at the record itself. A path that occurs several times in a record, as array elements do,
 yields its values in order.
 
-One query keeps its decoded state in a session. Between queries a `File` keeps only its
-dictionary, which a host that opens the file again hands back (`set_dictionary`), and the only
-global state is a per-thread zstd context. `DecodeBudget` bounds decoding of untrusted bytes.
+A block containing rows outside the JSON tree, such as templates or verbatim records, is read
+whole for field predicates. Predicates on whole objects or arrays rebuild the tested rows.
+A substring or word in a shape's constant text also requires rebuilding rows of that shape.
+JSON records with leading whitespace are stored verbatim and are rebuilt for queries.
 
-## Writing
+One query keeps its decoded column state in a session. A `File` shares its models, query-plan
+cache, and loaded dictionary across sessions. A host opening the file again can supply the
+dictionary through `set_dictionary`. Per-thread caches retain compiled payload programs and
+zstd contexts. `DecodeBudget` bounds decoding of untrusted bytes.
+
+## writing
 
 The writer takes records in their final order. `cut()` ends a block early, and `finish()`
 returns the index region. Data region bytes are emitted in order as blocks complete and never
@@ -122,14 +164,15 @@ revisited.
 
 - **Memory** is a multiple of the block size and does not grow with the file. A dictionary
   adds its content and match tables, about four times its size; choosing one holds a block, a
-  filter of up to 64 MiB and four budgets of candidate values.
+  filter of up to 64 MiB and four budgets of candidate values. Training adds sample and
+  model-building memory. `TrainOptions` controls sampling, with defaults of 16,384 rows and 16 MiB.
 - **Models** come from a `Profile` or from training on the first records, and are stored in the
   data region. Every block reports a `Fit`: the rows and bytes its model could not place. When
   to retrain is the host's policy.
 - **Determinism.** The same records, options, model and library version give the same bytes.
 - **Threads.** None. A writer runs on the calling thread.
 
-## What the host owns
+## what the host owns
 
 - Storing, fetching and caching the two regions.
 - Data per row that is not record bytes (timestamps, stream identity, labels), in its own
@@ -142,103 +185,3 @@ revisited.
 
 `zform` indexes only what it stores: the columns inside a record. The encoder has those values
 in hand, and their identifiers mean nothing outside the file.
-
-## Status
-
-Built: the block as parts, the index region, `zform::file` (writer, row sets, `matches`,
-`records`, `fields`, `distinct`) and the CLI's `select` and `grep` on it. The data region is
-still framed as `ZFM1`.
-
-Known limits:
-
-- A block holding rows outside the JSON tree (templates, verbatim rows) does not prune field
-  predicates and is read whole for them.
-- A predicate on a field whose value is a whole object or array rebuilds the rows it tests.
-- A substring or word that also occurs in the constant text of a record shape rebuilds the
-  rows of that shape.
-- A profile trained before the shape rule for `null` objects and empty arrays still decodes
-  what it wrote, but fits new data worse than a retrained one (10% larger on GitHub events).
-- JSON records with leading whitespace are stored verbatim, so every query on them rebuilds
-  rows.
-- The trainer has no sample cap; it is the writer's memory peak when no profile is given.
-- Choosing a dictionary needs a profile and a second pass over the records, so the CLI, which
-  streams, writes none. It is measured on one corpus, and not on files past the 16 million
-  distinct values its filter holds.
-- Concatenated files unpack, but their index regions are not merged, so the result cannot be
-  queried.
-
-## Evidence
-
-All at zstd level 6 on one thread.
-
-**Block size.** Files written by the current encoder:
-
-| Block | GitHub Archive hour, 499 MB | HDFS logs, 256 MiB | Writer peak, with a profile |
-|---|---:|---:|---:|
-| 8 MiB | 32.8 MB | 6.69 MB | 32–37 MiB |
-| 16 MiB | 29.4 MB | 6.63 MB | |
-| 32 MiB | 27.2 MB | 6.61 MB | 75–112 MiB |
-| 64 MiB | 25.9 MB | 6.35 MB | 137–215 MiB |
-
-A whole block decodes at 0.6–1.0 GB/s on the GitHub hour and about 250 MB/s on HDFS, which
-bounds a selective read at 8–32 ms for an 8 MiB block and 65–250 ms for a 64 MiB one. Without a
-profile the trainer's sample adds about 150 MiB to the writer.
-
-**Selective reads.** A GitHub Archive day (2,500,841 records, 9.56 GB) grouped by event type,
-in 1,141 blocks of 8 MiB: 508.4 MB of data and 15.5 MB of index (14.3 MB of it filters), packed
-with a profile in 116 CPU seconds at a 56 MiB peak. Cold, from `examples/qbench.rs`:
-
-| Query | Data read | Index read | Round trips | CPU |
-|---|---:|---:|---:|---:|
-| Count a 10-letter substring with 324 matches | 82.1 MB | 15.5 MB | 3 | 0.31 s |
-| Fetch the 962 records of one repository | 205.9 MB | 7.1 MB | 5 | 0.93 s |
-| The same, given the 320 blocks that hold them | 182.6 MB | 1.9 MB | 5 | 0.76 s |
-| The 20 newest records with that substring | 9.5 MB | 3.0 MB | 7 | 0.09 s |
-| Top values of a depth-5 path over 229,000 records | 1.7 MB | 1.2 MB | 4 | 0.09 s |
-
-The filter passes 208 blocks for that substring. Simulated over the same day, it passes 2% of
-the blocks that lack it; with one bit per token 11%, and at 64 Kbit 20%. The repository's name
-is two common words, so no filter prunes it: the fetch reads its name column in 1,097 blocks.
-
-Larger blocks on the same day, files written by an earlier encoder: 16 MiB is 6% smaller and
-reads 15% more for the 962 records, 32 MiB 11% and 32%, 64 MiB 16% and 55%.
-
-**Dictionary.** Two hours of that day (250,493 records, 999 MB) with a profile trained on a
-16 MiB sample. 26.0 MB of values recur across the 8 MiB blocks, so the 32 MiB budget holds
-them all:
-
-| Blocks | Dictionary budget | Level | File | Dictionary in it | Encode | First read |
-|---|---:|---:|---:|---:|---:|---:|
-| 8 MiB | none | 6 | 64.9 MB | | 10.6 s | 1.2 ms |
-| 8 MiB | 4 MiB | 6 | 57.9 MB | 1.0 MB | 12.7 s | 3.7 ms |
-| 8 MiB | 8 MiB | 6 | 55.1 MB | 2.0 MB | 16.1 s | 5.8 ms |
-| 8 MiB | 16 MiB | 6 | 52.8 MB | 3.2 MB | 18.9 s | 8.6 ms |
-| 8 MiB | 32 MiB | 6 | 51.1 MB | 6.1 MB | 20.6 s | 15–24 ms |
-| 8 MiB | 32 MiB | 9 | 49.9 MB | 6.1 MB | 23.8 s | 15–24 ms |
-| 8 MiB | none | 9 | 64.4 MB | | 13.3 s | 1.2 ms |
-| 128 MiB | none | 6 | 48.2 MB | | 9.8 s | |
-
-First read is opening the file and reading one record of a small block; with the dictionary
-already held it is 1.3 ms. With the full dictionary the data region is 48.8 MB against 48.0 MB
-in 128 MiB blocks; the rest of the difference is the index, 2.3 MB against 0.2 MB. Choosing
-the dictionary takes another 1.5 s, and the writer's peak rises by 94 MiB. Reading every
-record back takes 0.89 to 0.94 s in each layout.
-
-Values under 16 bytes are left out: from 8 bytes the file is 0.3 MB larger. Sorted content
-makes it 0.2 MB smaller than most-shared-first. The match tables hold a position per
-dictionary byte; at zstd's default size the blocks are 61 MB instead of 45 MB. The content is
-stored at level 16: level 19 saves 0.2 MB of it and takes 2.7 s longer.
-
-Layouts in which a block refers to other blocks' bytes were measured first and rejected. Free
-text stored once per file with back references, pooled across 6 to 12 blocks, or held in a
-paged table of long values saved 2–7% of a file, and reading one block then needed 3 to 21
-times its own text from elsewhere. Sorted dictionaries shared by a frame's blocks reached
-56.0 MB on the two hours and made selective reads 1.5–2.9x slower.
-
-**Small blocks.** Against 65,536-row blocks, an HDFS file is 1.19x the size at 4,096 rows
-per block, 2.0x at 512 and 4.9x at 64. A block names the decode programs in its model's
-library and stores only the constants that differ; with the programs in every block the
-figures were 1.5x, 2.9x and 7.3x.
-
-**The index is paged by block.** The GitHub model has about 780 columns, and a block's
-directory lists only those with a value in some row: 1.2 MB for the day's 1,141 blocks.

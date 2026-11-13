@@ -22,7 +22,7 @@ Compressed size and ratio (`raw size / compressed size`):
 | GitHub Archive NDJSON | 8.00 MiB | 0.89 MiB (8.9x) | 0.69 MiB (11.6x) | 0.69 MiB (11.6x) | **0.60 MiB (13.4x)** |
 | Silesia `sao` star catalog (binary) | 6.92 MiB | 5.29 MiB (1.31x) | 4.77 MiB (1.45x) | 4.21 MiB (1.64x) | **3.57 MiB (1.94x)** |
 
-`zform` outputs include the trailing query index, which accounts for 7% of the single-block, 766-column GitHub Archive file (`0.56 MiB` / `14.4x` with `--no-index`) and ~3% on multi-block files. Larger-scale archive and cold-query benchmarks are in [`DESIGN.md`](DESIGN.md#evidence).
+`zform` outputs include the trailing query index, which accounts for 7% of the single-block, 766-column GitHub Archive file (`0.56 MiB` / `14.4x` with `--no-index`) and ~3% on multi-block files. Corpus benchmarks and cold-query commands are documented in [`bench/README.md`](bench/README.md).
 
 Single-core throughput and peak memory on the two log corpora:
 
@@ -115,8 +115,8 @@ raw bytes ──►│ frame │──►│ parse │──►│ encode │─
 
 1. **Frame.** Detects record boundaries (line or NUL delimiters, length prefixes, fixed binary strides, or elements of a JSON array) and splits the stream into records. Incompressible chunks skip parsing and pass directly to `zstd`.
 2. **Parse.** Learns a structural model from a sample of records, then splits each record into fields. Records that do not match the model go to a verbatim residual column. Subsequent frames reuse the model and retrain automatically if the stream drifts.
-3. **Encode.** Transposes fields into typed columns. Per block, each column is trial-encoded across candidate codecs and keeps the smallest output. Fields derivable from others (`end_us = start_us + dur_us`, or a URL embedding a repository name) are stored as rules at near-zero per-record cost.
-4. **Compress & index.** Compresses column buffers with `zstd` (default) or `LZ4` into independent blocks (up to 65,536 records or 8 MiB). A trailing index records part offsets, per-block column min/max bounds, character bitmasks, and a substring filter so queries fetch and decode only the byte ranges they need.
+3. **Encode.** Transposes fields into columns. Writer-side codec packs trial-encode each column as a self-describing payload graph and keep the smallest candidate. Fields derivable from others (`end_us = start_us + dur_us`, or a URL embedding a repository name) use graph references and reconstruction programs.
+4. **Compress & index.** Compresses the graphs' byte and integer buffers with `zstd` (default) or `LZ4` into independent blocks (up to 65,536 records or 8 MiB by default). A trailing index records part offsets, per-block column min/max bounds, character bitmasks, and a substring filter so queries fetch and decode only the byte ranges they need.
 
 For example, these three records:
 
@@ -142,10 +142,18 @@ Codecs are selected per block; `zform inspect -v` shows the compressed byte brea
 
 ## Model and container
 
-Models are plain data interpreted by a single fixed decoder (specified in [`FORMAT.md`](FORMAT.md)) and built from two kinds of primitives:
+The structural model and column payloads describe different layers:
 
 - **Structural families** describe record layout: nested JSON trees, flat `logfmt` pairs, CSV/TSV rows, fixed-width binary structs, Kubernetes CRI or syslog envelopes around inner payloads, and literal text templates with variable slots. Templates serve as a general fallback for line-oriented text, splitting custom log formats into columns without dedicated parsers.
-- **Value codecs** encode column contents: timestamps, integers, decimals, UUIDs/ULIDs, network addresses, per-column and shared dictionaries, pooled free text, hex IDs, cross-column derivations (copies, affine sums, interpolated strings), and pseudo-random values stored as positions in their generator's output (`java.util.Random`, Python's Mersenne Twister). A column's payload spells out the steps that rebuild it, so the decoder has no code per value type; steps the blocks of a model share are stored once with the model.
+- **Payload graphs** rebuild column contents from byte buffers, integer streams, lane programs, recurrences, and cell operations. Writer-side codec packs recognize timestamps, integers, decimals, UUIDs/ULIDs, network addresses, hex IDs, and pseudo-random values (`java.util.Random`, Python's Mersenne Twister), then express them using those primitives.
+
+### self-describing payloads
+
+Each column stores a `PayloadGraph`: an occurrence count, declared dependencies, an ordered list of nodes, and a root node. Nodes produce byte buffers, integer lanes, or byte-string cells. A dictionary column, for example, combines an integer stream of ordinals with a buffer of dictionary bytes. A timestamp column carries the arithmetic and byte-formatting program that reconstructs its original spelling.
+
+`CoreDecoder` executes these generic operations. The payload carries the reconstruction rules, so a reader needs no timestamp, UUID, or generator-specific codec. Applications can register a writer-side `CodecPack` that emits existing primitives without changing readers. New primitives still require decoder support.
+
+Graphs declare any shared dictionary, prose pool, or peer columns they read. Programs, recurrences, and constant tables shared across blocks live in the model's library; each block stores references and any program constants it overrides. Standalone columns can carry their code inline. [`FORMAT.md` §4](FORMAT.md#4-model-and-column-payloads) describes the graph layout, node operands, integer encodings, program instructions, and library references, with a worked example.
 
 Regardless of how records are modeled, decoding preserves exact byte representation: key order, whitespace, `null` versus `"null"`, trailing zeros (`12.300`), leading zeros and signs (`007`, `-0`, `+42`), and timestamp separators and zones.
 
@@ -158,17 +166,15 @@ The `.zfm` container is designed for both streaming pipelines and indexed archiv
 - **Integrity:** Frame headers carry CRC32 checksums and frame payloads carry XXH64 content checksums.
 - **Embeddable layout:** Storage engines and databases can embed `zform` blocks or files inside their own objects alongside external columns and indexes ([`DESIGN.md`](DESIGN.md)).
 
-## Status
-
-Experimental. The wire format is not frozen and changes without notice; keep original copies of data you cannot repack. Known limitations are tracked in [`DESIGN.md`](DESIGN.md#status).
+The wire format is experimental and changes without notice; keep original copies of data you cannot repack.
 
 ## Repository layout
 
-- [`crates/zform-core`](crates/zform-core) — wire format, framing, structural models, column codecs, trainer, and query engine.
-- [`crates/zform`](crates/zform) — public Rust API: `pack`, `unpack`, `train`, `Archive` for querying files, and lower-level `file` and `block` modules for host embedding.
+- [`crates/zform-core`](crates/zform-core) — wire format, framing, structural models, writer-side codec packs, payload decoder, trainer, and query engine.
+- [`crates/zform`](crates/zform) — public Rust API: `pack`, `unpack`, `train`, `Archive` for querying files, `column` and `numeric` for standalone payloads, and lower-level `file` and `block` modules for host embedding.
 - [`crates/zform-cli`](crates/zform-cli) — the `zform` command-line tool.
-- [`FORMAT.md`](FORMAT.md) — binary specification for `ZFM1` streams, `ZFIX` index regions, and `ZFP1` profiles.
-- [`DESIGN.md`](DESIGN.md) — queryable file architecture, host embedding interface, known limits, and benchmark evidence.
+- [`FORMAT.md`](FORMAT.md) — binary layout of `ZFM1` streams, self-describing payload graphs and programs, `ZFIX` index regions, and `ZFP1` profiles.
+- [`DESIGN.md`](DESIGN.md) — payload architecture, queryable files, and the host embedding interface.
 - [`bench/`](bench) — corpus generators and benchmark runners.
 
 ## Related work

@@ -48,7 +48,6 @@ impl From<std::io::Error> for Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Explicit resource bounds enforced during untrusted stream/frame decoding.
-/// Replaces legacy hidden thread-local state with deterministic tracking.
 #[derive(Debug, Clone, Copy)]
 pub struct DecodeBudget {
     pub max_frame_compressed_bytes: usize,

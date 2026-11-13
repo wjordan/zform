@@ -1,8 +1,8 @@
 //! Thin block-column summary, dependency inspection, and lazy `CoreDecoder` execution glue.
 //!
-//! All bespoke column codecs have been replaced by self-describing [`PayloadGraph`] programs
-//! emitted on the writer side by [`PackRegistry`] (`packs.rs`) and executed on the reader side by
-//! [`CoreDecoder`] (`payload/graph.rs`).
+//! Columns carry self-describing [`PayloadGraph`] programs emitted by the writer's
+//! [`PackRegistry`] and executed by [`CoreDecoder`]. This module records their dependencies
+//! and loads shared block parts on demand.
 
 use std::sync::Arc;
 
