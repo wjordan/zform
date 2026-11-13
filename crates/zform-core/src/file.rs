@@ -4,6 +4,7 @@
 //! operation returns the ranges it found missing and is run again once the host has them. Rows
 //! are numbered from 0 across the file.
 
+use crate::dictionary::{Dictionary, Scope};
 use crate::container::{BlockParts, BlockRows, FrameFit, PackOptions, StreamEncoder, Structure};
 use crate::framing::{FramingSpec, split_passthrough};
 use crate::grammar::{ModelPlan, PlanVariant};
@@ -18,7 +19,7 @@ use crate::wire::{Cursor, DecodeBudget, Error, Result, decompress_leaf};
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 // ============================================================================
 // Bytes
@@ -331,6 +332,8 @@ pub struct File {
     budget: DecodeBudget,
     /// Query plans, shared by the file's sessions.
     query_plans: Arc<Mutex<Plans>>,
+    /// The dictionary, once a read has needed it.
+    dict: OnceLock<Arc<Dictionary>>,
 }
 
 /// How much of the index region's end to ask for before the root's size is known.
@@ -387,7 +390,49 @@ impl File {
             starts,
             budget,
             query_plans: Arc::default(),
+            dict: OnceLock::new(),
         }))
+    }
+
+    /// The id of the dictionary the file's blocks were written with, if any. The first read of
+    /// a block fetches and decodes it, and the file keeps it. A host that kept it from an
+    /// earlier open spares that with `set_dictionary`.
+    pub fn dictionary_id(&self) -> Option<u64> {
+        self.root.dict.map(|d| d.id)
+    }
+
+    /// The dictionary, if the file holds it by now.
+    pub fn dictionary(&self) -> Option<&Arc<Dictionary>> {
+        self.dict.get()
+    }
+
+    pub fn set_dictionary(&self, dict: Arc<Dictionary>) -> Result<()> {
+        if self.dictionary_id() != Some(dict.id()) {
+            return Err(Error::InvalidArgument("not the file's dictionary".into()));
+        }
+        let _ = self.dict.set(dict);
+        Ok(())
+    }
+
+    /// Reads the dictionary ahead of the first block read, which would read it otherwise.
+    pub fn load_dictionary(&self, src: &dyn Source) -> Result<Step<()>> {
+        Ok(match self.dict_scope(src)? {
+            Ok(_) => Step::Ready(()),
+            Err(range) => Step::Missing(vec![range]),
+        })
+    }
+
+    /// Puts the dictionary in scope for the leaves decoded while the guard lives. `Err` is the
+    /// range to fetch first.
+    fn dict_scope(&self, src: &dyn Source) -> Result<std::result::Result<Scope, ByteRange>> {
+        if let (Some(e), None) = (&self.root.dict, self.dict.get()) {
+            let range = data(e.off, e.len);
+            let Some(leaf) = src.get(range) else {
+                return Ok(Err(range));
+            };
+            let _ = self.dict.set(Arc::new(Dictionary::read(leaf, e.id, &self.budget)?));
+        }
+        Ok(Ok(Scope::enter(self.dict.get().cloned())))
     }
 
     pub fn rows(&self) -> u64 {
@@ -683,6 +728,18 @@ fn mask(sel: impl Iterator<Item = (u32, u32)>, n: usize) -> Vec<bool> {
 }
 
 impl<'f> Session<'f> {
+    /// The file's dictionary in scope for the blocks about to be decoded, or its range added to
+    /// `missing`.
+    fn dict(&self, src: &dyn Source, missing: &mut Vec<ByteRange>) -> Result<Option<Scope>> {
+        Ok(match self.file.dict_scope(src)? {
+            Ok(scope) => Some(scope),
+            Err(range) => {
+                missing.push(range);
+                None
+            }
+        })
+    }
+
     /// Keeps the values a run that came back `Missing` collected, when this is the same request.
     fn begin_values(&mut self, key: String) {
         if key != self.value_key {
@@ -806,6 +863,10 @@ impl<'f> Session<'f> {
             missing.extend(ranges);
             todo.push((b, dir.clone()));
         }
+        let _dict = match todo.is_empty() {
+            true => None,
+            false => self.dict(src, &mut missing)?,
+        };
         if !missing.is_empty() {
             return Ok(Step::Missing(missing));
         }
@@ -926,11 +987,15 @@ impl<'f> Session<'f> {
         let file = self.file;
         let budget = &file.budget;
         let blocks = file.blocks_in(Some(rows));
-        let missing: Vec<_> = blocks
+        let mut missing: Vec<_> = blocks
             .iter()
             .map(|&b| whole(&file.root.blocks[b]))
             .filter(|r| src.get(*r).is_none())
             .collect();
+        let _dict = match blocks.is_empty() {
+            true => None,
+            false => self.dict(src, &mut missing)?,
+        };
         if !missing.is_empty() {
             return Ok(Step::Missing(missing));
         }
@@ -1003,6 +1068,10 @@ impl<'f> Session<'f> {
             };
             missing.extend(ranges.into_iter().filter(|r| src.get(*r).is_none()));
         }
+        let _dict = match blocks.is_empty() {
+            true => None,
+            false => self.dict(src, &mut missing)?,
+        };
         if !missing.is_empty() {
             return Ok(Step::Missing(missing));
         }

@@ -4,6 +4,8 @@
 use std::cell::RefCell;
 use std::fmt;
 
+use crate::dictionary::Dictionary;
+
 thread_local! {
     static ZSTD_ENC_SCRATCH: RefCell<(Option<zstd_safe::CCtx<'static>>, Vec<u8>)> =
         const { RefCell::new((None, Vec::new())) };
@@ -233,6 +235,8 @@ pub enum EntropyBackend {
     Raw = 0,
     Zstd = 1,
     Lz4 = 2,
+    /// Zstd against the file's dictionary. A writer asks for `Zstd` and gives the dictionary.
+    ZstdDict = 3,
 }
 
 impl EntropyBackend {
@@ -241,74 +245,103 @@ impl EntropyBackend {
             0 => Ok(Self::Raw),
             1 => Ok(Self::Zstd),
             2 => Ok(Self::Lz4),
+            3 => Ok(Self::ZstdDict),
             _ => Err(Error::Format(format!("unknown entropy backend id {b}"))),
         }
     }
 }
 
-/// Compresses `src` with `backend` (falling back to `Raw` if compression does not shrink `src`).
-/// Writes `[tag: u8][raw_len: varint][payload_len: varint][payload]` to `out`.
+/// Writes a leaf: `[tag: u8][raw_len: varint][payload_len: varint][payload]`.
+pub(crate) fn put_leaf(out: &mut Vec<u8>, tag: EntropyBackend, raw_len: usize, payload: &[u8]) {
+    out.push(tag as u8);
+    put_uvarint(out, raw_len as u64);
+    put_uvarint(out, payload.len() as u64);
+    out.extend_from_slice(payload);
+}
+
+/// The zstd window that spans `len` bytes. A leaf is decoded as a whole, so a smaller window
+/// would only hide its own repetitions, and its dictionary past the first window.
+pub(crate) fn window_log(len: usize) -> u32 {
+    len.next_power_of_two().ilog2().clamp(10, 27)
+}
+
+/// Compresses `src` with `backend` into a leaf, `Raw` if that does not shrink it.
 pub fn compress_leaf(out: &mut Vec<u8>, src: &[u8], backend: EntropyBackend, zstd_level: i32) {
-    if src.len() < 32 || backend == EntropyBackend::Raw {
-        out.push(EntropyBackend::Raw as u8);
-        put_uvarint(out, src.len() as u64);
-        put_uvarint(out, src.len() as u64);
-        out.extend_from_slice(src);
-        return;
-    }
-    match backend {
-        EntropyBackend::Raw => unreachable!(),
-        EntropyBackend::Zstd => {
-            let bound = zstd_safe::compress_bound(src.len());
-            let wrote = ZSTD_ENC_SCRATCH.with(|cell| {
-                let mut borrow = cell.borrow_mut();
-                let (cctx_opt, tmp) = &mut *borrow;
-                if cctx_opt.is_none() {
-                    *cctx_opt = zstd_safe::CCtx::try_create();
-                }
-                let Some(ctx) = cctx_opt.as_mut() else {
-                    return false;
-                };
-                let _ = ctx.reset(zstd_safe::ResetDirective::SessionOnly);
-                let _ = ctx.set_parameter(zstd_safe::CParameter::CompressionLevel(zstd_level));
-                let _ = ctx.set_parameter(zstd_safe::CParameter::ChecksumFlag(false));
-                if tmp.len() < bound {
-                    tmp.resize(bound, 0);
-                }
-                if let Ok(n) = ctx.compress2(&mut tmp[..bound], src)
-                    && n + 2 < src.len()
-                {
-                    out.push(EntropyBackend::Zstd as u8);
-                    put_uvarint(out, src.len() as u64);
-                    put_uvarint(out, n as u64);
-                    out.extend_from_slice(&tmp[..n]);
-                    return true;
-                }
-                false
-            });
-            if wrote {
-                return;
+    compress_leaf_with(out, src, backend, zstd_level, None)
+}
+
+/// [`compress_leaf`], with a `Zstd` leaf compressed against `dict` when there is one.
+pub(crate) fn compress_leaf_with(
+    out: &mut Vec<u8>,
+    src: &[u8],
+    backend: EntropyBackend,
+    zstd_level: i32,
+    dict: Option<&Dictionary>,
+) {
+    let packed = src.len() >= 32
+        && match backend {
+            EntropyBackend::Raw => false,
+            EntropyBackend::Zstd | EntropyBackend::ZstdDict => {
+                let bound = zstd_safe::compress_bound(src.len());
+                ZSTD_ENC_SCRATCH.with(|cell| {
+                    let mut borrow = cell.borrow_mut();
+                    let (cctx_opt, tmp) = &mut *borrow;
+                    if tmp.len() < bound {
+                        tmp.resize(bound, 0);
+                    }
+                    let tmp = &mut tmp[..bound];
+                    let (tag, n) = match dict.and_then(|d| d.compress(tmp, src, zstd_level)) {
+                        Some(n) => (EntropyBackend::ZstdDict, n),
+                        None => {
+                            if cctx_opt.is_none() {
+                                *cctx_opt = zstd_safe::CCtx::try_create();
+                            }
+                            let Some(ctx) = cctx_opt.as_mut() else {
+                                return false;
+                            };
+                            use zstd_safe::CParameter::{ChecksumFlag, CompressionLevel, WindowLog};
+                            let _ = ctx.reset(zstd_safe::ResetDirective::SessionOnly);
+                            let _ = ctx.set_parameter(CompressionLevel(zstd_level));
+                            let _ = ctx.set_parameter(ChecksumFlag(false));
+                            let _ = ctx.set_parameter(WindowLog(window_log(src.len())));
+                            match ctx.compress2(tmp, src) {
+                                Ok(n) => (EntropyBackend::Zstd, n),
+                                Err(_) => return false,
+                            }
+                        }
+                    };
+                    let shrunk = n + 2 < src.len();
+                    if shrunk {
+                        put_leaf(out, tag, src.len(), &tmp[..n]);
+                    }
+                    shrunk
+                })
             }
-        }
-        EntropyBackend::Lz4 => {
-            let tmp = lz4_flex::block::compress(src);
-            if tmp.len() + 2 < src.len() {
-                out.push(EntropyBackend::Lz4 as u8);
-                put_uvarint(out, src.len() as u64);
-                put_uvarint(out, tmp.len() as u64);
-                out.extend_from_slice(&tmp);
-                return;
+            EntropyBackend::Lz4 => {
+                let tmp = lz4_flex::block::compress(src);
+                let shrunk = tmp.len() + 2 < src.len();
+                if shrunk {
+                    put_leaf(out, EntropyBackend::Lz4, src.len(), &tmp);
+                }
+                shrunk
             }
-        }
+        };
+    if !packed {
+        put_leaf(out, EntropyBackend::Raw, src.len(), src);
     }
-    out.push(EntropyBackend::Raw as u8);
-    put_uvarint(out, src.len() as u64);
-    put_uvarint(out, src.len() as u64);
-    out.extend_from_slice(src);
 }
 
 /// Decompresses a leaf written by [`compress_leaf`].
 pub fn decompress_leaf(cur: &mut Cursor<'_>, budget: &DecodeBudget) -> Result<Vec<u8>> {
+    decompress_leaf_with(cur, budget, None)
+}
+
+/// [`decompress_leaf`], for a leaf that may be compressed against `dict`.
+pub(crate) fn decompress_leaf_with(
+    cur: &mut Cursor<'_>,
+    budget: &DecodeBudget,
+    dict: Option<&Dictionary>,
+) -> Result<Vec<u8>> {
     let tag = EntropyBackend::from_u8(cur.u8()?)?;
     let raw_len = cur.uvar()? as usize;
     let comp_len = cur.uvar()? as usize;
@@ -321,7 +354,13 @@ pub fn decompress_leaf(cur: &mut Cursor<'_>, budget: &DecodeBudget) -> Result<Ve
             budget.check_alloc(raw_len, "raw leaf")?;
             Ok(payload.to_vec())
         }
-        EntropyBackend::Zstd => {
+        EntropyBackend::Zstd | EntropyBackend::ZstdDict => {
+            let dict = match tag {
+                EntropyBackend::Zstd => None,
+                _ => Some(dict.ok_or_else(|| {
+                    Error::Format("leaf needs a dictionary that was not given".into())
+                })?),
+            };
             let mut dst = budget.alloc_vec(raw_len, "zstd leaf")?;
             let n = ZSTD_DEC_SCRATCH.with(|cell| -> Result<usize> {
                 let mut borrow = cell.borrow_mut();
@@ -332,7 +371,11 @@ pub fn decompress_leaf(cur: &mut Cursor<'_>, budget: &DecodeBudget) -> Result<Ve
                     .as_mut()
                     .ok_or_else(|| Error::Format("failed to create zstd DCtx".into()))?;
                 let _ = dctx.reset(zstd_safe::ResetDirective::SessionOnly);
-                dctx.decompress(&mut dst[..], payload).map_err(|code| {
+                match dict {
+                    Some(d) => d.decompress(dctx, &mut dst[..], payload),
+                    None => dctx.decompress(&mut dst[..], payload),
+                }
+                .map_err(|code| {
                     Error::Format(format!(
                         "zstd decompress error: {}",
                         zstd_safe::get_error_name(code)
@@ -530,4 +573,31 @@ pub fn sha256_hex(data: &[u8]) -> String {
         let _ = write!(&mut out, "{word:08x}");
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leaf_matches_repetitions_beyond_the_default_window() {
+        let mut state = 7u64;
+        let mut raw = Vec::with_capacity(3 << 20);
+        for _ in 0..((2 << 20) + (128 << 10)) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            raw.push(state as u8);
+        }
+        raw.extend_from_within(..128 << 10);
+        let budget = DecodeBudget::default();
+        let mut leaf = Vec::new();
+        compress_leaf(&mut leaf, &raw, EntropyBackend::Zstd, 6);
+        assert!(leaf.len() < raw.len() - (64 << 10));
+        assert_eq!(decompress_leaf(&mut Cursor::new(&leaf), &budget).unwrap(), raw);
+        // The reused compressor returns to a small window for the next leaf.
+        leaf.clear();
+        compress_leaf(&mut leaf, &[b'x'; 256], EntropyBackend::Zstd, 3);
+        assert_eq!(decompress_leaf(&mut Cursor::new(&leaf), &budget).unwrap(), [b'x'; 256]);
+    }
 }

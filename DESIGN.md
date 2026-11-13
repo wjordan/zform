@@ -33,16 +33,24 @@ the regions anywhere and pass their bases to the reader.
 **The data region is a stream of self-contained blocks.** It decodes front to back with nothing
 else, and two data regions concatenated are one valid stream.
 
-- A block needs only its model and row count to decode. Nothing is shared between blocks: no
-  dictionary, no text, no reference to another block's values.
+- A block needs its model and row count to decode and, in a file written with one, the file's
+  dictionary. No block refers to another block's bytes.
 - A block is stored as parts: the row structure, then one part per column, plus the tables
   several columns share (a dictionary, pooled free text). A part decompresses on its own once
   the parts of the same block it depends on are present.
 - Reading any row of a block decompresses the whole of each part the query needs.
 
-**Block size is the one knob between file size and read cost**, set by the writer in rows and
-bytes. A larger block gives every column more context and a selective read more to fetch and
-decode. The stream default is 65,536 rows or 8 MiB.
+**Block size trades file size for read cost**, set by the writer in rows and bytes. A larger
+block gives every column more context and a selective read more to fetch and decode. The stream
+default is 65,536 rows or 8 MiB.
+
+**A dictionary gives small blocks the context of the file.** It is the column values that two
+or more blocks hold, each once, stored ahead of the blocks, and every part is compressed
+against it. Columns, queries and decode speed are as without one. The price is fixed per file
+instead of per block: whoever reads any block reads the whole dictionary first, in the round
+trip that fetches the block's parts, and holds it expanded. The writer is handed the dictionary;
+`DictionaryBuilder` chooses one within a byte budget in a pass over the records before they
+are written.
 
 **The index region is derived data.** Scanning the data region rebuilds it.
 
@@ -102,7 +110,8 @@ escapes included; absent; or unparsed, when the record was stored verbatim and t
 look at the record itself. A path that occurs several times in a record, as array elements do,
 yields its values in order.
 
-One query keeps its decoded state in a session. Nothing is kept between queries, and the only
+One query keeps its decoded state in a session. Between queries a `File` keeps only its
+dictionary, which a host that opens the file again hands back (`set_dictionary`), and the only
 global state is a per-thread zstd context. `DecodeBudget` bounds decoding of untrusted bytes.
 
 ## Writing
@@ -111,7 +120,9 @@ The writer takes records in their final order. `cut()` ends a block early, and `
 returns the index region. Data region bytes are emitted in order as blocks complete and never
 revisited.
 
-- **Memory** is a multiple of the block size and does not grow with the file.
+- **Memory** is a multiple of the block size and does not grow with the file. A dictionary
+  adds its content and match tables, about four times its size; choosing one holds a block, a
+  filter of up to 64 MiB and four budgets of candidate values.
 - **Models** come from a `Profile` or from training on the first records, and are stored in the
   data region. Every block reports a `Fit`: the rows and bytes its model could not place. When
   to retrain is the host's policy.
@@ -126,7 +137,8 @@ revisited.
 - Indexes over data it stores, indexes that span files, and any index whose rules are a product
   decision, such as a word index with its own tokenizer. It builds these from the records and
   row numbers it already holds before it calls the writer.
-- Training policy, where profiles are kept, and the block size.
+- Training policy, where profiles are kept, the block size, the dictionary's budget, and
+  keeping the dictionaries of files it opens often.
 
 `zform` indexes only what it stores: the columns inside a record. The encoder has those values
 in hand, and their identifiers mean nothing outside the file.
@@ -149,6 +161,9 @@ Known limits:
 - JSON records with leading whitespace are stored verbatim, so every query on them rebuilds
   rows.
 - The trainer has no sample cap; it is the writer's memory peak when no profile is given.
+- Choosing a dictionary needs a profile and a second pass over the records, so the CLI, which
+  streams, writes none. It is measured on one corpus, and not on files past the 16 million
+  distinct values its filter holds.
 - Concatenated files unpack, but their index regions are not merged, so the result cannot be
   queried.
 
@@ -188,25 +203,37 @@ is two common words, so no filter prunes it: the fetch reads its name column in 
 Larger blocks on the same day, files written by an earlier encoder: 16 MiB is 6% smaller and
 reads 15% more for the 962 records, 32 MiB 11% and 32%, 64 MiB 16% and 55%.
 
-**Sharing between blocks was measured and rejected.** Free text is 82.5 MB of the GitHub hour
-and most of the gap between block sizes, so three ways of widening its scope at 8 MiB blocks
-were computed inside the encoder:
+**Dictionary.** Two hours of that day (250,493 records, 999 MB) with a profile trained on a
+16 MiB sample. 26.0 MB of values recur across the 8 MiB blocks, so the 32 MiB budget holds
+them all:
 
-| Text layout at 8 MiB blocks | Text size | A block's text also needs |
-|---|---:|---|
-| Pooled per block (today) | 17.3 MB | nothing |
-| Each value stored once per file, later blocks refer back | 14.7 MB | parts of 26 earlier blocks on average, 21x its own bytes |
-| The same, within runs of 8 blocks | 16.4 MB | 2.9x its own bytes |
-| Text of 6 to 12 blocks pooled into one segment | 14.2–15.0 MB | a 1.5–2.8 MB segment |
-| Pooled per 64 MiB block, for reference | 13.5 MB | nothing |
+| Blocks | Dictionary budget | Level | File | Dictionary in it | Encode | First read |
+|---|---:|---:|---:|---:|---:|---:|
+| 8 MiB | none | 6 | 64.9 MB | | 10.6 s | 1.2 ms |
+| 8 MiB | 4 MiB | 6 | 57.9 MB | 1.0 MB | 12.7 s | 3.7 ms |
+| 8 MiB | 8 MiB | 6 | 55.1 MB | 2.0 MB | 16.1 s | 5.8 ms |
+| 8 MiB | 16 MiB | 6 | 52.8 MB | 3.2 MB | 18.9 s | 8.6 ms |
+| 8 MiB | 32 MiB | 6 | 51.1 MB | 6.1 MB | 20.6 s | 15–24 ms |
+| 8 MiB | 32 MiB | 9 | 49.9 MB | 6.1 MB | 23.8 s | 15–24 ms |
+| 8 MiB | none | 9 | 64.4 MB | | 13.3 s | 1.2 ms |
+| 128 MiB | none | 6 | 48.2 MB | | 9.8 s | |
 
-None reaches what a 64 MiB block gets with no mechanism at all, and each makes a block depend
-on bytes outside it. Raising the block size moves along the same trade with one option.
+First read is opening the file and reading one record of a small block; with the dictionary
+already held it is 1.3 ms. With the full dictionary the data region is 48.8 MB against 48.0 MB
+in 128 MiB blocks; the rest of the difference is the index, 2.3 MB against 0.2 MB. Choosing
+the dictionary takes another 1.5 s, and the writer's peak rises by 94 MiB. Reading every
+record back takes 0.89 to 0.94 s in each layout.
 
-A file-wide table of repeated values of 256 bytes or more, in pages of 64 KiB to 1 MiB, was
-simulated on two hours of that day at 8 MiB blocks. Chosen in a first pass over the input it
-saves 6–7% of the file, and reading a whole block then needs 3–7x its own text in table pages;
-16 MiB blocks save 6% with no table. Chosen on a value's second appearance it saves under 2%.
+Values under 16 bytes are left out: from 8 bytes the file is 0.3 MB larger. Sorted content
+makes it 0.2 MB smaller than most-shared-first. The match tables hold a position per
+dictionary byte; at zstd's default size the blocks are 61 MB instead of 45 MB. The content is
+stored at level 16: level 19 saves 0.2 MB of it and takes 2.7 s longer.
+
+Layouts in which a block refers to other blocks' bytes were measured first and rejected. Free
+text stored once per file with back references, pooled across 6 to 12 blocks, or held in a
+paged table of long values saved 2–7% of a file, and reading one block then needed 3 to 21
+times its own text from elsewhere. Sorted dictionaries shared by a frame's blocks reached
+56.0 MB on the two hours and made selective reads 1.5–2.9x slower.
 
 **Small blocks.** Against 65,536-row blocks, an HDFS file is 1.19x the size at 4,096 rows
 per block, 2.0x at 512 and 4.9x at 64. A block names the decode programs in its model's

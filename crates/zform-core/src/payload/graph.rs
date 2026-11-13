@@ -9,9 +9,10 @@ use std::cell::Cell;
 use std::sync::Arc;
 
 use crate::cells::{Cells, Col, NULL_CELL};
+use crate::dictionary::with_current;
 use crate::wire::{
-    Cursor, DecodeBudget, EntropyBackend, Error, Result, compress_leaf, decompress_leaf,
-    put_ivarint, put_uvarint,
+    Cursor, DecodeBudget, EntropyBackend, Error, Result, compress_leaf, compress_leaf_with,
+    decompress_leaf_with, put_ivarint, put_uvarint,
 };
 
 use super::engine::CompiledProgram;
@@ -45,14 +46,14 @@ pub fn with_encode_opts<R>(backend: EntropyBackend, level: i32, f: impl FnOnce()
 pub(crate) fn pack_leaf(raw: &[u8]) -> Vec<u8> {
     let (backend, level) = ENC_OPTS.with(|c| c.get());
     let mut out = Vec::with_capacity(raw.len() + 12);
-    compress_leaf(&mut out, raw, backend, level);
+    with_current(|dict| compress_leaf_with(&mut out, raw, backend, level, dict));
     out
 }
 
 #[inline]
 pub(crate) fn unpack_leaf(leaf: &[u8], budget: &DecodeBudget) -> Result<Vec<u8>> {
     let mut cur = Cursor::new(leaf);
-    let raw = decompress_leaf(&mut cur, budget)?;
+    let raw = with_current(|dict| decompress_leaf_with(&mut cur, budget, dict))?;
     if cur.remaining() != 0 {
         return Err(Error::Format("trailing bytes in payload leaf".into()));
     }

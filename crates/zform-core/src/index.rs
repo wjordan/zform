@@ -462,6 +462,16 @@ pub struct Root {
     /// Encoded models, in the order blocks refer to them.
     pub models: Vec<Vec<u8>>,
     pub blocks: Vec<BlockEntry>,
+    pub dict: Option<DictEntry>,
+}
+
+/// Where the data region holds the leaf of the dictionary its blocks were written with.
+#[derive(Debug, Clone, Copy)]
+pub struct DictEntry {
+    pub off: u64,
+    pub len: u64,
+    /// The XXH64 of the dictionary's content.
+    pub id: u64,
 }
 
 /// Collects blocks as they are written and lays out the index region: the filter pages, the
@@ -507,6 +517,10 @@ impl IndexBuilder {
         });
     }
 
+    pub fn dictionary(&mut self, off: u64, len: u64, id: u64) {
+        self.root.dict = Some(DictEntry { off, len, id });
+    }
+
     pub fn is_empty(&self) -> bool {
         self.root.blocks.is_empty()
     }
@@ -540,6 +554,11 @@ impl IndexBuilder {
             put_uvarint(&mut raw, b.dir_len as u64);
             put_uvarint(&mut raw, b.filter_len as u64);
             end = b.off + b.len;
+        }
+        put_uvarint(&mut raw, self.root.dict.map_or(0, |d| d.len));
+        if let Some(d) = self.root.dict {
+            put_uvarint(&mut raw, d.off);
+            raw.extend_from_slice(&d.id.to_le_bytes());
         }
         let mut root = Vec::new();
         compress_leaf(&mut root, &raw, backend, level.max(3));
@@ -650,10 +669,21 @@ impl Root {
             b.dir_off = dir_off;
             dir_off += b.dir_len as u64;
         }
+        let dict = match cur.uvar()? {
+            0 => None,
+            len => {
+                let off = cur.uvar()?;
+                if off.checked_add(len).is_none_or(|end| end > data_len) {
+                    return Err(Error::Format("index root dictionary range".into()));
+                }
+                Some(DictEntry { off, len, id: cur.u64_le()? })
+            }
+        };
         Ok(Self {
             data_len,
             models,
             blocks,
+            dict,
         })
     }
 }

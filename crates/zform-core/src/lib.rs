@@ -6,6 +6,7 @@ pub mod block;
 pub mod cells;
 pub mod codecs;
 pub mod container;
+pub mod dictionary;
 pub mod file;
 pub mod framing;
 pub mod grammar;
@@ -21,6 +22,7 @@ pub mod wire;
 pub use container::{
     FrameFit, InspectReport, PackOptions, StreamEncoder, inspect_stream, pack_stream, unpack_stream,
 };
+pub use dictionary::{Dictionary, DictionaryBuilder};
 pub use framing::{FramingSpec, ResolvedFraming};
 pub use grammar::ModelPlan;
 pub use packs::{CodecPack, ColumnProfile, PackRegistry};

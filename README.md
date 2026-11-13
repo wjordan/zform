@@ -154,7 +154,7 @@ The `.zfm` container is designed for both streaming pipelines and indexed archiv
 - **Self-describing & profile-ready:** Models travel inside the stream so every file decodes standalone, or can be saved as `.zfp` profiles (`zform train`, extended with `train --extend`, and applied via `pack --profile`) to avoid cold-start overhead on small chunks.
 - **Stream concatenation:** `cat a.zfm b.zfm > ab.zfm` produces a valid stream that unpacks to both inputs in order, just like `gzip` and `zstd` (`grep` and `select` require a single-run index).
 - **Sparse columns:** Columns store values only for records where a field occurs, so wide, sparse JSON pays nothing per row for absent fields.
-- **Self-contained blocks:** Blocks share no state across boundaries, allowing readers to fetch and decode individual blocks and column parts on demand.
+- **Self-contained blocks:** No block refers to another, so readers fetch and decode individual blocks and column parts on demand. A library writer can give a file one dictionary of the values its blocks share, which every read then loads first.
 - **Integrity:** Frame headers carry CRC32 checksums and frame payloads carry XXH64 content checksums.
 - **Embeddable layout:** Storage engines and databases can embed `zform` blocks or files inside their own objects alongside external columns and indexes ([`DESIGN.md`](DESIGN.md)).
 

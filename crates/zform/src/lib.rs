@@ -19,7 +19,8 @@ pub use zform_core::json_tree::JsonDoc;
 pub use zform_core::packs;
 pub use zform_core::payload;
 pub use zform_core::{
-    CodecPack, ColumnProfile, CoreDecoder, DecodeBudget, EntropyBackend, Error, FrameFit,
+    CodecPack, ColumnProfile, CoreDecoder, DecodeBudget, Dictionary, DictionaryBuilder,
+    EntropyBackend, Error, FrameFit,
     FramingSpec, InspectReport, ModelPlan, PackOptions, PackRegistry, PayloadGraph, Predicate,
     Profile, ResolvedFraming, Result, StreamEncoder, TrainOptions, eval_raw_record, inspect_stream,
     logical, pack_stream, raw_field_values,
@@ -1140,6 +1141,141 @@ mod tests {
             }
         }
         assert_eq!(session.stats.rebuilt, 0);
+    }
+
+    #[test]
+    fn file_dictionary_holds_what_blocks_share() {
+        // Long values that recur across blocks and seldom within one.
+        let mut state = 7u64;
+        let mut text = || -> String {
+            let words = (0..12).map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                format!("{state:016x}")
+            });
+            words.collect()
+        };
+        let texts: Vec<String> = (0..300).map(|_| text()).collect();
+        let rows: Vec<String> = (0..4000)
+            .map(|i| {
+                let body = &texts[(i * 7919) % 300];
+                format!("{{\"id\":{i},\"svc\":\"svc{}\",\"body\":\"{body}\"}}", i % 7)
+            })
+            .collect();
+        let recs: Vec<&[u8]> = rows.iter().map(|r| r.as_bytes()).collect();
+        let profile = train(rows.join("\n").as_bytes(), &TrainOptions::default(), None).unwrap();
+        let mut opts = PackOptions {
+            block_rows: 500,
+            profile: Some(profile),
+            ..Default::default()
+        };
+        let write = |opts: &PackOptions| {
+            let mut w = Writer::new(Vec::new(), opts.clone());
+            for r in &recs {
+                w.push(r).unwrap();
+            }
+            w.finish().unwrap()
+        };
+        let (plain, _) = write(&opts);
+        let mut builder = DictionaryBuilder::new(&opts, 1 << 20).unwrap();
+        recs.iter().for_each(|r| builder.push(r));
+        let dict = std::sync::Arc::new(builder.finish().unwrap());
+        assert!((300 * 192..=300 * 194).contains(&dict.len()), "{}", dict.len());
+        opts.dictionary = Some(dict.clone());
+        let (data, index) = write(&opts);
+        assert!(
+            data.len() * 2 < plain.len(),
+            "{} bytes with the dictionary, {} without",
+            data.len(),
+            plain.len()
+        );
+
+        // The data region is still a stream on its own.
+        let mut restored = Vec::new();
+        unpack(&data[..], &mut restored).unwrap();
+        let framed: Vec<u8> = recs
+            .iter()
+            .flat_map(|r| [&(r.len() as u32).to_le_bytes()[..], r].concat())
+            .collect();
+        assert!(restored == framed);
+        let report = inspect_stream(&data[..], &DecodeBudget::default()).unwrap();
+        assert!(report.column_bytes.iter().any(|c| c.0 == "$dictionary"));
+        assert_eq!(report.total_records, 4000);
+
+        // Round trips, and the lowest data offset read.
+        let fetched = std::cell::Cell::new((0usize, u64::MAX));
+        let fetch = |ranges: &[ByteRange]| {
+            let (trips, mut low) = fetched.get();
+            let parts = ranges.iter().map(|r| {
+                let buf = match r.region {
+                    Region::Data => {
+                        low = low.min(r.off);
+                        &data
+                    }
+                    Region::Index => &index,
+                };
+                buf[r.off as usize..r.end() as usize].to_vec()
+            });
+            let parts = parts.collect();
+            fetched.set((trips + 1, low));
+            Ok(parts)
+        };
+        let open = |cache: &mut RangeCache| {
+            drive(cache, fetch, |c| {
+                file::File::open(c, index.len() as u64, DecodeBudget::default())
+            })
+            .unwrap()
+        };
+        let mut cache = RangeCache::default();
+        let file = open(&mut cache);
+        assert_eq!(file.dictionary_id(), Some(dict.id()));
+        assert!(file.dictionary().is_none());
+        let pred = eq("svc", "svc3");
+        let mut session = file.session();
+        let hits = drive(&mut cache, fetch, |c| session.matches(c, &pred, None)).unwrap();
+        assert_eq!(hits.iter().collect::<Vec<_>>(), brute(&recs, &pred));
+        let (trips, low) = fetched.get();
+        assert_eq!(trips, 2, "the dictionary comes with the columns");
+        assert!(low < 64 && file.dictionary().is_some());
+        let some = RowSet::from_sorted((0..4000).filter(|r| r % 397 == 5));
+        let check = |session: &mut Session<'_>, cache: &mut RangeCache| {
+            let mut n = 0;
+            drive(cache, fetch, |c| {
+                n = 0;
+                session.records(c, &some, |row, rec| {
+                    n += 1;
+                    let _: () = assert_eq!(rec, recs[row as usize]);
+                    Ok(())
+                })
+            })
+            .unwrap();
+            assert_eq!(n, some.len());
+            drive(cache, fetch, |c| {
+                session.fields(c, &["body"], &some, |row, _, v| {
+                    let body = &texts[(row as usize * 7919) % 300];
+                    let _: () = assert_eq!(logical(v.unwrap()).as_ref(), body.as_bytes());
+                    Ok(())
+                })
+            })
+            .unwrap();
+        };
+        check(&mut session, &mut cache);
+
+        // A file opened again takes the dictionary its host kept, and does not read it.
+        fetched.set((0, u64::MAX));
+        let mut cache = RangeCache::default();
+        let again = open(&mut cache);
+        assert!(again.set_dictionary(std::sync::Arc::new(Dictionary::new(vec![7; 64]))).is_err());
+        again.set_dictionary(file.dictionary().unwrap().clone()).unwrap();
+        check(&mut again.session(), &mut cache);
+        assert!(fetched.get().1 > low, "{:?}", fetched.get());
+
+        // Or it reads the dictionary ahead of any block.
+        let ahead = open(&mut cache);
+        drive(&mut cache, fetch, |c| ahead.load_dictionary(c)).unwrap();
+        assert_eq!(ahead.dictionary().map(|d| d.id()), Some(dict.id()));
+        assert_eq!(fetched.get().1, low);
     }
 
     #[test]

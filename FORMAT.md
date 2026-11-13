@@ -24,8 +24,9 @@ Every compressed buffer in a frame, an index region or a profile is a leaf that 
 - `backend = 0` (`Raw`): the bytes themselves; `comp_len` equals `raw_len`.
 - `backend = 1` (`Zstd`): a Zstandard frame expanding to `raw_len`.
 - `backend = 2` (`Lz4`): an LZ4 block expanding to `raw_len`.
+- `backend = 3` (`ZstdDict`): a Zstandard frame expanding to `raw_len` with the stream's dictionary (§2) as raw content. Only the leaves of a block's parts may be one.
 
-The encoder writes `Raw` for a buffer under 32 bytes and whenever compression saves fewer than 3 bytes.
+The encoder writes `Raw` for a buffer under 32 bytes and whenever compression saves fewer than 3 bytes. A Zstandard frame's window spans `raw_len` up to 2^27 bytes, so a match reaches the start of the buffer and, in a `ZstdDict` leaf, the dictionary.
 
 ---
 
@@ -69,6 +70,9 @@ A `.zfm` file is one or more `ZFM1` frames, optionally followed by a `ZFIX` inde
 | `0x0002` | `FLAG_PASSTHROUGH` | The chunk is stored as one entropy leaf, with no model. |
 | `0x0004` | `FLAG_REUSE_PREV_MODEL` | The frame uses the `ModelPlan` of the preceding structured frame of the stream. |
 | `0x0008` | `FLAG_SYNC_POINT` | The frame decodes without any frame before it: it carries its `ModelPlan` or is passthrough. |
+| `0x0010` | `FLAG_DICTIONARY` | The frame is the stream's dictionary and holds no records. |
+
+A dictionary frame comes first in its stream. Its payload is one entropy leaf holding the dictionary's content, `raw_len` is the content's length, and `content_xxh64`, which is required, is the dictionary's id. The `ZstdDict` leaves of the frames after it, up to the next index region, decode against that content. Content that begins with Zstandard's dictionary magic `37 A4 30 EC` is not valid; a writer puts a zero byte before it.
 
 ### Record framing (`ResolvedFraming`)
 - `0` (`Lf { open_end: u8 }`): `\n`-delimited lines (`open_end = 1` if the last byte is not `\n`).
@@ -220,6 +224,8 @@ All fields below are `uvarint` unless typed.
 - **Root**: `data_len`; `n_models`, then each model as a length and its `ModelPlan` bytes, each stored once; `n_blocks`, then per block:
   - `kind: u8`. `0` is a structured block, followed by its model id and `kinds`, a mask of what its rows are: `0x01` residual, `0x02` JSON, `0x04` template, `0x08` envelope, `0x10` logfmt, `0x20` CSV, `0x40` binary. `1` is a verbatim block, followed by its `ResolvedFraming`.
   - the gap between the previous block's end and this block's offset in the data region, its length, its row count, its directory page length and its filter page length. Page offsets follow from the lengths.
+
+  After the blocks comes the length of the dictionary's leaf in the data region, `0` when there is none, else followed by the leaf's offset and `id: u64 LE`.
 - **Directory page**: an `EntropyLeaf` holding, with offsets relative to the block's first byte: `struct_len`; the offset of the first structure stream; `n_streams` and each stream's length; `n_dicts` and each shared dictionary's `(offset, length)`; `pool_len`, then the pool's offset if `pool_len > 0`; `n_cols` and the first column's offset; then the columns in order. A column is `flags: u8`, `len`, and then by flag:
   - `0x01`, the column has values: `letters`, the ASCII letters its cells hold, case folded, bit `i` for `'a' + i` and bit 26 for a backslash.
   - `0x06`, a two-bit kind, `1` integer or `2` timestamp in nanoseconds: `min, max: ivarint`.

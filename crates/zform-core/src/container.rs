@@ -2,6 +2,7 @@
 //! previous frame's, and self-contained blocks. The encoder collects the index region as it goes.
 
 use crate::cells::{Cells, Col};
+use crate::dictionary::{Dictionary, Scope};
 use crate::codecs::{
     ANY_LETTERS, BlockDecodeCtx, ColSummary, Seeds, column_deps, decode_present_slice,
     decode_u32_seq, encode_dense_block_columns, encode_present_slice, encode_u32_seq,
@@ -34,6 +35,7 @@ pub const FLAG_HAS_CHECKSUM: u16 = 1 << 0;
 pub const FLAG_PASSTHROUGH: u16 = 1 << 1;
 pub const FLAG_REUSE_PREV_MODEL: u16 = 1 << 2;
 pub const FLAG_SYNC_POINT: u16 = 1 << 3;
+pub const FLAG_DICTIONARY: u16 = 1 << 4;
 
 pub const DEFAULT_BLOCK_ROWS: usize = 65_536;
 pub const DEFAULT_BLOCK_BYTES: usize = 8 << 20;
@@ -50,6 +52,8 @@ pub struct PackOptions {
     pub framing: FramingSpec,
     pub train: TrainOptions,
     pub profile: Option<Profile>,
+    /// Values the stream's blocks share, written ahead of them. A reader needs it for any block.
+    pub dictionary: Option<Arc<Dictionary>>,
     /// Allow online retraining when residual exceeds `drift_residual_ratio` (even if `profile` was supplied when `allow_profile_drift` is true).
     pub allow_drift_retrain: bool,
     pub drift_residual_ratio: f64,
@@ -74,6 +78,7 @@ impl Default for PackOptions {
             framing: FramingSpec::Auto,
             train: TrainOptions::default(),
             profile: None,
+            dictionary: None,
             allow_drift_retrain: true,
             drift_residual_ratio: 0.10,
             sync_interval_frames: 8,
@@ -163,12 +168,37 @@ impl StreamEncoder {
         self.encode_framed(&split_chunk(raw, self.opts.framing), &mut out)
     }
 
+    /// Writes the dictionary as a frame of its own.
+    fn write_dictionary<W: Write>(&mut self, dict: &Dictionary, mut out: W) -> Result<()> {
+        let payload = dict.store();
+        let hdr = frame_header(
+            FLAG_DICTIONARY | FLAG_HAS_CHECKSUM,
+            EntropyBackend::Zstd,
+            dict.len(),
+            0,
+            ResolvedFraming::LengthU32Le,
+            payload.len(),
+        );
+        out.write_all(&hdr)?;
+        out.write_all(&payload)?;
+        out.write_all(&dict.id().to_le_bytes())?;
+        let off = self.comp_offset + hdr.len() as u64;
+        self.index.dictionary(off, payload.len() as u64, dict.id());
+        self.comp_offset = off + payload.len() as u64 + 8;
+        Ok(())
+    }
+
     /// Compresses one already-framed chunk into a `ZFM1` frame written to `out`.
     pub(crate) fn encode_framed<W: Write>(
         &mut self,
         fc: &FramedChunk<'_>,
         mut out: W,
     ) -> Result<FrameFit> {
+        if self.comp_offset == 0
+            && let Some(dict) = self.opts.dictionary.clone()
+        {
+            self.write_dictionary(&dict, &mut out)?;
+        }
         let raw = fc.raw;
         let all_recs: Vec<&[u8]> = (0..fc.len()).map(|i| fc.record(i)).collect();
         let rec_bytes: usize = all_recs.iter().map(|r| r.len()).sum();
@@ -277,20 +307,23 @@ impl StreamEncoder {
             };
             let mut body = Vec::new();
             let plan = self.active_plan.as_ref().unwrap();
-            let (frame_blocks, library) = with_seeds(&mut self.seeds, || {
-                encode_structural_blocks(
-                    &all_recs,
-                    plan,
-                    &self.opts.packs,
-                    self.opts.backend,
-                    self.opts.level,
-                    self.opts.block_rows,
-                    self.opts.block_bytes,
-                    filter_bits,
-                    code,
-                    &mut body,
-                )
-            });
+            let (frame_blocks, library) = {
+                let _dict = Scope::enter(self.opts.dictionary.clone());
+                with_seeds(&mut self.seeds, || {
+                    encode_structural_blocks(
+                        &all_recs,
+                        plan,
+                        &self.opts.packs,
+                        self.opts.backend,
+                        self.opts.level,
+                        self.opts.block_rows,
+                        self.opts.block_bytes,
+                        filter_bits,
+                        code,
+                        &mut body,
+                    )
+                })
+            };
             blocks = frame_blocks;
             self.active_plan.as_mut().unwrap().library = library;
             let plan = self.active_plan.as_ref().unwrap();
@@ -360,16 +393,14 @@ impl StreamEncoder {
             flags |= FLAG_SYNC_POINT;
         }
 
-        let mut hdr = Vec::with_capacity(48);
-        hdr.extend_from_slice(FRAME_MAGIC);
-        hdr.extend_from_slice(&flags.to_le_bytes());
-        hdr.push(self.opts.backend as u8);
-        put_uvarint(&mut hdr, raw.len() as u64);
-        put_uvarint(&mut hdr, all_recs.len() as u64);
-        fc.framing.encode(&mut hdr);
-        hdr.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-        let h_crc = crc32(&hdr);
-        hdr.extend_from_slice(&h_crc.to_le_bytes());
+        let hdr = frame_header(
+            flags,
+            self.opts.backend,
+            raw.len(),
+            all_recs.len(),
+            fc.framing,
+            payload.len(),
+        );
 
         let tail_len = if self.opts.checksum { 8usize } else { 0usize };
         let total_frame_bytes = (hdr.len() + payload.len() + tail_len) as u64;
@@ -437,6 +468,27 @@ impl StreamEncoder {
         out.write_all(&self.finish_index())?;
         Ok(())
     }
+}
+
+fn frame_header(
+    flags: u16,
+    backend: EntropyBackend,
+    raw_len: usize,
+    records: usize,
+    framing: ResolvedFraming,
+    payload_len: usize,
+) -> Vec<u8> {
+    let mut hdr = Vec::with_capacity(48);
+    hdr.extend_from_slice(FRAME_MAGIC);
+    hdr.extend_from_slice(&flags.to_le_bytes());
+    hdr.push(backend as u8);
+    put_uvarint(&mut hdr, raw_len as u64);
+    put_uvarint(&mut hdr, records as u64);
+    framing.encode(&mut hdr);
+    hdr.extend_from_slice(&(payload_len as u64).to_le_bytes());
+    let crc = crc32(&hdr);
+    hdr.extend_from_slice(&crc.to_le_bytes());
+    hdr
 }
 
 /// One block inside a frame payload.
@@ -1577,6 +1629,7 @@ pub fn unpack_stream<R: Read, W: Write>(
     budget: &DecodeBudget,
 ) -> Result<()> {
     let mut prev_plan: Option<ModelPlan> = None;
+    let mut dict = Scope::enter(None);
     loop {
         match read_next_frame_header(&mut reader, budget)? {
             NextFrameKind::Eof => return Ok(()),
@@ -1585,8 +1638,9 @@ pub fn unpack_stream<R: Read, W: Write>(
                     &mut (&mut reader).take(skip_bytes as u64),
                     &mut std::io::sink(),
                 )?;
-                // A stream concatenated after this one starts with its own model.
+                // A stream concatenated after this one starts with its own model and dictionary.
                 prev_plan = None;
+                dict.set(None);
             }
             NextFrameKind::Data(hdr) => {
                 let mut payload = budget.alloc_vec(hdr.payload_len, "frame payload")?;
@@ -1598,6 +1652,11 @@ pub fn unpack_stream<R: Read, W: Write>(
                 } else {
                     None
                 };
+                if (hdr.flags & FLAG_DICTIONARY) != 0 {
+                    let id = exp_xxh.ok_or_else(|| Error::Format("dictionary frame has no id".into()))?;
+                    dict.set(Some(Arc::new(Dictionary::read(&payload, id, budget)?)));
+                    continue;
+                }
                 decode_frame_payload(&hdr, &payload, exp_xxh, &mut prev_plan, budget, &mut writer)?;
             }
         }
@@ -1617,6 +1676,14 @@ pub fn inspect_stream<R: Read>(mut reader: R, budget: &DecodeBudget) -> Result<I
                     &mut std::io::sink(),
                 )?;
                 prev_plan = None;
+            }
+            NextFrameKind::Data(hdr) if (hdr.flags & FLAG_DICTIONARY) != 0 => {
+                std::io::copy(
+                    &mut (&mut reader).take(hdr.payload_len as u64 + 8),
+                    &mut std::io::sink(),
+                )?;
+                rep.total_compressed_bytes += hdr.payload_len as u64 + 32;
+                rep.column_bytes.push(("$dictionary".into(), hdr.payload_len as u64));
             }
             NextFrameKind::Data(hdr) => {
                 rep.frames += 1;
