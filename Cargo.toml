@@ -25,6 +25,7 @@ lz4_flex = "0.14"
 memchr = "2.8"
 same-file = "1.0"
 # `experimental` lets a leaf search its dictionary in place instead of copying its tables.
-zstd-safe = { version = "7", features = ["experimental"] }
+# Current frames need neither legacy readers nor the separate dictionary trainer.
+zstd-safe = { version = "7", default-features = false, features = ["experimental"] }
 zform-core = { path = "crates/zform-core", version = "0.1.0" }
 zform = { path = "crates/zform", version = "0.1.0" }
