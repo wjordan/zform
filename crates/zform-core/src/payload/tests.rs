@@ -221,7 +221,7 @@ fn engine_matches_eval_reference_on_random_dags_w32_and_w64() {
             let dec = Program::decode(&enc).expect("random valid DAG must decode");
             assert_eq!(dec, prog);
 
-            let rows = [0, 1, 7, 16, 31, 32, 33, 64, 65, 131][trial % 10];
+            let rows = [0, 1, 7, 16, 31, 32, 33, 64, 65, 131, 300, 1100][trial % 12];
             let cols: Vec<Vec<i64>> = (0..n_in)
                 .map(|_| (0..rows).map(|_| splitmix64(&mut rng) as i64).collect())
                 .collect();
@@ -309,7 +309,7 @@ fn recurrence_matches_native_generators_across_odd_lengths() {
         assert_eq!(got_s, want_s, "running_sum mismatch at n={n}");
     }
 
-    // Nonlinear short-lag recurrence (`lag = 5` and `lag = 19`): exercises general DAG unfolding!
+    // Nonlinear short-lag recurrence (`lag = 5` and `lag = 19`): chunks of five words per step.
     let nb = Builder::new_u32(2);
     let a = nb.input(0);
     let c = nb.input(1);
@@ -326,6 +326,152 @@ fn recurrence_matches_native_generators_across_odd_lengths() {
     eval_scalar_u32(&nonlin, &seed[..19], &[], &mut want_nl);
     comp_nl.eval_u32(&seed[..19], &[], &mut got_nl);
     assert_eq!(got_nl, want_nl);
+}
+
+/// Recurrence throughput for the specs the writer emits: `cargo test --release bench_recur --
+/// --ignored --nocapture`.
+#[test]
+#[ignore]
+fn bench_recurrences() {
+    let best = |f: &mut dyn FnMut()| {
+        (0..15)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                f();
+                t.elapsed().as_nanos()
+            })
+            .min()
+            .unwrap()
+    };
+    let seed = generators::mt_seed(5489);
+    let mt = CompiledRecurrence::compile(&recur_mt19937(true)).unwrap();
+    let mut out = vec![0u32; 1 << 20];
+    let ns = best(&mut || mt.eval_u32(&seed, &[], &mut out));
+    println!(
+        "mt19937 tempered: {:.2} ns/word",
+        ns as f64 / out.len() as f64
+    );
+    // Python's `init_by_array` first pass: lag 1 with a column.
+    let b = Builder::new_u32(2);
+    let prev = b.input(0);
+    let mixed = b.ri(
+        Op::MulI,
+        b.rr(Op::Xor, prev, b.ri(Op::ShrI, prev, 30)),
+        1_812_433_253,
+    );
+    let cur = b.rr(Op::Add, mixed, b.input(1));
+    let spec = RecurrenceSpec {
+        lags: vec![1],
+        state_prog: b.finish(&[(cur, 4)]),
+        out_prog: None,
+    };
+    let lag1 = CompiledRecurrence::compile(&spec).unwrap();
+    let idx: Vec<u32> = (1..=623).collect();
+    let mut out = vec![0u32; 623];
+    let ns = best(&mut || {
+        for _ in 0..100 {
+            lag1.eval_u32(&[19_650_218], &[&idx], &mut out);
+        }
+    });
+    println!(
+        "init_by_array lag-1 (623 words): {:.2} ns/word",
+        ns as f64 / 62_300.0
+    );
+    let ns = best(&mut || {
+        for _ in 0..100 {
+            eval_scalar_u32(&spec, &[19_650_218], &[&idx], &mut out);
+        }
+    });
+    println!(
+        "  scalar evaluator, same: {:.2} ns/word",
+        ns as f64 / 62_300.0
+    );
+    // Lag `k` and `k + 1` add-xor generator: where chunking beats one word at a time.
+    for k in [2u32, 4, 8, 16, 32] {
+        let b = Builder::new_u32(2);
+        let x = b.rr(Op::Add, b.input(0), b.ri(Op::ShlI, b.input(1), 3));
+        let x = b.rr(Op::Xor, x, b.ri(Op::ShrI, x, 7));
+        let spec = RecurrenceSpec {
+            lags: vec![k, k + 1],
+            state_prog: b.finish(&[(x, 4)]),
+            out_prog: None,
+        };
+        let seed: Vec<u32> = (0..=k).map(|i| i * 2_654_435_761).collect();
+        let c = CompiledRecurrence::compile(&spec).unwrap();
+        let mut out = vec![0u32; 1 << 16];
+        let fast = best(&mut || c.eval_u32(&seed, &[], &mut out));
+        let slow = best(&mut || eval_scalar_u32(&spec, &seed, &[], &mut out));
+        println!(
+            "lag {k}: compiled {:.2} scalar {:.2} ns/word",
+            fast as f64 / 65536.0,
+            slow as f64 / 65536.0
+        );
+    }
+}
+
+/// `p` as a recurrence program: one full-width sink, no scans, gathers or buffers.
+fn as_recurrence_prog(mut p: Program) -> Program {
+    for ins in &mut p.ops {
+        if ins.op.is_scan() || ins.op == Op::Gather {
+            ins.op = Op::XorI;
+        }
+    }
+    let full = if p.width == Width::W32 { 4 } else { 8 };
+    p.n_bufs = 0;
+    p.sinks = vec![(p.n_in + p.ops.len() as u32 - 1, Len::Fixed(full))];
+    p
+}
+
+#[test]
+fn random_recurrences_match_the_scalar_evaluator() {
+    let mut rng = 0x5eed_0f_7ec0_u64;
+    for trial in 0..160 {
+        let width = if trial % 2 == 0 {
+            Width::W32
+        } else {
+            Width::W64
+        };
+        let state_prog = as_recurrence_prog(random_program(&mut rng, width, 0));
+        let n_lags = 1 + (splitmix64(&mut rng) % u64::from(state_prog.n_in)) as usize;
+        let lags: Vec<u32> = (0..n_lags)
+            .map(|_| [1, 2, 3, 5, 31, 64, 300][(splitmix64(&mut rng) % 7) as usize])
+            .collect();
+        let mut out_prog = None;
+        if splitmix64(&mut rng) % 2 == 0 {
+            let mut p = random_program(&mut rng, width, 0);
+            p.n_in = 1;
+            p.ops.iter_mut().for_each(|i| (i.a, i.b, i.c) = (0, 0, 0));
+            out_prog = Some(as_recurrence_prog(p));
+        }
+        let spec = RecurrenceSpec {
+            lags,
+            state_prog,
+            out_prog,
+        };
+        let n = [0, 1, 7, 300, 1100][trial % 5];
+        let cols: Vec<Vec<i64>> = (0..spec.n_cols())
+            .map(|_| (0..n).map(|_| splitmix64(&mut rng) as i64).collect())
+            .collect();
+        let seed: Vec<i64> = (0..spec.max_lag())
+            .map(|_| splitmix64(&mut rng) as i64)
+            .collect();
+        let compiled = CompiledRecurrence::compile(&spec).unwrap();
+        if width == Width::W32 {
+            let narrow = |v: &[i64]| v.iter().map(|&x| x as u32).collect::<Vec<_>>();
+            let cols: Vec<Vec<u32>> = cols.iter().map(|c| narrow(c)).collect();
+            let cols: Vec<&[u32]> = cols.iter().map(|c| c.as_slice()).collect();
+            let (mut want, mut got) = (vec![0; n], vec![0; n]);
+            eval_scalar_u32(&spec, &narrow(&seed), &cols, &mut want);
+            compiled.eval_u32(&narrow(&seed), &cols, &mut got);
+            assert_eq!(got, want, "trial {trial}: {spec:?}");
+        } else {
+            let cols: Vec<&[i64]> = cols.iter().map(|c| c.as_slice()).collect();
+            let (mut want, mut got) = (vec![0; n], vec![0; n]);
+            super::recur::eval_scalar_i64(&spec, &seed, &cols, &mut want);
+            compiled.eval_i64(&seed, &cols, &mut got);
+            assert_eq!(got, want, "trial {trial}: {spec:?}");
+        }
+    }
 }
 
 fn recur_lfg(lag_a: u32, lag_b: u32) -> RecurrenceSpec {
@@ -685,13 +831,11 @@ fn random_imm(prog: &Program, at: usize, rng: &mut u64) -> i64 {
 #[test]
 fn a_named_program_runs_as_if_compiled_with_its_constants() {
     let mut rng = 0x0bad_5eed_cafe_f00d_u64;
-    let (mut in_place, mut total) = (0usize, 0usize);
     for &width in &[Width::W32, Width::W64] {
         for trial in 0..80 {
             let prog = random_program(&mut rng, width, trial);
             let lib = Library::new(vec![LibEntry::Program(prog.clone().into())]);
             let n_imm = prog.ops.iter().filter(|i| i.op.has_imm()).count();
-            let settable = CompiledProgram::compile(&prog).settable();
             let rows = [1, 7, 31, 32, 33, 65][trial % 6];
             // One compiled entry serves every set of constants and then its own again.
             for round in 0..6 {
@@ -701,20 +845,17 @@ fn a_named_program_runs_as_if_compiled_with_its_constants() {
                         set.push((at, random_imm(&prog, at, &mut rng)));
                     }
                 }
-                total += 1;
-                in_place += usize::from(set.iter().all(|&(at, _)| settable[at]));
                 check_named(&lib, &prog, &set, rows, &mut rng);
             }
         }
     }
-    assert!(in_place * 2 > total, "{in_place} of {total} sets in place");
 }
 
 #[test]
-fn constants_folded_into_a_fused_operation_are_not_set_in_place() {
+fn constants_of_combined_operations_take_overrides_alone_or_together() {
     let m = 0x00ff_00ff_00ff_00ff_i64;
-    // Each program with which of its constants can be set in place.
-    let cases: Vec<(Program, Vec<bool>)> = vec![
+    // Each program with its count of constants.
+    let cases: Vec<(Program, usize)> = vec![
         // A constant lane, then one derived from it: only the last instruction's stands alone.
         {
             let b = Builder::new(1);
@@ -724,14 +865,14 @@ fn constants_folded_into_a_fused_operation_are_not_set_in_place() {
                     let out = b.rr(Op::Add, b.input(0), k);
                     b.finish(&[(out, 8)])
                 },
-                vec![false, false, true],
+                3,
             )
         },
         // Multiply-add: the addend, not the multiplier.
         {
             let b = Builder::new(1);
             let v = b.ri(Op::AddI, b.ri(Op::MulI, b.input(0), 3), 9);
-            (b.finish(&[(v, 8)]), vec![false, true])
+            (b.finish(&[(v, 8)]), 2)
         },
         // Complementary masks.
         {
@@ -739,14 +880,14 @@ fn constants_folded_into_a_fused_operation_are_not_set_in_place() {
             let lo = b.ri(Op::AndI, b.input(0), m);
             let hi = b.ri(Op::AndI, b.input(1), !m);
             let out = b.rr(Op::Or, lo, hi);
-            (b.finish(&[(out, 8)]), vec![false, false])
+            (b.finish(&[(out, 8)]), 2)
         },
         // Xorshift steps, either way round.
         {
             let b = Builder::new(1);
             let x = b.rr(Op::Xor, b.ri(Op::ShrI, b.input(0), 7), b.input(0));
             let y = b.rr(Op::Xor, x, b.ri(Op::AndI, b.ri(Op::ShlI, x, 3), m));
-            (b.finish(&[(y, 8)]), vec![false, false, false])
+            (b.finish(&[(y, 8)]), 3)
         },
         // A low bit spread into a mask.
         {
@@ -754,7 +895,7 @@ fn constants_folded_into_a_fused_operation_are_not_set_in_place() {
             let top = b.ri(Op::ShlI, b.input(1), 63);
             let mask = b.ri(Op::AndI, b.ri(Op::SarI, top, 63), m);
             let v = b.rr(Op::Xor, b.input(0), mask);
-            (b.finish(&[(v, 8)]), vec![false, false, false])
+            (b.finish(&[(v, 8)]), 3)
         },
         // A select on masked bits, and beside it a scan and a shift that stand alone.
         {
@@ -762,23 +903,19 @@ fn constants_folded_into_a_fused_operation_are_not_set_in_place() {
             let cond = b.ri(Op::AndI, b.input(0), 1);
             let sum = b.ri(Op::ScanAdd, b.input(1), 100);
             let v = b.select(cond, b.ri(Op::ShrI, sum, 4), b.input(1));
-            (b.finish(&[(v, 8)]), vec![false, true, true])
+            (b.finish(&[(v, 8)]), 3)
         },
     ];
     let mut rng = 7u64;
-    for (prog, settable) in &cases {
-        assert_eq!(
-            &CompiledProgram::compile(prog).settable(),
-            settable,
-            "{prog:?}"
-        );
+    for &(ref prog, n_imm) in &cases {
+        assert_eq!(prog.ops.iter().filter(|i| i.op.has_imm()).count(), n_imm);
         let lib = Library::new(vec![LibEntry::Program(prog.clone().into())]);
-        // Every constant alone, set in place or not, then all at once, then none.
-        let mut sets: Vec<Vec<(usize, i64)>> = (0..settable.len())
+        // Every constant alone, then all at once, then none.
+        let mut sets: Vec<Vec<(usize, i64)>> = (0..n_imm)
             .map(|at| vec![(at, random_imm(prog, at, &mut rng))])
             .collect();
         sets.push(
-            (0..settable.len())
+            (0..n_imm)
                 .map(|at| (at, random_imm(prog, at, &mut rng)))
                 .collect(),
         );
@@ -817,7 +954,7 @@ fn numeric_chains_match_reference_for_extremes_and_short_tails() {
                     let p = b.finish(&[(v, 8)]);
                     let want = eval_reference(&p, &[&input], &[]);
                     let mut fast = vec![0; rows];
-                    assert!(super::engine::eval_numeric_chain(&p, &input, &mut fast));
+                    assert!(super::chain::eval_numeric_chain(&p, &input, &mut fast));
                     let mut general = vec![0; rows];
                     CompiledProgram::compile(&p).eval_i64(&[&input], &[], &mut general);
                     assert_eq!(fast, general);

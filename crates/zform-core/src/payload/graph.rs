@@ -2455,7 +2455,7 @@ impl CoreDecoder {
                 if let Some(prog) = prog {
                     budget.check_alloc(values.len().saturating_mul(8), "numeric lane output")?;
                     let mut out = vec![0; values.len()];
-                    if !super::engine::eval_numeric_chain(&prog, &values, &mut out) {
+                    if !super::chain::eval_numeric_chain(&prog, &values, &mut out) {
                         CompiledProgram::with(&prog.into(), |cp| {
                             cp.eval_i64(&[&values], &[], &mut out)
                         });
@@ -2982,7 +2982,7 @@ impl CoreDecoder {
                     let mut out = vec![0i64; n_rows];
                     if in_refs.len() != 1
                         || !tbufs.is_empty()
-                        || !super::engine::eval_numeric_chain(prog, in_refs[0], &mut out)
+                        || !super::chain::eval_numeric_chain(prog, in_refs[0], &mut out)
                     {
                         CompiledProgram::with(prog, |cp| cp.eval_i64(&in_refs, &tbufs, &mut out));
                     }

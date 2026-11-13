@@ -24,18 +24,18 @@ pub enum LibEntry {
     Bytes(Vec<u8>),
 }
 
-/// A program as a graph holds it. One read from the library remembers its entry and the
-/// instruction constants replaced in it, so the engine can run the entry it already compiled.
+/// A program as a graph holds it. One read from the library remembers its entry: overrides
+/// change only constants, so the engine can reuse the plan it made for the entry.
 #[derive(Clone, Debug)]
 pub struct Code {
     prog: Arc<Program>,
-    entry: Option<(Arc<Program>, Vec<(u32, i64)>)>,
+    entry: Option<Arc<Program>>,
 }
 
 impl Code {
-    /// The library entry this is, and the constants replaced in it by [`program_values`] index.
-    pub(crate) fn entry(&self) -> Option<(&Arc<Program>, &[(u32, i64)])> {
-        self.entry.as_ref().map(|(e, r)| (e, r.as_slice()))
+    /// The library entry this is.
+    pub(crate) fn entry(&self) -> Option<&Arc<Program>> {
+        self.entry.as_ref()
     }
 }
 
@@ -191,8 +191,6 @@ impl Library {
         let n = cur.uvar()? as usize;
         let n_imm = base.ops.iter().filter(|i| i.op.has_imm()).count();
         let mut prog = base.clone();
-        let mut replaced = Vec::new();
-        let mut shape_kept = true;
         let mut at = 0usize;
         for i in 0..n {
             let skip = cur.uvar()? as usize;
@@ -205,7 +203,6 @@ impl Library {
             let (width, mut imms) = (p.width, p.ops.iter_mut().filter(|i| i.op.has_imm()));
             let ok = if let Some(ins) = imms.nth(at) {
                 ins.imm = value;
-                replaced.push((at as u32, value));
                 ins.op.imm_ok(width, value)
             } else {
                 let fixed = p.sinks.iter_mut().filter_map(|(_, len)| match len {
@@ -213,7 +210,6 @@ impl Library {
                     Len::Lane(_) => None,
                 });
                 let max = if width == Width::W32 { 4 } else { 8 };
-                shape_kept = false;
                 match fixed.into_iter().nth(at - n_imm) {
                     Some(w) => {
                         *w = value as u8;
@@ -228,7 +224,7 @@ impl Library {
         }
         Ok(Code {
             prog,
-            entry: shape_kept.then(|| (base.clone(), replaced)),
+            entry: Some(base.clone()),
         })
     }
 
