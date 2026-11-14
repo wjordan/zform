@@ -8,7 +8,7 @@
 use std::cell::Cell;
 use std::sync::Arc;
 
-use crate::cells::{Cells, Col, NULL_CELL};
+use crate::cells::{Cells, Col, NOT_HELD, NULL_CELL, Pool};
 use crate::dictionary::with_current;
 use crate::wire::{
     Cursor, DecodeBudget, EntropyBackend, Error, Result, compress_leaf, compress_leaf_with,
@@ -842,6 +842,14 @@ pub enum GraphNode {
         base: u32,
         lens: u16,
     },
+    /// Cells of `lens` bytes, each in page `pages[i]` of `buf`: a page's cells lie back to back
+    /// in cell order from `bases[page]`.
+    PagedSlice {
+        buf: u16,
+        lens: u16,
+        pages: u16,
+        bases: u16,
+    },
     IndexCells {
         source: u16,
         indices: u16,
@@ -944,6 +952,17 @@ impl GraphNode {
                 f(*buf);
                 f(*lens);
             }
+            Self::PagedSlice {
+                buf,
+                lens,
+                pages,
+                bases,
+            } => {
+                f(*buf);
+                f(*lens);
+                f(*pages);
+                f(*bases);
+            }
             Self::IndexCells { source, indices } => {
                 f(*source);
                 f(*indices);
@@ -1021,6 +1040,17 @@ impl GraphNode {
                 buf: f(*buf),
                 base: *base,
                 lens: f(*lens),
+            },
+            Self::PagedSlice {
+                buf,
+                lens,
+                pages,
+                bases,
+            } => Self::PagedSlice {
+                buf: f(*buf),
+                lens: f(*lens),
+                pages: f(*pages),
+                bases: f(*bases),
             },
             Self::IndexCells { source, indices } => Self::IndexCells {
                 source: f(*source),
@@ -1821,6 +1851,18 @@ impl GraphBuilder {
         })
     }
 
+    pub fn add_paged_slice(&mut self, buf: u16, lens: &[i64], pages: &[i64], bases: &[i64]) -> u16 {
+        let lens = self.add_ints(lens);
+        let pages = self.add_ints(pages);
+        let bases = self.add_ints(bases);
+        self.push(GraphNode::PagedSlice {
+            buf,
+            lens,
+            pages,
+            bases,
+        })
+    }
+
     pub fn add_index_cells(&mut self, source: u16, indices: u16) -> u16 {
         self.push(GraphNode::IndexCells { source, indices })
     }
@@ -2159,6 +2201,17 @@ fn encode_node_linked(n: &GraphNode, lib: Option<&Library>, out: &mut Vec<u8>) {
             put_uvarint(out, *base as u64);
             put_uvarint(out, *lens as u64);
         }
+        GraphNode::PagedSlice {
+            buf,
+            lens,
+            pages,
+            bases,
+        } => {
+            out.push(24);
+            for x in [buf, lens, pages, bases] {
+                put_uvarint(out, *x as u64);
+            }
+        }
         GraphNode::IndexCells { source, indices } => {
             out.push(13);
             put_uvarint(out, *source as u64);
@@ -2361,6 +2414,12 @@ fn decode_node(
             let indices = check_ref(cur.uvar()?)?;
             Ok(GraphNode::IndexCells { source, indices })
         }
+        24 => Ok(GraphNode::PagedSlice {
+            buf: check_ref(cur.uvar()?)?,
+            lens: check_ref(cur.uvar()?)?,
+            pages: check_ref(cur.uvar()?)?,
+            bases: check_ref(cur.uvar()?)?,
+        }),
         14 => {
             let template = check_ref(cur.uvar()?)?;
             let slots = get_u16_list(cur, idx)?;
@@ -2440,7 +2499,7 @@ fn decode_node(
 /// External block-level inputs supplied when decoding a column [`PayloadGraph`].
 #[derive(Default)]
 pub struct ExtInputs<'a> {
-    pub pool: Option<&'a Arc<Vec<u8>>>,
+    pub pool: Option<&'a Arc<Pool>>,
     pub dict: Option<(u16, &'a Arc<Cells>)>,
     pub peers: &'a [Arc<Cells>],
     /// The value of each `ExtAlign` node, in node order, which the block layout determines.
@@ -2459,7 +2518,7 @@ pub struct CoreDecoder;
 enum Val {
     Empty,
     Buf(Vec<u8>),
-    SharedBuf(Arc<Vec<u8>>),
+    SharedBuf(Arc<Pool>),
     Ints(Vec<i64>),
     Cells(Cells),
     SharedCells(Arc<Cells>),
@@ -2600,6 +2659,7 @@ impl CoreDecoder {
                 GraphNode::ConstCells { .. }
                     | GraphNode::IndexCells { .. }
                     | GraphNode::SliceBuf { .. }
+                    | GraphNode::PagedSlice { .. }
             )
         };
         match &graph.nodes[root] {
@@ -2673,7 +2733,7 @@ impl CoreDecoder {
             }
             GraphNode::SliceBuf { buf, base, lens } => {
                 let lens_col = as_ints(&vals[*lens as usize])?;
-                let raw_len = as_table_bytes(&vals[*buf as usize])?.len();
+                let raw_len = buf_len(&vals[*buf as usize])?;
                 let start = *base as usize;
                 if start > raw_len {
                     return Err(Error::Format("SliceBuf base out of bounds".into()));
@@ -2699,6 +2759,10 @@ impl CoreDecoder {
                     return Err(Error::Format("SliceBuf slice exceeds buffer".into()));
                 }
                 if let Val::SharedBuf(pool) = &vals[*buf as usize] {
+                    // Only a paged slice reads a pool held in part.
+                    if !pool.is_whole() {
+                        return Err(Error::NotLoaded);
+                    }
                     return Ok(Col::Pool {
                         pool: Arc::clone(pool),
                         base: start,
@@ -2712,6 +2776,12 @@ impl CoreDecoder {
                 };
                 Ok(Col::Flat(Cells::from_parts(data, ends)?))
             }
+            GraphNode::PagedSlice {
+                buf,
+                lens,
+                pages,
+                bases,
+            } => paged_col(vals, [*buf, *lens, *pages, *bases], budget),
             GraphNode::QuoteOrNull { inner, map } => {
                 let map_u32 =
                     if let Some(m_id) = map {
@@ -3133,6 +3203,22 @@ impl CoreDecoder {
                     };
                     Val::Cells(Cells::from_parts(data, ends)?)
                 }
+                GraphNode::PagedSlice {
+                    buf,
+                    lens,
+                    pages,
+                    bases,
+                } => {
+                    let bytes = as_table_bytes(&vals[*buf as usize])?;
+                    let spans = paged_spans(
+                        as_ints(&vals[*lens as usize])?,
+                        as_ints(&vals[*pages as usize])?,
+                        as_ints(&vals[*bases as usize])?,
+                        bytes.len(),
+                        budget,
+                    )?;
+                    Val::Cells(gather(bytes, &spans)?)
+                }
                 GraphNode::IndexCells { source, indices } => {
                     let src = as_cells(&vals[*source as usize])?;
                     let idx_col = as_ints(&vals[*indices as usize])?;
@@ -3437,15 +3523,109 @@ fn parse_cell_ascii_i64(mut s: &[u8]) -> i64 {
 fn as_buf(v: &Val) -> Result<&[u8]> {
     match v {
         Val::Buf(b) => Ok(b),
-        Val::SharedBuf(b) => Ok(b),
+        Val::SharedBuf(b) => b.all(),
         _ => Err(Error::Format("expected Buf node".into())),
     }
+}
+
+/// The length of a buffer, which a pool knows without holding all its bytes.
+fn buf_len(v: &Val) -> Result<usize> {
+    match v {
+        Val::SharedBuf(p) => Ok(p.len()),
+        v => Ok(as_table_bytes(v)?.len()),
+    }
+}
+
+/// Each `PagedSlice` cell's `(start, end)` in a buffer of `buf_len` bytes.
+/// A `PagedSlice` node's column from its `[buf, lens, pages, bases]` inputs. Cells in pages the
+/// pool lacks get `NOT_HELD`.
+fn paged_col(
+    vals: &[Val],
+    [buf, lens, pages, bases]: [u16; 4],
+    budget: &DecodeBudget,
+) -> Result<Col> {
+    let mut spans = paged_spans(
+        as_ints(&vals[lens as usize])?,
+        as_ints(&vals[pages as usize])?,
+        as_ints(&vals[bases as usize])?,
+        buf_len(&vals[buf as usize])?,
+        budget,
+    )?;
+    match &vals[buf as usize] {
+        Val::SharedBuf(pool) => {
+            if !pool.is_whole() {
+                spans
+                    .iter_mut()
+                    .filter(|(s, e)| !pool.held(*s as usize, *e as usize))
+                    .for_each(|s| *s = NOT_HELD);
+            }
+            Ok(Col::Paged {
+                pool: Arc::clone(pool),
+                spans,
+            })
+        }
+        v => Ok(Col::Flat(gather(as_table_bytes(v)?, &spans)?)),
+    }
+}
+
+fn paged_spans(
+    lens: &[i64],
+    pages: &[i64],
+    bases: &[i64],
+    buf_len: usize,
+    budget: &DecodeBudget,
+) -> Result<Vec<(u32, u32)>> {
+    if lens.len() != pages.len() {
+        return Err(Error::Format("PagedSlice page count != cell count".into()));
+    }
+    if buf_len > u32::MAX as usize {
+        return Err(Error::BudgetExceeded("PagedSlice buffer"));
+    }
+    budget.check_alloc(lens.len().saturating_mul(8), "PagedSlice")?;
+    let mut at: Vec<u64> = Vec::with_capacity(bases.len());
+    for &b in bases {
+        if b < 0 || b as u64 > buf_len as u64 {
+            return Err(Error::Format("PagedSlice base out of bounds".into()));
+        }
+        at.push(b as u64);
+    }
+    let starts = at.clone();
+    let mut spans = Vec::with_capacity(lens.len());
+    for (&l, &p) in lens.iter().zip(pages) {
+        let next = usize::try_from(p).ok().and_then(|p| at.get_mut(p));
+        let (Some(next), true) = (next, l >= 0) else {
+            return Err(Error::Format("invalid PagedSlice cell".into()));
+        };
+        let (s, e) = (*next, *next + l as u64);
+        if e > buf_len as u64 {
+            return Err(Error::Format("PagedSlice cell exceeds buffer".into()));
+        }
+        *next = e;
+        spans.push((s as u32, e as u32));
+    }
+    // Runs may not overlap, so the cells' bytes stay within the buffer's.
+    let mut runs: Vec<(u64, u64)> = starts.into_iter().zip(at).collect();
+    runs.sort_unstable();
+    if runs.windows(2).any(|w| w[0].1 > w[1].0) {
+        return Err(Error::Format("PagedSlice runs overlap".into()));
+    }
+    Ok(spans)
+}
+
+/// The bytes of `spans` as cells.
+fn gather(bytes: &[u8], spans: &[(u32, u32)]) -> Result<Cells> {
+    let mut out = Cells::with_capacity(spans.len(), 0);
+    for &(s, e) in spans {
+        out.tail().extend_from_slice(&bytes[s as usize..e as usize]);
+        out.seal();
+    }
+    Ok(out)
 }
 
 fn as_table_bytes(v: &Val) -> Result<&[u8]> {
     match v {
         Val::Buf(b) => Ok(b),
-        Val::SharedBuf(b) => Ok(b),
+        Val::SharedBuf(b) => b.all(),
         Val::Ints(x) => {
             Ok(unsafe { core::slice::from_raw_parts(x.as_ptr().cast::<u8>(), x.len() * 8) })
         }

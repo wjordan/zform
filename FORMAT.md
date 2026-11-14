@@ -96,8 +96,9 @@ Rows of a block stay in arrival order. A column holds a value only for the rows 
 | [json_struct]:      [u32_seq; n_struct_streams]                   |
 | n_shared_dicts:     uvarint                                       |
 | shared_dicts:       [(len: uvarint, PayloadGraph); n_shared_dicts]|
-| has_prose_pool:     u8 (0 or 1)                                   |
-| [prose_pool]:       len: uvarint, EntropyLeaf                     |
+| prose_pool_kind:    u8 (0 none, 1 one leaf, 2 pages)              |
+| [prose_pool]:       1: len: uvarint, EntropyLeaf                  |
+|                     2: n: uvarint, [len: uvarint; n], [leaf; n]   |
 | col_lengths:        [uvarint; n_cols]                             |
 | col_blobs:          [ColumnPayload; n_cols]                      |
 +-------------------------------------------------------------------+
@@ -113,6 +114,7 @@ Each object path has a shape stream (one shape id per occurrence, `0` for a valu
 ### shared tables
 - **Shared dictionaries** (`shared_dicts`): columns whose string values overlap (GitHub `actor.login`, `user.login`, `owner.login`; source and destination addresses) share a table of cells per block. Each table is itself a `PayloadGraph`. A consuming graph uses `ExtDict` and `IndexCells` with a stream of ordinals.
 - **Prose pool** (`prose_pool`): free-text columns whose cells average 40 bytes or more (`body`, commit messages) share one compressed buffer. Pooling requires at least two qualifying columns and must make the block smaller. A consuming graph uses `ExtPool` and `SliceBuf` with its base offset and a stream of cell lengths. Columns that hold raw JSON subtrees stay out of it, so a field read inside one does not fetch the pool.
+- **Pool pages**: a pool over the writer's page size (default 192 KiB raw) may be cut into 2 to 255 pages of whole rows, so a reader decompresses only the pages its rows use. The pool's bytes are the pages' raw bytes back to back. Page 0 is a `Zstd` or `Raw` leaf; every later page is a `Raw` leaf or a `Zstd` frame decoded with page 0's raw bytes as raw-content dictionary (`ZSTD_decompress_usingDict`), so it needs page 0 and itself; page 0 must not begin with the dictionary magic `37 A4 30 EC`. A consuming graph uses `ExtPool` and `PagedSlice`. Within a page, each column's cells lie back to back in cell order.
 
 ---
 
@@ -256,6 +258,7 @@ Unless typed otherwise, operands are `uvarint`. `ref` names an earlier node; `re
 | `21` | `LibraryBytes` | `id` | Buffer from a byte-table library entry |
 | `22` | `ExtAlign` | `key`, `at` | Integers: for each cell of `at`, the value id of the first `key` cell in its record |
 | `23` | `MatchIndex` | `needles: ref`, `hay: ref`, `codes: ref` | Integers: positions in `hay` matched by key |
+| `24` | `PagedSlice` | `buf: ref`, `lens: ref`, `pages: ref`, `bases: ref` | Cell `i` of `lens[i]` bytes in page `pages[i]`; page `p`'s cells follow one another from offset `bases[p]` of `buf`; the pages' runs must not overlap |
 
 `MtfFixed` keeps the last 64 items, most recent first. Code `0` consumes the next `width` fallback bytes and inserts that item. Code `k > 0` selects rank `k - 1` and moves it to the front. `MtfInts` uses the same code convention with integer misses.
 
@@ -355,19 +358,19 @@ row_modes: u32_seq | child_block: blob | [fallback_graph: blob]
 Derived from the data region and rebuilt by scanning it. `pack` appends it at EOF; the file writer returns it apart.
 ```text
 "ZFIX" (4B) | body_len: u64 LE
-| filter pages | directory pages | root: EntropyLeaf
+| page filter pages | filter pages | directory pages | root: EntropyLeaf
 | root_crc32: u32 LE | root_len: u64 LE | region_len: u64 LE | "ZFIE" (4B)
 ```
-`body_len` counts the bytes after it, `region_len` the whole region, and `root_crc32` is the IEEE CRC32 of the root leaf as stored. Each block has one filter page and one directory page, in block order, the filter pages starting at offset 12; a page may be empty, and a verbatim block has no directory page. A streaming decoder skips the region. A reader takes the last 24 bytes to find the root, and the directories and root are the contiguous tail every query reads.
+`body_len` counts the bytes after it, `region_len` the whole region, and `root_crc32` is the IEEE CRC32 of the root leaf as stored. Each block has one filter page and one directory page, and a block with a paged pool one page filter page, each kind in block order from offset 12; a page may be empty, and a verbatim block has no directory page. A streaming decoder skips the region. A reader takes the last 24 bytes to find the root, and the directories and root are the contiguous tail every query reads.
 
 All fields below are `uvarint` unless typed.
 
 - **Root**: `data_len`; `n_models`, then each model as a length and its `ModelPlan` bytes, each stored once; `n_blocks`, then per block:
-  - `kind: u8`. `0` is a structured block, followed by its model id and `kinds`, a mask of what its rows are: `0x01` variant 0, `0x02` `JsonTree`, `0x04` another `Shape`, `0x08` `ShapeCell`. `1` is a verbatim block, followed by its `ResolvedFraming`.
-  - the gap between the previous block's end and this block's offset in the data region, its length, its row count, its directory page length and its filter page length. Page offsets follow from the lengths.
+  - `kind: u8`. `0` is a structured block, followed by its model id and `kinds`, a mask of what its rows are: `0x01` variant 0, `0x02` `JsonTree`, `0x04` another `Shape`, `0x08` `ShapeCell`. `1` is a verbatim block, followed by its `ResolvedFraming`. `2` is a structured block as `0` with a page filter page.
+  - the gap between the previous block's end and this block's offset in the data region, its length, its row count, its directory page length, its filter page length and, for kind `2`, its page filter page length. Page offsets follow from the lengths.
 
   After the blocks comes the length of the dictionary's leaf in the data region, `0` when there is none, else followed by the leaf's offset and `id: u64 LE`.
-- **Directory page**: an `EntropyLeaf` holding, with offsets relative to the block's first byte: `struct_len`; the offset of the first structure stream; `n_streams` and each stream's length; `n_dicts` and each shared dictionary's `(offset, length)`; `pool_len`, then the pool's offset if `pool_len > 0`; `n_cols` and the first column's offset; then the columns in order. A column is `flags: u8`, `len`, and then by flag:
+- **Directory page**: an `EntropyLeaf` holding, with offsets relative to the block's first byte: `struct_len`; the offset of the first structure stream; `n_streams` and each stream's length; `n_dicts` and each shared dictionary's `(offset, length)`; `pool_len`, then if `pool_len > 0` the pool's offset and `n_pages`, `0` for one leaf, else each page's compressed and raw length, which must sum to `pool_len` and stay within the decode budget; `n_cols` and the first column's offset; then the columns in order. A column is `flags: u8`, `len`, and then by flag:
   - `0x01`, the column has values: `letters`, the ASCII letters its cells hold, case folded, bit `i` for `'a' + i` and bit 26 for a backslash.
   - `0x06`, a two-bit kind, `1` integer or `2` timestamp in nanoseconds: `min, max: ivarint`.
   - `0x08`: the column reads the prose pool.
@@ -377,6 +380,7 @@ All fields below are `uvarint` unless typed.
 
   `flags = 0x80` followed by a count stands for a run of that many empty one-byte columns.
 - **Filter page**: a power-of-two number of bytes, at least 8, read as bits: bit `p` is bit `p & 7` of byte `p >> 3`. The tokens of a block's records come from the runs of ASCII letters in them, case kept. A run of 3 to 7 letters is one token, `mix(h)` with `h` the FNV-1a 64 hash of its letters. A run of 8 or more gives no such token and one token for every 8 consecutive letters in it, `mix(w ^ 0x6772616d)` with `w` those 8 letters as a `u64 LE`. `mix` is the MurmurHash3 64-bit finalizer. A token sets the bits at its low and its high 32 bits, each modulo the filter's size in bits. The writer starts at 2^17 bits and, while under a quarter of the bits are set, halves the filter by OR-ing its upper half into its lower.
+- **Page filter page**: for a pool of `n` pages, `n` bytes giving each page filter's size as `log2` of its bytes, at least 3; then the row page map, row `r`'s value in `w` bits from bit `r * w`, `w` the bit length of `n`, `page + 1` for the page holding the row's pool cells or `0` for none, in `ceil(rows * w / 8)` bytes; then the page filters back to back. A page filter is a filter page of the tokens of that page's cells; the writer halves it while at most 70% of the half's bits would be set. A reader may skip a page whose filter lacks a token that a needle held within one pooled cell must have.
 
 ### `ZFP1` profile (`.zfp`)
 ```text

@@ -6,6 +6,8 @@
 //! [`CoreDecoder`](crate::payload::graph::CoreDecoder) executes without knowing anything about
 //! the pack that produced it.
 
+use crate::container::DEFAULT_FILTER_BITS;
+use crate::index::{FilterBuilder, MAX_PAGES, tokens};
 use std::cell::{OnceCell, RefCell};
 use std::fmt;
 use std::sync::Arc;
@@ -18,7 +20,8 @@ use crate::payload::graph::{
 };
 use crate::payload::ir::{Builder, Len, Op, Program, V};
 use crate::payload::recur::RecurrenceSpec;
-use crate::wire::EntropyBackend;
+use crate::dictionary::with_current;
+use crate::wire::{EntropyBackend, compress_pages};
 
 // ============================================================================
 // 1. Writer-Side Pre-Filtering Profile & CodecPack Registry
@@ -4366,9 +4369,114 @@ impl CodecPack for BinaryPlanesPack {
 /// Result of encoding all columns of a dense block via [`PackRegistry::encode_dense_block`].
 pub struct EncodedDenseBlock {
     pub shared_dict_blobs: Vec<Vec<u8>>,
-    pub prose_pool_leaf: Option<Vec<u8>>,
+    /// The text pool's leaves: none, one leaf, or pages.
+    pub pool_pages: Vec<Vec<u8>>,
+    /// Each page's token filter and by row its page plus one (`0` for none), when paged.
+    pub pool_filters: Vec<Vec<u8>>,
+    pub pool_rows: Vec<u32>,
     pub col_blobs: Vec<Vec<u8>>,
     pub summaries: Vec<ColSummary>,
+}
+
+/// How a block's text pool is cut into pages.
+#[derive(Clone, Copy)]
+pub struct Paging<'a> {
+    /// Most raw bytes in a page. A row with more has a page of its own.
+    pub page_bytes: usize,
+    /// By column of the mask, the row of each of its cells, if every cell has one.
+    pub cell_rows: &'a dyn Fn(&[bool]) -> Option<Vec<Vec<u32>>>,
+}
+
+/// A text pool's leaves and its columns' graphs, and when paged each page's token filter and
+/// by row its page plus one.
+type PoolEnc = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<u32>);
+
+/// The pool as one leaf, each column's cells back to back.
+fn whole_pool(cols: &[&[&[u8]]]) -> PoolEnc {
+    let mut raw = Vec::new();
+    let mut specs = Vec::with_capacity(cols.len());
+    for vals in cols {
+        let base = raw.len() as u32;
+        let lens: Vec<i64> = vals.iter().map(|v| v.len() as i64).collect();
+        vals.iter().for_each(|v| raw.extend_from_slice(v));
+        let mut gb = GraphBuilder::new(vals.len());
+        let p_node = gb.add_ext_pool();
+        let s_node = gb.add_slice_buf(p_node, base, &lens);
+        specs.push(gb.finish(s_node).encode());
+    }
+    (vec![pack_text_leaf(&raw)], specs, Vec::new(), Vec::new())
+}
+
+/// The pool cut into pages of whole rows, so a record reads one page and the first. Rows go in
+/// order of their longest cell's leading bytes, which puts like rows, and repeats, together.
+fn page_pool(
+    cols: &[&[&[u8]]],
+    rows: &[Vec<u32>],
+    page_bytes: usize,
+    level: i32,
+) -> PoolEnc {
+    const KEY: usize = 32;
+    let n_rows = rows.iter().flatten().map(|&r| r as usize + 1).max().unwrap_or(0);
+    let mut row_bytes = vec![0usize; n_rows];
+    let mut key: Vec<&[u8]> = vec![&[]; n_rows];
+    let mut longest = vec![0usize; n_rows];
+    for (vals, rs) in cols.iter().zip(rows) {
+        for (v, &r) in vals.iter().zip(rs) {
+            let r = r as usize;
+            row_bytes[r] += v.len();
+            if v.len() >= longest[r] {
+                longest[r] = v.len();
+                key[r] = &v[..v.len().min(KEY)];
+            }
+        }
+    }
+    let mut order: Vec<usize> = (0..n_rows).filter(|&r| row_bytes[r] > 0).collect();
+    order.sort_by_key(|&r| key[r]);
+    let mut page_of = vec![0u32; n_rows];
+    let (mut n_pages, mut cur) = (1u32, 0usize);
+    for r in order {
+        if cur > 0 && cur + row_bytes[r] > page_bytes {
+            n_pages += 1;
+            cur = 0;
+        }
+        page_of[r] = n_pages - 1;
+        cur += row_bytes[r];
+    }
+    let mut pages = vec![Vec::new(); n_pages as usize];
+    let mut filters: Vec<_> =
+        (0..n_pages).map(|_| FilterBuilder::new(DEFAULT_FILTER_BITS)).collect();
+    let mut col_pages = Vec::with_capacity(cols.len());
+    let mut col_bases = Vec::with_capacity(cols.len());
+    for (vals, rs) in cols.iter().zip(rows) {
+        let ids: Vec<i64> = rs.iter().map(|&r| page_of[r as usize] as i64).collect();
+        let bases: Vec<usize> = pages.iter().map(Vec::len).collect();
+        for (v, &p) in vals.iter().zip(&ids) {
+            pages[p as usize].extend_from_slice(v);
+            tokens(v, |t, _| filters[p as usize].add(t));
+        }
+        col_pages.push(ids);
+        col_bases.push(bases);
+    }
+    let starts: Vec<usize> = pages
+        .iter()
+        .scan(0, |at, p| Some(std::mem::replace(at, *at + p.len())))
+        .collect();
+    let specs = cols
+        .iter()
+        .zip(col_pages.iter().zip(&col_bases))
+        .map(|(vals, (ids, bases))| {
+            let lens: Vec<i64> = vals.iter().map(|v| v.len() as i64).collect();
+            // A run's place in its page, made a place in the pool.
+            let bases: Vec<i64> = bases.iter().zip(&starts).map(|(b, s)| (b + s) as i64).collect();
+            let mut gb = GraphBuilder::new(vals.len());
+            let p_node = gb.add_ext_pool();
+            let s_node = gb.add_paged_slice(p_node, &lens, ids, &bases);
+            gb.finish(s_node).encode()
+        })
+        .collect();
+    let filters = filters.into_iter().map(FilterBuilder::finish_page).collect();
+    let rows = (0..n_rows).map(|r| (row_bytes[r] > 0) as u32 * (page_of[r] + 1)).collect();
+    (compress_pages(&pages, level), specs, filters, rows)
 }
 
 fn replace_subslice(hay: &[u8], needle: &[u8], rep: &[u8]) -> Option<Vec<u8>> {
@@ -4478,6 +4586,7 @@ impl PackRegistry {
         preencoded_nested: &mut [Option<(ColSummary, Vec<u8>)>],
         standalone: &[bool],
         layout: Option<(&ModelPlan, &[u32])>,
+        paging: Option<Paging<'_>>,
         backend: EntropyBackend,
         level: i32,
     ) -> EncodedDenseBlock {
@@ -4984,9 +5093,22 @@ impl PackRegistry {
             // Phase 3: Block-level `ProseSlice` (`ExtPool` + `SliceBuf`) across long-text columns.
             let mut prose_cols = Vec::<usize>::new();
             let mut total_prose_bytes = 0usize;
+            let paging = paging.filter(|_| {
+                backend == EntropyBackend::Zstd && with_current(|d| d.is_none())
+            });
+            // A column another column reads decodes whole, so a paged pool leaves it out.
+            let mut read_by_peer = vec![false; n_cols];
+            if paging.is_some() {
+                for blob in &col_blobs {
+                    for c in crate::codecs::column_deps(blob).cols {
+                        read_by_peer.get_mut(c as usize).map(|r| *r = true);
+                    }
+                }
+            }
             for cid in 0..n_cols {
                 if !raw_backed[cid]
                     || used_ext[cid]
+                    || read_by_peer[cid]
                     || standalone.get(cid).copied().unwrap_or(false)
                 {
                     continue;
@@ -5006,32 +5128,48 @@ impl PackRegistry {
                 }
             }
 
-            let mut prose_pool_leaf = None;
+            let (mut pool_pages, mut pool_filters, mut pool_rows) =
+                (Vec::new(), Vec::new(), Vec::new());
             if prose_cols.len() >= 2 {
-                let mut cur_sum = 0usize;
-                let mut pool_raw = Vec::with_capacity(total_prose_bytes);
-                let mut member_specs = Vec::with_capacity(prose_cols.len());
-
-                for &cid in &prose_cols {
-                    cur_sum += col_costs[cid];
-                    let vals = &occ_streams[cid];
-                    let base = pool_raw.len() as u32;
-                    let mut lens = Vec::with_capacity(vals.len());
-                    for &v in vals {
-                        pool_raw.extend_from_slice(v);
-                        lens.push(v.len() as i64);
+                let cur_sum: usize = prose_cols.iter().map(|&c| col_costs[c]).sum();
+                let cols: Vec<&[&[u8]]> = prose_cols.iter().map(|&c| &occ_streams[c][..]).collect();
+                let rows = paging
+                    .filter(|p| total_prose_bytes > p.page_bytes)
+                    .and_then(|p| {
+                        let mut want = vec![false; n_cols];
+                        prose_cols.iter().for_each(|&c| want[c] = true);
+                        let rows = (p.cell_rows)(&want)?;
+                        let rows: Vec<Vec<u32>> =
+                            prose_cols.iter().map(|&c| rows[c].clone()).collect();
+                        let fits = rows.iter().zip(&cols).all(|(r, c)| r.len() == c.len());
+                        Some((p.page_bytes, fits.then_some(rows)?))
+                    });
+                let cost = |(pages, specs, ..): &PoolEnc| {
+                    pages.iter().map(|p| p.len() + 3).sum::<usize>()
+                        + specs.iter().map(Vec::len).sum::<usize>()
+                };
+                let paged = rows
+                    .map(|(page_bytes, rows)| page_pool(&cols, &rows, page_bytes, level))
+                    .filter(|p| (2..=MAX_PAGES).contains(&p.0.len()));
+                // Pages cost a little more than one leaf. The pool is chosen as one leaf would
+                // be, then paged unless that costs over a quarter more: text that repeats
+                // across rows pays for its repeats in every page.
+                let pool = match paged {
+                    Some(p) if cost(&p) + 16 < cur_sum => Some(p),
+                    paged => {
+                        let whole = whole_pool(&cols);
+                        let w = cost(&whole);
+                        (w + 16 < cur_sum).then(|| match paged {
+                            Some(p) if cost(&p) * 4 <= w * 5 => p,
+                            _ => whole,
+                        })
                     }
-                    let mut gb = GraphBuilder::new(vals.len());
-                    let p_node = gb.add_ext_pool();
-                    let s_node = gb.add_slice_buf(p_node, base, &lens);
-                    member_specs.push((cid, gb.finish(s_node).encode()));
-                }
-                let p_leaf = pack_text_leaf(&pool_raw);
-                let new_sum =
-                    p_leaf.len() + 3 + member_specs.iter().map(|(_, b)| b.len()).sum::<usize>();
-                if new_sum + 16 < cur_sum {
-                    prose_pool_leaf = Some(p_leaf);
-                    for (cid, blob) in member_specs {
+                };
+                if let Some((pages, member_specs, filters, rows)) = pool {
+                    pool_pages = pages;
+                    pool_filters = filters;
+                    pool_rows = rows;
+                    for (&cid, blob) in prose_cols.iter().zip(member_specs) {
                         col_costs[cid] = blob.len();
                         col_blobs[cid] = blob;
                     }
@@ -5040,7 +5178,9 @@ impl PackRegistry {
 
             EncodedDenseBlock {
                 shared_dict_blobs,
-                prose_pool_leaf,
+                pool_pages,
+                pool_filters,
+                pool_rows,
                 col_blobs,
                 summaries,
             }

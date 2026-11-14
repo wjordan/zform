@@ -1,10 +1,10 @@
 //! The `ZFM1` framed stream, which is a file's data region. A frame carries a model, or reuses the
 //! previous frame's, and self-contained blocks. The encoder collects the index region as it goes.
 
-use crate::cells::{Cells, Col};
+use crate::cells::{Cells, Col, underflow};
 use crate::dictionary::{Dictionary, DictionaryBuilder, Scope};
 use crate::codecs::{
-    ANY_LETTERS, BlockDecodeCtx, ColSummary, Seeds, column_deps, decode_present_slice,
+    ANY_LETTERS, BlockDecodeCtx, ColSummary, PoolParts, Seeds, column_deps, decode_present_slice,
     decode_u32_seq, encode_dense_block_columns, encode_present_slice, encode_u32_seq,
     ensure_dense_block_column, with_seeds,
 };
@@ -16,17 +16,17 @@ use crate::grammar::{
 };
 use crate::index::{
     BlockDir, BlockKind, ColEntry, FilterBuilder, INDEX_MAGIC, IndexBuilder, KIND_JSON, KIND_RESIDUAL,
-    KIND_SHAPE, KIND_SHAPE_CELL, tokens,
+    KIND_SHAPE, KIND_SHAPE_CELL, page_filter_page, tokens,
 };
 use crate::json_tree::{decode_json_struct_streams, encode_json_struct_streams};
 use crate::lex::parse_base64;
-use crate::packs::{EncodedDenseBlock, PackRegistry};
+use crate::packs::{EncodedDenseBlock, PackRegistry, Paging};
 use crate::payload::graph::{NESTED_COLUMN_TAG, PayloadGraph};
 use crate::payload::library::{Harvest, Library, with_code_pricing};
 use crate::plan::{ProbeBackoff, Profile, TrainOptions, sample_strided, train_from_records};
 use crate::wire::{
     Cursor, DecodeBudget, EntropyBackend, Error, Result, compress_leaf, crc32, decompress_leaf,
-    put_bytes, put_uvarint, xxh64,
+    leaf_raw_len, put_bytes, put_uvarint, xxh64,
 };
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -43,6 +43,7 @@ pub const DEFAULT_BLOCK_ROWS: usize = 65_536;
 pub const DEFAULT_BLOCK_BYTES: usize = 8 << 20;
 /// Largest substring filter of one block, in bits. A filter shrinks to fit what its block holds.
 pub const DEFAULT_FILTER_BITS: usize = 1 << 17;
+pub const DEFAULT_POOL_PAGE_BYTES: usize = 192 << 10;
 
 #[derive(Debug, Clone)]
 pub struct PackOptions {
@@ -65,6 +66,9 @@ pub struct PackOptions {
     /// Build the index region; `StreamEncoder::finish` writes it after the last frame.
     pub index: bool,
     pub filter_bits: usize,
+    /// Most raw bytes in a page of a block's text pool, which a reader fetches a page at a time.
+    /// Zero keeps each pool whole.
+    pub pool_page_bytes: usize,
     /// Pluggable writer-side codec packs evaluated on columns.
     pub packs: PackRegistry,
 }
@@ -87,6 +91,7 @@ impl Default for PackOptions {
             checksum: true,
             index: true,
             filter_bits: DEFAULT_FILTER_BITS,
+            pool_page_bytes: DEFAULT_POOL_PAGE_BYTES,
             packs: PackRegistry::default(),
         }
     }
@@ -336,6 +341,8 @@ impl StreamEncoder {
                         self.opts.block_rows,
                         self.opts.block_bytes,
                         filter_bits,
+                        // Pages serve readers that come through the index.
+                        if self.opts.index { self.opts.pool_page_bytes } else { 0 },
                         code,
                         &mut body,
                     )
@@ -433,7 +440,7 @@ impl StreamEncoder {
         if !self.opts.index {
         } else if !final_passthrough {
             for b in &blocks {
-                let Some((dir, filter, kinds)) = &b.index else {
+                let Some((dir, filter, pages, kinds)) = &b.index else {
                     continue;
                 };
                 let kind = BlockKind::Structured {
@@ -447,6 +454,7 @@ impl StreamEncoder {
                     b.rows as u64,
                     dir,
                     filter,
+                    pages,
                 );
             }
         } else if !all_recs.is_empty() {
@@ -464,6 +472,7 @@ impl StreamEncoder {
                 all_recs.len() as u64,
                 &[],
                 &fb.finish(),
+                &[],
             );
         }
         self.comp_offset += total_frame_bytes;
@@ -515,7 +524,7 @@ pub(crate) struct FrameBlock {
     pub len: usize,
     pub residual_rows: usize,
     pub residual_bytes: usize,
-    pub index: Option<(Vec<u8>, Vec<u8>, u16)>,
+    pub index: Option<(Vec<u8>, Vec<u8>, Vec<u8>, u16)>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -528,6 +537,7 @@ fn encode_structural_blocks(
     max_block_rows: usize,
     max_block_bytes: usize,
     filter_bits: Option<usize>,
+    page_bytes: usize,
     code: CodeSharing,
     out: &mut Vec<u8>,
 ) -> (Vec<FrameBlock>, Arc<Library>) {
@@ -558,7 +568,8 @@ fn encode_structural_blocks(
             bounds
                 .iter()
                 .map(|&(s, e)| {
-                    encode_block_columns(&all_recs[s..e], plan, packs, backend, level, filter_bits)
+                    let recs = &all_recs[s..e];
+                    encode_block_columns(recs, plan, packs, backend, level, filter_bits, page_bytes)
                 })
                 .collect()
         });
@@ -612,8 +623,8 @@ pub(crate) struct EncodedBlock {
     /// Rows and bytes the model left residual.
     pub residual_rows: usize,
     pub residual_bytes: usize,
-    /// Directory page, filter page and row kinds, when a filter size was given.
-    pub index: Option<(Vec<u8>, Vec<u8>, u16)>,
+    /// Directory, filter and page filter pages and row kinds, when a filter size was given.
+    pub index: Option<(Vec<u8>, Vec<u8>, Vec<u8>, u16)>,
 }
 
 /// What kinds of row a block holds, as `index::KIND_*` bits.
@@ -645,7 +656,7 @@ pub(crate) fn encode_block_fit(
     filter_bits: Option<usize>,
 ) -> EncodedBlock {
     with_code_pricing(plan.library.clone(), 1, || {
-        encode_block_columns(recs, plan, packs, backend, level, filter_bits)
+        encode_block_columns(recs, plan, packs, backend, level, filter_bits, 0)
     })
     .finish(plan, &plan.library, backend, level)
 }
@@ -663,7 +674,7 @@ pub(crate) fn learn_library(
     }
     // Priced as shared by many blocks: the sample stands for all of them.
     let mut block = with_code_pricing(plan.library.clone(), 64, || {
-        encode_block_columns(recs, plan, packs, backend, level, None)
+        encode_block_columns(recs, plan, packs, backend, level, None, 0)
     });
     let mut harvest = Harvest::default();
     block.harvest(plan, &mut harvest);
@@ -680,8 +691,8 @@ pub(crate) struct PendingBlock {
     per_row: Vec<bool>,
     residual_rows: usize,
     residual_bytes: usize,
-    /// Filter page and row kinds, when a filter size was given.
-    index: Option<(Vec<u8>, u16)>,
+    /// Filter page, row kinds and row count, when a filter size was given.
+    index: Option<(Vec<u8>, u16, usize)>,
 }
 
 impl PendingBlock {
@@ -737,13 +748,28 @@ impl PendingBlock {
             dir.dicts.push((out.len() as u32, db.len() as u32));
             out.extend_from_slice(db);
         }
-        if let Some(pl) = &enc.prose_pool_leaf {
-            out.push(1);
-            put_uvarint(&mut out, pl.len() as u64);
-            dir.pool = Some((out.len() as u32, pl.len() as u32));
-            out.extend_from_slice(pl);
-        } else {
-            out.push(0);
+        match enc.pool_pages.as_slice() {
+            [] => out.push(0),
+            [pl] => {
+                out.push(1);
+                put_uvarint(&mut out, pl.len() as u64);
+                dir.pool = Some((out.len() as u32, pl.len() as u32));
+                out.extend_from_slice(pl);
+            }
+            pages => {
+                out.push(2);
+                put_uvarint(&mut out, pages.len() as u64);
+                for p in pages {
+                    put_uvarint(&mut out, p.len() as u64);
+                }
+                let off = out.len();
+                for p in pages {
+                    let raw = leaf_raw_len(p).expect("a page the writer made");
+                    dir.pages.push((p.len() as u32, raw as u32));
+                    out.extend_from_slice(p);
+                }
+                dir.pool = Some((off as u32, (out.len() - off) as u32));
+            }
         }
         for blob in &enc.col_blobs {
             put_uvarint(&mut out, blob.len() as u64);
@@ -771,10 +797,18 @@ impl PendingBlock {
         }
         dir.set_cols(cols_off, cols);
 
-        let index = index.map(|(filter, kinds)| {
+        let index = index.map(|(filter, kinds, n_rows)| {
             let mut page = Vec::new();
             dir.encode(backend, level, &mut page);
-            (page, filter, kinds)
+            let pages = match enc.pool_filters.len() {
+                0 | 1 => Vec::new(),
+                _ => {
+                    let mut rows = enc.pool_rows.clone();
+                    rows.resize(n_rows, 0);
+                    page_filter_page(&enc.pool_filters, &rows)
+                }
+            };
+            (page, filter, pages, kinds)
         });
         EncodedBlock {
             bytes: out,
@@ -793,6 +827,7 @@ fn encode_block_columns(
     backend: EntropyBackend,
     level: i32,
     filter_bits: Option<usize>,
+    page_bytes: usize,
 ) -> PendingBlock {
     let split = split_records_with_plan(recs, plan);
     let n_cols = plan.columns.len();
@@ -845,6 +880,13 @@ fn encode_block_columns(
         }
     }
 
+    let cell_rows = |want: &[bool]| {
+        crate::query::cell_rows(plan, &split.json_struct_streams, &split.variant_ids, want).ok()
+    };
+    let paging = (page_bytes > 0).then_some(Paging {
+        page_bytes,
+        cell_rows: &cell_rows,
+    });
     let enc = encode_dense_block_columns(
         &occ_views,
         &dict_groups,
@@ -852,6 +894,7 @@ fn encode_block_columns(
         &mut preencoded_nested,
         &standalone,
         Some((plan, &split.variant_ids)),
+        paging,
         packs,
         backend,
         level,
@@ -877,7 +920,7 @@ fn encode_block_columns(
         for r in recs {
             tokens(r, |t, _| fb.add(t));
         }
-        (fb.finish(), row_kinds(plan, &split.variant_ids))
+        (fb.finish(), row_kinds(plan, &split.variant_ids), recs.len())
     });
     PendingBlock {
         out,
@@ -1289,7 +1332,7 @@ pub(crate) enum Structure<'a> {
 pub(crate) struct BlockParts<'a> {
     pub structure: Structure<'a>,
     pub dicts: Vec<Option<&'a [u8]>>,
-    pub pool: Option<&'a [u8]>,
+    pub pool: Option<PoolParts<'a>>,
     pub cols: Vec<Option<&'a [u8]>>,
 }
 
@@ -1312,7 +1355,22 @@ impl<'a> BlockParts<'a> {
         }
         let pool = match cur.u8()? {
             0 => None,
-            1 => Some(cur.bytes()?),
+            1 => Some(PoolParts::Leaf(cur.bytes()?)),
+            2 => {
+                let n = cur.uvar()? as usize;
+                if n < 2 || n > cur.remaining() {
+                    return Err(Error::Format("text pool page count".into()));
+                }
+                let lens = (0..n).map(|_| cur.uvar()).collect::<Result<Vec<_>>>()?;
+                let mut pages = Vec::with_capacity(n);
+                for len in lens {
+                    let leaf = cur.slice(usize::try_from(len).map_err(|_| underflow())?)?;
+                    let raw = u32::try_from(leaf_raw_len(leaf)?)
+                        .map_err(|_| Error::BudgetExceeded("text pool"))?;
+                    pages.push((Some(leaf), raw));
+                }
+                Some(PoolParts::Pages(pages))
+            }
             m => return Err(Error::Format(format!("invalid block prose_pool flag {m}"))),
         };
         let n_cols = plan.columns.len();
@@ -1777,7 +1835,7 @@ pub fn inspect_stream<R: Read>(mut reader: R, budget: &DecodeBudget) -> Result<I
                                 add_stat(
                                     &mut rep,
                                     "$prose_pool",
-                                    pb.pool.map_or(0, |b| b.len() as u64),
+                                    pb.pool.map_or(0, |b| b.held_bytes() as u64),
                                 );
                                 for (cid, blob) in pb.cols.iter().enumerate() {
                                     add_stat(

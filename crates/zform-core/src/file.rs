@@ -10,11 +10,13 @@ use crate::framing::{FramingSpec, split_passthrough};
 use crate::grammar::{ModelPlan, PlanVariant};
 use crate::index::{
     BlockDir, BlockEntry, BlockKind, Filter, INDEX_TAIL_LEN, KIND_JSON, Root, locate_root,
+    page_filters, row_map_span, row_page,
 };
 use crate::query::{
     BlockMeta, FieldEv, Need, Plans, Predicate, UNKNOWN, YES, eval, eval_raw_record, field_events,
     filter_use, json_variant, may_match, needs, plain_may_contain, raw_field_values,
 };
+use crate::codecs::PoolParts;
 use crate::wire::{Cursor, DecodeBudget, Error, Result, decompress_leaf};
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
@@ -559,6 +561,26 @@ fn filter_page(e: &BlockEntry) -> ByteRange {
     }
 }
 
+fn pages_page(e: &BlockEntry) -> ByteRange {
+    ByteRange {
+        region: Region::Index,
+        off: e.pages_off,
+        len: e.pages_len as u64,
+    }
+}
+
+/// The filters of a block's text pool pages, or none if it has none or the source lacks them.
+fn page_filters_of<'s>(
+    src: &'s dyn Source,
+    e: &BlockEntry,
+    dir: &BlockDir,
+) -> Result<Vec<Filter<'s>>> {
+    match src.get(pages_page(e)).filter(|_| e.pages_len > 0) {
+        Some(page) => page_filters(page, dir.pages.len(), e.rows),
+        None => Ok(Vec::new()),
+    }
+}
+
 /// A block's filter, or `None` if the source lacks it.
 fn filter<'s>(src: &'s dyn Source, e: &BlockEntry) -> Result<Option<Filter<'s>>> {
     match src.get(filter_page(e)).map(Filter) {
@@ -578,7 +600,8 @@ struct Wanted {
     streams: Vec<bool>,
     cols: Vec<bool>,
     dicts: Vec<bool>,
-    pool: bool,
+    /// The pool's leaf, or by page.
+    pool: Vec<bool>,
 }
 
 impl Wanted {
@@ -596,12 +619,13 @@ impl Wanted {
             streams: need.streams.clone(),
             cols: need.cols.clone(),
             dicts: vec![false; dir.dicts.len()],
-            pool: false,
+            pool: vec![false; pool_pieces(dir).len()],
         };
         let mut stack: Vec<usize> = (0..w.cols.len()).filter(|&c| w.cols[c]).collect();
+        let mut pooled = false;
         while let Some(c) = stack.pop() {
             let deps = &dir.col(c).deps;
-            w.pool |= deps.pool;
+            pooled |= deps.pool;
             if let Some(d) = deps.dict.filter(|&d| (d as usize) < w.dicts.len()) {
                 w.dicts[d as usize] = true;
             }
@@ -611,6 +635,15 @@ impl Wanted {
                     stack.push(s as usize);
                 }
             }
+        }
+        // Page 0 is the others' dictionary.
+        match need.pages.as_ref().filter(|p| p.len() == w.pool.len()) {
+            _ if !pooled => {}
+            Some(pages) => {
+                w.pool.copy_from_slice(pages);
+                w.pool[0] |= pages.contains(&true);
+            }
+            None => w.pool.fill(true),
         }
         w
     }
@@ -626,7 +659,10 @@ impl Wanted {
             .iter()
             .zip(&self.dicts)
             .map(|(&(off, len), &on)| (on, off, len));
-        let pool = dir.pool.iter().map(|&(off, len)| (self.pool, off, len));
+        let pool = pool_pieces(dir)
+            .into_iter()
+            .zip(&self.pool)
+            .map(|((off, len), &on)| (on, off, len));
         let cols = dir
             .col_spans()
             .zip(&self.cols)
@@ -646,6 +682,25 @@ impl Wanted {
     }
 }
 
+/// The pool's leaves as `(offset, length)` in the block: the one leaf, or each page.
+fn pool_pieces(dir: &BlockDir) -> Vec<(u32, u32)> {
+    let Some((off, len)) = dir.pool else {
+        return Vec::new();
+    };
+    if dir.pages.is_empty() {
+        return vec![(off, len)];
+    }
+    dir.pages
+        .iter()
+        .scan(off, |at, &(comp, _)| Some((std::mem::replace(at, *at + comp), comp)))
+        .collect()
+}
+
+fn page_range(e: &BlockEntry, dir: &BlockDir, page: usize) -> ByteRange {
+    let (off, len) = pool_pieces(dir)[page];
+    data(e.off + off as u64, len as u64)
+}
+
 /// A block's parts: all of them if the source has the whole block, and else those wanted.
 fn load_parts<'s>(
     src: &'s dyn Source,
@@ -663,9 +718,19 @@ fn load_parts<'s>(
             "block directory column count != model".into(),
         ));
     }
-    let mut parts = want.spans(dir).map(|(on, off, len)| match on {
-        true => src.get(data(e.off + off as u64, len as u64)),
-        false => None,
+    // The parts either side of the pool come from one range each when the source holds them.
+    let held = dir.pool.and_then(|_| {
+        let [head, tail] = around_pool(e, dir);
+        Some((src.get(head)?, (tail.off - e.off) as usize, src.get(tail)?))
+    });
+    let mut parts = want.spans(dir).map(|(on, off, len)| {
+        let (o, l) = (off as usize, len as usize);
+        match (on, held) {
+            (false, _) => None,
+            (true, Some((head, _, _))) if o + l <= head.len() => Some(&head[o..o + l]),
+            (true, Some((_, at, tail))) if o >= at => tail.get(o - at..o - at + l),
+            (true, _) => src.get(data(e.off + off as u64, len as u64)),
+        }
     });
     let head = parts.next().unwrap();
     if want.head && head.is_none() {
@@ -678,11 +743,67 @@ fn load_parts<'s>(
                 streams: parts.by_ref().take(dir.streams.len()).collect(),
             },
             dicts: parts.by_ref().take(dir.dicts.len()).collect(),
-            pool: dir.pool.and_then(|_| parts.next().unwrap()),
+            pool: match dir.pool {
+                None => None,
+                Some(_) if dir.pages.is_empty() => parts.next().unwrap().map(PoolParts::Leaf),
+                Some(_) => Some(PoolParts::Pages(
+                    dir.pages.iter().map(|p| (parts.next().unwrap(), p.1)).collect(),
+                )),
+            },
             cols: parts.collect(),
         },
         false,
     )))
+}
+
+/// A pooled block's bytes before its pool and after it.
+fn around_pool(e: &BlockEntry, dir: &BlockDir) -> [ByteRange; 2] {
+    let (off, len) = dir.pool.unwrap_or_default();
+    let end = (off as u64 + len as u64).min(e.len);
+    [data(e.off, off as u64), data(e.off + end, e.len - end)]
+}
+
+/// Every part of a paged block but the pool pages not in `pages`.
+fn record_parts(dir: &BlockDir, pages: &[usize]) -> Wanted {
+    let mut pool = vec![false; dir.pages.len()];
+    pages.iter().for_each(|&p| pool[p] = true);
+    Wanted {
+        head: true,
+        streams: vec![true; dir.streams.len()],
+        cols: vec![true; dir.n_cols()],
+        dicts: vec![true; dir.dicts.len()],
+        pool,
+    }
+}
+
+fn row_map_range(e: &BlockEntry, dir: &BlockDir) -> ByteRange {
+    let (off, len) = row_map_span(dir.pages.len(), e.rows);
+    ByteRange {
+        region: Region::Index,
+        off: e.pages_off + off,
+        len: len.min(e.pages_len as u64),
+    }
+}
+
+/// The pool pages rows `sel` of a paged block read, with page 0, which the others expand
+/// against; `None` while the source lacks the block's row page map.
+fn row_pages(
+    src: &dyn Source,
+    e: &BlockEntry,
+    dir: &BlockDir,
+    sel: impl Iterator<Item = (u32, u32)>,
+) -> Result<Option<Vec<usize>>> {
+    let Some(map) = src.get(row_map_range(e, dir)) else {
+        return Ok(None);
+    };
+    let mut on = vec![false; dir.pages.len()];
+    for r in sel.flat_map(|(s, t)| s as usize..t as usize) {
+        if let Some(p) = row_page(map, on.len(), r)? {
+            on[p] = true;
+        }
+    }
+    on[0] |= on.contains(&true);
+    Ok(Some((0..on.len()).filter(|&p| on[p]).collect()))
 }
 
 /// The records of a verbatim block.
@@ -707,11 +828,11 @@ fn verbatim_records(
     Ok((raw, spans))
 }
 
-/// False when a verbatim block's filter proves no record satisfies `pred`.
-fn verbatim_may_match(pred: &Predicate, filter: Filter<'_>) -> bool {
+/// False when a block's filter proves no record satisfies `pred`.
+fn filter_may_match(pred: &Predicate, filter: Filter<'_>) -> bool {
     match pred {
-        Predicate::And(list) => list.iter().all(|p| verbatim_may_match(p, filter)),
-        Predicate::Or(list) => list.iter().any(|p| verbatim_may_match(p, filter)),
+        Predicate::And(list) => list.iter().all(|p| filter_may_match(p, filter)),
+        Predicate::Or(list) => list.iter().any(|p| filter_may_match(p, filter)),
         Predicate::Contains(needle) => plain_may_contain(needle, false, filter),
         Predicate::Word(needle) => plain_may_contain(needle, true, filter),
         _ => true,
@@ -804,8 +925,15 @@ impl<'f> Session<'f> {
         let mut dirs = Vec::with_capacity(blocks.len());
         for &b in &blocks {
             let e = &file.root.blocks[b];
+            // A block its filter rules out needs no directory.
+            let ruled_out =
+                || Ok::<_, Error>(filter(src, e)?.is_some_and(|f| !filter_may_match(pred, f)));
+            if uses_filter && self.dirs[b].is_none() && ruled_out()? {
+                dirs.push(None);
+                continue;
+            }
             match self.dir(src, b)? {
-                Some(dir) => dirs.push(dir),
+                Some(dir) => dirs.push(Some(dir)),
                 None => missing.push(dir_page(e)),
             }
             if uses_filter && only_filter && src.get(filter_page(e)).is_none() {
@@ -822,25 +950,37 @@ impl<'f> Session<'f> {
             let e = &file.root.blocks[b];
             let held = if uses_filter { filter(src, e)? } else { None };
             let filter = held.unwrap_or(Filter::NONE);
-            let ranges = match e.kind {
-                BlockKind::Verbatim { .. } => {
-                    verbatim_may_match(pred, filter).then(|| vec![whole(e)])
+            let ranges = match (&e.kind, dir) {
+                (_, None) => None,
+                (BlockKind::Verbatim { .. }, _) => {
+                    filter_may_match(pred, filter).then(|| vec![whole(e)])
                 }
-                BlockKind::Structured { model, kinds } => {
+                (&BlockKind::Structured { model, kinds }, Some(dir)) => {
+                    let pages = page_filters_of(src, e, dir)?;
                     let m = BlockMeta {
                         model,
                         plan: &file.plans[model as usize],
                         kinds,
                         dir,
                         filter,
+                        pages: &pages,
                     };
                     may_match(pred, &m, &mut self.plans).then(|| {
-                        let mut need = Need::new(dir);
+                        let mut need = Need::paged(&m);
+                        // Without the page filters, every page; still `Some` if they would help.
+                        let ask = uses_filter && e.pages_len > 0 && pages.is_empty();
+                        if ask {
+                            need.pages = Some(vec![true; dir.pages.len()]);
+                        }
                         needs(pred, &m, &mut self.plans, &mut need);
+                        let want = Wanted::of(dir, &need, m.plan, kinds);
                         if need.whole {
                             vec![whole(e)]
+                        } else if ask && need.pages.is_some() && want.pool.contains(&true) {
+                            // The page filters first, to read only the pages they allow.
+                            vec![pages_page(e)]
                         } else {
-                            Wanted::of(dir, &need, m.plan, kinds).ranges(e, dir)
+                            want.ranges(e, dir)
                         }
                     })
                 }
@@ -861,7 +1001,7 @@ impl<'f> Session<'f> {
                 continue;
             }
             missing.extend(ranges);
-            todo.push((b, dir.clone()));
+            todo.push((b, dir.clone().unwrap_or_default()));
         }
         let _dict = match todo.is_empty() {
             true => None,
@@ -932,14 +1072,16 @@ impl<'f> Session<'f> {
             }
         };
         let plan = &self.file.plans[model as usize];
+        let pages = page_filters_of(src, e, dir)?;
         let m = BlockMeta {
             model,
             plan,
             kinds,
             dir,
             filter: Filter::NONE,
+            pages: &pages,
         };
-        let mut need = Need::new(dir);
+        let mut need = Need::paged(&m);
         needs(pred, &m, &mut self.plans, &mut need);
         let Some((parts, is_whole)) = load_parts(
             src,
@@ -977,7 +1119,8 @@ impl<'f> Session<'f> {
         Ok(Some(hits))
     }
 
-    /// Calls `f(row, record)` for each row of `rows`, byte-exact and in row order.
+    /// Calls `f(row, record)` for each row of `rows`, byte-exact and in row order. A block with
+    /// a paged text pool is read without the pages its rows do not use.
     pub fn records(
         &mut self,
         src: &dyn Source,
@@ -987,11 +1130,36 @@ impl<'f> Session<'f> {
         let file = self.file;
         let budget = &file.budget;
         let blocks = file.blocks_in(Some(rows));
-        let mut missing: Vec<_> = blocks
-            .iter()
-            .map(|&b| whole(&file.root.blocks[b]))
-            .filter(|r| src.get(*r).is_none())
-            .collect();
+        let mut missing = Vec::new();
+        // By block read by parts: its directory and the pool pages its rows read.
+        let mut paged = Vec::with_capacity(blocks.len());
+        for &b in &blocks {
+            let (e, first) = (&file.root.blocks[b], file.starts[b]);
+            let by_parts =
+                matches!(e.kind, BlockKind::Structured { .. }) && src.get(whole(e)).is_none();
+            let dir = match by_parts {
+                true => self.dir(src, b)?,
+                false => None,
+            };
+            let Some(dir) = dir.filter(|d| !d.pages.is_empty() && e.pages_len > 0) else {
+                if by_parts && self.dirs[b].is_none() {
+                    missing.push(dir_page(e));
+                } else if src.get(whole(e)).is_none() {
+                    missing.push(whole(e));
+                }
+                paged.push(None);
+                continue;
+            };
+            let sel = rows.within(first, first + e.rows);
+            let pages = row_pages(src, e, &dir, sel)?;
+            let need = match &pages {
+                Some(pages) => pages.iter().map(|&p| page_range(e, &dir, p)).collect(),
+                None => vec![row_map_range(e, &dir)],
+            };
+            let held = |r: &ByteRange| src.get(*r).is_some();
+            missing.extend(around_pool(e, &dir).into_iter().chain(need).filter(|r| !held(r)));
+            paged.push(pages.map(|p| (dir, p)));
+        }
         let _dict = match blocks.is_empty() {
             true => None,
             false => self.dict(src, &mut missing)?,
@@ -1000,31 +1168,42 @@ impl<'f> Session<'f> {
             return Ok(Step::Missing(missing));
         }
         let mut rec = Vec::new();
-        for b in blocks {
-            let e = &file.root.blocks[b];
-            let first = file.starts[b];
-            let bytes = src.get(whole(e)).unwrap();
+        for (&b, paged) in blocks.iter().zip(paged) {
+            let (e, first) = (&file.root.blocks[b], file.starts[b]);
             let sel = rows.within(first, first + e.rows).flat_map(|(s, t)| s..t);
-            self.stats.blocks_whole += 1;
-            match e.kind {
+            let model = match e.kind {
+                BlockKind::Structured { model, .. } => model,
                 BlockKind::Verbatim { .. } => {
-                    let (raw, spans) = verbatim_records(bytes, e, budget)?;
+                    let (raw, spans) = verbatim_records(src.get(whole(e)).unwrap(), e, budget)?;
                     for r in sel {
                         let (s, t) = spans[r as usize];
                         f(first + r as u64, &raw[s as usize..t as usize])?;
                     }
+                    self.stats.blocks_whole += 1;
+                    continue;
                 }
-                BlockKind::Structured { model, .. } => {
-                    let plan = &file.plans[model as usize];
-                    let mut block = BlockRows::open(bytes, e.rows as usize, plan, budget)?;
-                    for r in sel {
-                        block.seek(r as usize, budget)?;
-                        rec.clear();
-                        block.emit(&mut rec, budget)?;
-                        f(first + r as u64, &rec)?;
-                    }
+            };
+            let plan = &file.plans[model as usize];
+            let mut block = match &paged {
+                Some((dir, pages)) => {
+                    let want = record_parts(dir, pages);
+                    let parts = load_parts(src, e, dir, plan, &want, budget)?;
+                    let parts = parts.ok_or(Error::NotLoaded)?.0;
+                    BlockRows::of_parts(parts, e.rows as usize, plan, budget)?
                 }
+                None => BlockRows::open(src.get(whole(e)).unwrap(), e.rows as usize, plan, budget)?,
+            };
+            for r in sel {
+                block.seek(r as usize, budget)?;
+                rec.clear();
+                block.emit(&mut rec, budget).map_err(|err| match err {
+                    Error::NotLoaded => Error::Format("row page map misses a page".into()),
+                    err => err,
+                })?;
+                f(first + r as u64, &rec)?;
             }
+            self.stats.blocks_partial += usize::from(paged.is_some());
+            self.stats.blocks_whole += usize::from(paged.is_none());
         }
         Ok(Step::Ready(()))
     }
@@ -1062,7 +1241,17 @@ impl<'f> Session<'f> {
             }
             let ranges = match e.kind {
                 BlockKind::Structured { model, kinds } if kinds & !KIND_JSON == 0 => {
-                    self.value_parts(paths, model, kinds, dir).ranges(e, dir)
+                    let mut want = self.value_parts(paths, model, kinds, dir);
+                    // The pages wait for the row page map, which says which the rows read.
+                    let paged = !dir.pages.is_empty() && e.pages_len > 0;
+                    if paged && want.pool.contains(&true) {
+                        want.pool.fill(false);
+                        let mut r = want.ranges(e, dir);
+                        r.push(row_map_range(e, dir));
+                        r
+                    } else {
+                        want.ranges(e, dir)
+                    }
                 }
                 _ => vec![whole(e)],
             };
@@ -1079,11 +1268,13 @@ impl<'f> Session<'f> {
             let e = &file.root.blocks[b];
             let first = file.starts[b];
             let sel = mask(rows.within(first, first + e.rows), e.rows as usize);
-            match self.block_values(src, paths, e, dir, &sel) {
+            let n = missing.len();
+            match self.block_values(src, paths, e, dir, &sel, &mut missing) {
                 Ok(Some(v)) => {
                     self.values.insert(b, v);
                 }
-                Ok(None) | Err(Error::NotLoaded) => missing.push(whole(e)),
+                Ok(None) | Err(Error::NotLoaded) if missing.len() == n => missing.push(whole(e)),
+                Ok(None) | Err(Error::NotLoaded) => {}
                 Err(err) => return Err(err),
             }
         }
@@ -1101,6 +1292,7 @@ impl<'f> Session<'f> {
             kinds,
             dir,
             filter: Filter::NONE,
+            pages: &[],
         };
         let mut need = Need::new(dir);
         for p in paths {
@@ -1110,7 +1302,8 @@ impl<'f> Session<'f> {
     }
 
     /// The values of `paths` on the rows `sel` of one block, or `None` when some row has to be
-    /// rebuilt and the source has only parts of the block.
+    /// rebuilt and the source has only parts of the block, or when they read pool pages the
+    /// source lacks, which go to `need`.
     fn block_values(
         &mut self,
         src: &dyn Source,
@@ -1118,6 +1311,7 @@ impl<'f> Session<'f> {
         e: &BlockEntry,
         dir: &BlockDir,
         sel: &[bool],
+        need: &mut Vec<ByteRange>,
     ) -> Result<Option<BlockVals>> {
         let budget = &self.file.budget;
         let mut out = BlockVals {
@@ -1148,7 +1342,21 @@ impl<'f> Session<'f> {
             }
         };
         let plan = &self.file.plans[model as usize];
-        let want = self.value_parts(paths, model, kinds, dir);
+        let mut want = self.value_parts(paths, model, kinds, dir);
+        if !dir.pages.is_empty() && e.pages_len > 0 && want.pool.contains(&true) {
+            let sel = (0..sel.len() as u32).filter(|&r| sel[r as usize]).map(|r| (r, r + 1));
+            let Some(pages) = row_pages(src, e, dir, sel)? else {
+                return Ok(None);
+            };
+            want.pool.fill(false);
+            pages.iter().for_each(|&p| want.pool[p] = true);
+            let ranges = pages.into_iter().map(|p| page_range(e, dir, p));
+            let n = need.len();
+            need.extend(ranges.filter(|r| src.get(*r).is_none()));
+            if need.len() > n {
+                return Ok(None);
+            }
+        }
         let Some((parts, is_whole)) = load_parts(src, e, dir, plan, &want, budget)? else {
             return Ok(None);
         };
@@ -1159,6 +1367,7 @@ impl<'f> Session<'f> {
             kinds,
             dir,
             filter: Filter::NONE,
+            pages: &[],
         };
         // Rows the columns cannot answer: those outside the JSON tree, and opaque values.
         let jvi = json_variant(plan);

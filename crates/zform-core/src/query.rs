@@ -3,7 +3,7 @@
 //! The raw record defines what a predicate means. A block answers from its columns for the rows
 //! whose model makes that exact, and reports the rest as unknown for the caller to rebuild.
 
-use crate::cells::{Col, NULL_CELL, underflow};
+use crate::cells::{Col, NOT_HELD, NULL_CELL, underflow};
 use crate::codecs::{ColSummary, ESCAPES, letters_of};
 use crate::container::BlockRows;
 use crate::grammar::{ModelPlan, PlanVariant, parse_logfmt_line};
@@ -367,6 +367,9 @@ impl FieldPlan {
 
     /// Adds what `field_events` reads of a block to `need`.
     pub fn needs(&self, kinds: u16, dir: &BlockDir, need: &mut Need) {
+        if self.cols.iter().any(|&c| dir.col(c as usize).deps.pool) {
+            need.pages = None;
+        }
         if let Some(c) = self.row_col(kinds, dir) {
             need.cols[c as usize] = true;
             return;
@@ -753,6 +756,8 @@ impl NeedlePlan {
 pub(crate) struct Plans {
     fields: HashMap<(u32, String), Arc<FieldPlan>>,
     needles: HashMap<(u32, Vec<u8>, bool), Arc<NeedlePlan>>,
+    /// By model and the columns a walk wants, the structure streams it reads.
+    streams: HashMap<(u32, Vec<bool>), Vec<bool>>,
     /// Plans kept for every session of a file, so each is built once.
     shared: Option<Arc<Mutex<Plans>>>,
 }
@@ -803,6 +808,8 @@ pub(crate) struct BlockMeta<'a> {
     pub kinds: u16,
     pub dir: &'a BlockDir,
     pub filter: Filter<'a>,
+    /// The filters of the text pool's pages, when at hand.
+    pub pages: &'a [Filter<'a>],
 }
 
 /// False when the index proves no row of the block satisfies `pred`.
@@ -855,6 +862,8 @@ pub(crate) struct Need {
     pub cols: Vec<bool>,
     /// By structure stream.
     pub streams: Vec<bool>,
+    /// The text pool pages a search may find its needles in, or `None` for every page.
+    pub pages: Option<Vec<bool>>,
 }
 
 impl Need {
@@ -863,6 +872,16 @@ impl Need {
             whole: false,
             cols: vec![false; dir.n_cols()],
             streams: vec![false; dir.streams.len()],
+            pages: None,
+        }
+    }
+
+    /// As `new`, with no text pool page needed yet when the page filters are at hand.
+    pub fn paged(m: &BlockMeta<'_>) -> Self {
+        let n = m.dir.pages.len();
+        Need {
+            pages: (n > 0 && m.pages.len() == n).then(|| vec![false; n]),
+            ..Need::new(m.dir)
         }
     }
 }
@@ -904,21 +923,36 @@ pub(crate) fn needs(pred: &Predicate, m: &BlockMeta<'_>, plans: &mut Plans, need
             }
             // A column with a cell for every row needs no structure to place its cells.
             let mut want = vec![false; need.cols.len()];
+            let mut pooled = false;
             for c in np.candidates(m) {
                 (need.cols[c], want[c]) = (true, !m.dir.col(c).summary.per_row);
+                pooled |= m.dir.col(c).deps.pool;
+            }
+            // The pages whose filters hold every token of the needle.
+            if pooled && let Some(pages) = &mut need.pages {
+                let word = matches!(pred, Predicate::Word(_));
+                match needle_tokens(needle, word) {
+                    Some(ts) => pages
+                        .iter_mut()
+                        .zip(m.pages)
+                        .for_each(|(p, f)| *p |= ts.iter().all(|&t| f.has(t))),
+                    None => pages.fill(true),
+                }
             }
             if let Some(jt) = &m.plan.json_tree {
-                let streams = WalkRoute::of(
-                    jt,
-                    &JsonWalk {
-                        want_cols: &want,
-                        ..JsonWalk::default()
-                    },
-                )
-                .streams(jt);
+                let streams = plans
+                    .streams
+                    .entry((m.model, want))
+                    .or_insert_with_key(|(_, want)| {
+                        let walk = JsonWalk {
+                            want_cols: want,
+                            ..JsonWalk::default()
+                        };
+                        WalkRoute::of(jt, &walk).streams(jt)
+                    });
                 need.streams
                     .iter_mut()
-                    .zip(streams)
+                    .zip(streams.iter())
                     .for_each(|(n, s)| *n |= s);
             }
         }
@@ -1246,33 +1280,7 @@ fn eval_contains(
         return Ok(tri);
     }
 
-    // The row of each occurrence of each column left.
-    let mut occ_rows = match (&plan.json_tree, json_variant(plan)) {
-        (Some(jt), Some(jvi)) => {
-            let walk = JsonWalk {
-                want_cols: &want,
-                ..JsonWalk::default()
-            };
-            let route = WalkRoute::of(jt, &walk);
-            map_json_block_structure(
-                jt,
-                rows.json_streams(),
-                &rows.variant_ids,
-                jvi,
-                &walk,
-                &route,
-            )?
-            .col_occ_rows
-        }
-        _ => vec![Vec::new(); plan.columns.len()],
-    };
-    for (r, &v) in rows.variant_ids.iter().enumerate() {
-        if let PlanVariant::Shape(s) = &plan.variants[v as usize] {
-            for &c in s.slots.iter().filter(|&&c| want[c as usize]) {
-                occ_rows[c as usize].push(r as u32);
-            }
-        }
-    }
+    let occ_rows = cell_rows(plan, rows.json_streams(), &rows.variant_ids, &want)?;
     for (cid, occs) in hits {
         let at = &occ_rows[cid];
         if rows.col(cid, budget)?.len() != at.len() {
@@ -1284,6 +1292,36 @@ fn eval_contains(
             .for_each(|&occ| tri[at[occ as usize] as usize] = YES);
     }
     Ok(tri)
+}
+
+/// By column of `want`, the row of each of its cells, as JSON and shape rows place them. Cells
+/// of other variants are left out, so a caller compares the counts with the column's.
+pub(crate) fn cell_rows(
+    plan: &ModelPlan,
+    json_streams: &[Vec<u32>],
+    variant_ids: &[u32],
+    want: &[bool],
+) -> Result<Vec<Vec<u32>>> {
+    let mut occ_rows = match (&plan.json_tree, json_variant(plan)) {
+        (Some(jt), Some(jvi)) => {
+            let walk = JsonWalk {
+                want_cols: want,
+                ..JsonWalk::default()
+            };
+            let route = WalkRoute::of(jt, &walk);
+            map_json_block_structure(jt, json_streams, variant_ids, jvi, &walk, &route)?
+                .col_occ_rows
+        }
+        _ => vec![Vec::new(); plan.columns.len()],
+    };
+    for (r, &v) in variant_ids.iter().enumerate() {
+        if let Some(PlanVariant::Shape(s)) = plan.variants.get(v as usize) {
+            for &c in s.slots.iter().filter(|&&c| want[c as usize]) {
+                occ_rows[c as usize].push(r as u32);
+            }
+        }
+    }
+    Ok(occ_rows)
 }
 
 /// Calls `hit` with each cell of `col` whose bytes, as a record shows them, contain the needle.
@@ -1343,7 +1381,32 @@ fn scan_col(
         Col::Flat(cells) if !nested => scan_buf(cells.bytes(), cells.ends(), hit),
         Col::Pool { pool, base, ends } => {
             let len = ends.last().map_or(0, |&e| e as usize);
-            scan_buf(&pool[*base..*base + len], ends, hit)
+            scan_buf(&pool.bytes()[*base..*base + len], ends, hit)
+        }
+        Col::Paged { pool, spans } => {
+            // A page holds its cells of the column back to back, in order: scan each run. The
+            // pages not held are those the page filters ruled out.
+            let bytes = pool.bytes();
+            let held = |i: &u32| spans[*i as usize] != NOT_HELD;
+            let mut order: Vec<u32> = (0..spans.len() as u32).filter(held).collect();
+            order.sort_by_key(|&i| spans[i as usize].0);
+            let mut ends = Vec::new();
+            let mut a = 0;
+            while a < order.len() {
+                let from = spans[order[a] as usize].0;
+                ends.clear();
+                let mut b = a;
+                while let Some(&(s, e)) = order.get(b).map(|&i| &spans[i as usize])
+                    && s == from + ends.last().copied().unwrap_or(0)
+                {
+                    ends.push(e - from);
+                    b += 1;
+                }
+                let run = &order[a..b];
+                let to = from as usize + *ends.last().unwrap() as usize;
+                scan_buf(&bytes[from as usize..to], &ends, &mut |k| hit(run[k] as usize));
+                a = b;
+            }
         }
         Col::Quoted { inner, map } if !np.quote_sensitive => {
             if map.is_empty() {

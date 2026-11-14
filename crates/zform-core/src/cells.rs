@@ -122,8 +122,65 @@ pub(crate) fn ends_of(lens: &[u32], total: usize) -> Result<Vec<u32>> {
     Ok(ends)
 }
 
+/// The span of a paged cell in a page not held, which reads as `NotLoaded`.
+pub(crate) const NOT_HELD: (u32, u32) = (u32::MAX, 0);
+
 /// Marks a `Quoted` cell that is the bare token `null`.
 pub(crate) const NULL_CELL: u32 = u32::MAX;
+
+/// A block's text pool, which a reader may hold only some pages of. A cell in a page it lacks is
+/// `NotLoaded`.
+#[derive(Debug, Default)]
+pub struct Pool {
+    bytes: Vec<u8>,
+    /// Byte ranges not held, ascending and disjoint.
+    missing: Vec<(u32, u32)>,
+}
+
+impl Pool {
+    pub fn whole(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn partial(bytes: Vec<u8>, missing: Vec<(u32, u32)>) -> Self {
+        Self { bytes, missing }
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    pub fn is_whole(&self) -> bool {
+        self.missing.is_empty()
+    }
+
+    /// All the bytes, when the pool is whole.
+    pub fn all(&self) -> Result<&[u8]> {
+        match self.missing.is_empty() {
+            true => Ok(&self.bytes),
+            false => Err(Error::NotLoaded),
+        }
+    }
+
+    /// The bytes, those not held zeroed.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Whether bytes `s..e` are held.
+    pub(crate) fn held(&self, s: usize, e: usize) -> bool {
+        let i = self.missing.partition_point(|m| (m.1 as usize) <= s);
+        !self.missing.get(i).is_some_and(|m| (m.0 as usize) < e)
+    }
+
+}
 
 #[derive(Debug, Clone)]
 pub enum Col {
@@ -137,11 +194,17 @@ pub enum Col {
         dict: Arc<Cells>,
         ords: Vec<u32>,
     },
-    /// Cells laid back to back in the block's text pool from `base`.
+    /// Cells laid back to back in the block's text pool, which is whole, from `base`.
     Pool {
-        pool: Arc<Vec<u8>>,
+        pool: Arc<Pool>,
         base: usize,
         ends: Vec<u32>,
+    },
+    /// Cells at `(start, end)` in the block's paged text pool, `NOT_HELD` for one in a page
+    /// not held.
+    Paged {
+        pool: Arc<Pool>,
+        spans: Vec<(u32, u32)>,
     },
     /// `"inner"` per cell. With a non-empty `map`, cell `i` is `inner[map[i]]`, or `null`.
     Quoted {
@@ -161,6 +224,7 @@ impl Col {
             Col::Const { n, .. } => *n,
             Col::Dict { ords, .. } => ords.len(),
             Col::Pool { ends, .. } => ends.len(),
+            Col::Paged { spans, .. } => spans.len(),
             Col::Quoted { inner, map } => {
                 if map.is_empty() {
                     inner.len()
@@ -194,8 +258,12 @@ impl Col {
             Col::Pool { pool, base, ends } => match ends.get(i) {
                 Some(&e) => {
                     let s = if i == 0 { 0 } else { ends[i - 1] as usize };
-                    Ok(&pool[base + s..base + e as usize])
+                    Ok(&pool.bytes()[base + s..base + e as usize])
                 }
+                None => Err(underflow()),
+            },
+            Col::Paged { pool, spans } => match spans.get(i) {
+                Some(&(s, e)) => pool.bytes.get(s as usize..e as usize).ok_or(Error::NotLoaded),
                 None => Err(underflow()),
             },
             Col::Quoted { .. } => return None,
@@ -206,7 +274,7 @@ impl Col {
     pub(crate) fn laid(&self) -> Option<(&[u8], &[u32])> {
         match self {
             Col::Flat(c) => Some((c.bytes(), c.ends())),
-            Col::Pool { pool, base, ends } => Some((&pool[*base..], ends)),
+            Col::Pool { pool, base, ends } => Some((&pool.bytes()[*base..], ends)),
             _ => None,
         }
     }

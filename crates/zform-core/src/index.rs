@@ -133,6 +133,93 @@ impl FilterBuilder {
         }
         self.bits.iter().flat_map(|w| w.to_le_bytes()).collect()
     }
+
+    /// A pool page's filter: halved while at most `PAGE_FILL` of the half's bits would be set.
+    pub fn finish_page(mut self) -> Vec<u8> {
+        while self.bits.len() > 1 {
+            let half = self.bits.len() / 2;
+            let (lo, hi) = self.bits.split_at(half);
+            let set: u32 = lo.iter().zip(hi).map(|(a, b)| (a | b).count_ones()).sum();
+            if set as usize * 1000 > PAGE_FILL * half * 64 {
+                break;
+            }
+            for i in 0..half {
+                self.bits[i] |= self.bits[half + i];
+            }
+            self.bits.truncate(half);
+        }
+        self.bits.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+}
+
+/// Most pages a text pool is cut into, so a row page map value fits a byte.
+pub const MAX_PAGES: usize = 255;
+
+/// Most bits a page filter has set, per mille.
+const PAGE_FILL: usize = 700;
+
+/// A paged pool's index page: each page filter's size as `log2` of its bytes, the row page map,
+/// then the filters back to back. The map gives row `r` the value `page + 1`, or `0` for a row
+/// with no text in the pool, in `row_map_width` bits from bit `r * width`, least significant
+/// first.
+pub fn page_filter_page(filters: &[Vec<u8>], row_pages: &[u32]) -> Vec<u8> {
+    let mut out: Vec<u8> = filters.iter().map(|f| f.len().trailing_zeros() as u8).collect();
+    let w = row_map_width(filters.len());
+    let mut map = vec![0u8; row_pages.len() * w / 8 + 1];
+    for (r, &v) in row_pages.iter().enumerate() {
+        for k in (0..w).filter(|k| v >> k & 1 != 0) {
+            map[(r * w + k) / 8] |= 1 << ((r * w + k) % 8);
+        }
+    }
+    map.truncate((row_pages.len() * w).div_ceil(8));
+    out.extend_from_slice(&map);
+    filters.iter().for_each(|f| out.extend_from_slice(f));
+    out
+}
+
+/// Bits per row in the row page map of a pool of `n_pages` pages.
+pub fn row_map_width(n_pages: usize) -> usize {
+    (usize::BITS - n_pages.leading_zeros()) as usize
+}
+
+/// Where a block's row page map lies in its page filter page, as `(offset, length)`.
+pub fn row_map_span(n_pages: usize, rows: u64) -> (u64, u64) {
+    (n_pages as u64, rows.saturating_mul(row_map_width(n_pages) as u64).div_ceil(8))
+}
+
+/// The pool page row `r` of a row page map reads, if any.
+pub fn row_page(map: &[u8], n_pages: usize, r: usize) -> Result<Option<usize>> {
+    let w = row_map_width(n_pages);
+    let mut v = 0usize;
+    for k in 0..w {
+        let bit = r * w + k;
+        let byte = map.get(bit / 8).ok_or_else(|| Error::Format("row page map".into()))?;
+        v |= ((byte >> (bit % 8)) as usize & 1) << k;
+    }
+    match v {
+        0 => Ok(None),
+        v if v <= n_pages => Ok(Some(v - 1)),
+        _ => Err(Error::Format("row page map value".into())),
+    }
+}
+
+/// The `n` filters of a page filter page for a block of `rows` rows.
+pub fn page_filters(page: &[u8], n: usize, rows: u64) -> Result<Vec<Filter<'_>>> {
+    let bad = || Error::Format("page filter page".into());
+    let (sizes, rest) = page.split_at_checked(n).ok_or_else(bad)?;
+    let map_len = usize::try_from(row_map_span(n, rows).1).map_err(|_| bad())?;
+    let (_, mut rest) = rest.split_at_checked(map_len).ok_or_else(bad)?;
+    let mut out = Vec::with_capacity(n);
+    for &log in sizes {
+        let len = 1usize.checked_shl(log as u32).filter(|&l| l >= 8).ok_or_else(bad)?;
+        let (f, more) = rest.split_at_checked(len).ok_or_else(bad)?;
+        out.push(Filter(f));
+        rest = more;
+    }
+    if !rest.is_empty() {
+        return Err(bad());
+    }
+    Ok(out)
 }
 
 /// A block's filter as stored: a power-of-two number of 8-byte words. One with no bytes is a
@@ -182,6 +269,9 @@ pub struct BlockDir {
     pub streams: Vec<u32>,
     pub dicts: Vec<(u32, u32)>,
     pub pool: Option<(u32, u32)>,
+    /// A paged pool's pages as `(compressed, raw)` lengths, lying back to back over `pool`.
+    /// Empty for a pool of one leaf.
+    pub pages: Vec<(u32, u32)>,
     /// Where the first column starts. The columns lie back to back.
     cols_off: u32,
     /// The columns some row has a value in, by number. A wide model leaves most of a block's
@@ -283,6 +373,11 @@ impl BlockDir {
         put_uvarint(&mut raw, pool_len as u64);
         if pool_len > 0 {
             put_uvarint(&mut raw, pool_off as u64);
+            put_uvarint(&mut raw, self.pages.len() as u64);
+            for &(comp, len) in &self.pages {
+                put_uvarint(&mut raw, comp as u64);
+                put_uvarint(&mut raw, len as u64);
+            }
         }
         put_uvarint(&mut raw, self.slot.len() as u64);
         put_uvarint(&mut raw, self.cols_off as u64);
@@ -363,6 +458,21 @@ impl BlockDir {
         } else {
             None
         };
+        let n_pages = if pool.is_some() { cur.uvar()? as usize } else { 0 };
+        if n_pages == 1 || n_pages > cur.remaining().min(MAX_PAGES) {
+            return Err(Error::Format("block directory page count".into()));
+        }
+        let mut pages = Vec::with_capacity(n_pages);
+        let (mut comp, mut raw_len) = (0u64, 0u64);
+        for _ in 0..n_pages {
+            pages.push((u32v(&mut cur)?, u32v(&mut cur)?));
+            comp += pages.last().unwrap().0 as u64;
+            raw_len += pages.last().unwrap().1 as u64;
+        }
+        let over = raw_len > budget.max_single_alloc_bytes as u64;
+        if n_pages > 0 && (comp != pool_len as u64 || over) {
+            return Err(Error::Format("block directory pages do not cover the pool".into()));
+        }
         // A model numbers its columns in 16 bits.
         let n_cols = cur.uvar()? as usize;
         if n_cols >= 1 << 16 {
@@ -422,6 +532,7 @@ impl BlockDir {
             streams,
             dicts,
             pool,
+            pages,
             cols_off,
             listed,
             slot,
@@ -451,6 +562,9 @@ pub struct BlockEntry {
     /// The filter page and the directory page (empty for a verbatim block) in the index region.
     pub filter_off: u64,
     pub filter_len: u32,
+    /// The page filter page, empty unless the block's text pool is paged.
+    pub pages_off: u64,
+    pub pages_len: u32,
     pub dir_off: u64,
     pub dir_len: u32,
 }
@@ -473,12 +587,14 @@ pub struct DictEntry {
     pub id: u64,
 }
 
-/// Collects blocks as they are written and lays out the index region: the filter pages, the
-/// directory pages, the root. The directories and the root, which every query reads, are its end.
+/// Collects blocks as they are written and lays out the index region: the page filter pages,
+/// the filter pages, the directory pages, the root. The directories and the root, which every
+/// query reads, are its end.
 #[derive(Default)]
 pub struct IndexBuilder {
     root: Root,
     filters: Vec<u8>,
+    page_filters: Vec<u8>,
     dirs: Vec<u8>,
 }
 
@@ -500,9 +616,11 @@ impl IndexBuilder {
         rows: u64,
         dir: &[u8],
         filter: &[u8],
+        pages: &[u8],
     ) {
         // The page offsets are the reader's to work out from the lengths.
         self.filters.extend_from_slice(filter);
+        self.page_filters.extend_from_slice(pages);
         self.dirs.extend_from_slice(dir);
         self.root.blocks.push(BlockEntry {
             kind,
@@ -511,6 +629,8 @@ impl IndexBuilder {
             rows,
             filter_off: 0,
             filter_len: filter.len() as u32,
+            pages_off: 0,
+            pages_len: pages.len() as u32,
             dir_off: 0,
             dir_len: dir.len() as u32,
         });
@@ -538,7 +658,7 @@ impl IndexBuilder {
         for b in &self.root.blocks {
             match &b.kind {
                 BlockKind::Structured { model, kinds } => {
-                    raw.push(0);
+                    raw.push(if b.pages_len > 0 { 2 } else { 0 });
                     put_uvarint(&mut raw, *model as u64);
                     put_uvarint(&mut raw, *kinds as u64);
                 }
@@ -552,6 +672,9 @@ impl IndexBuilder {
             put_uvarint(&mut raw, b.rows);
             put_uvarint(&mut raw, b.dir_len as u64);
             put_uvarint(&mut raw, b.filter_len as u64);
+            if b.pages_len > 0 {
+                put_uvarint(&mut raw, b.pages_len as u64);
+            }
             end = b.off + b.len;
         }
         put_uvarint(&mut raw, self.root.dict.map_or(0, |d| d.len));
@@ -562,10 +685,15 @@ impl IndexBuilder {
         let mut root = Vec::new();
         compress_leaf(&mut root, &raw, backend, level.max(3));
 
-        let body_len = self.filters.len() + self.dirs.len() + root.len() + INDEX_TAIL_LEN;
+        let body_len = self.filters.len()
+            + self.page_filters.len()
+            + self.dirs.len()
+            + root.len()
+            + INDEX_TAIL_LEN;
         let mut out = Vec::with_capacity(INDEX_HEAD_LEN + body_len);
         out.extend_from_slice(INDEX_MAGIC);
         out.extend_from_slice(&(body_len as u64).to_le_bytes());
+        out.extend_from_slice(&self.page_filters);
         out.extend_from_slice(&self.filters);
         out.extend_from_slice(&self.dirs);
         out.extend_from_slice(&root);
@@ -619,10 +747,11 @@ impl Root {
         }
         let mut blocks = Vec::with_capacity(n_blocks);
         let mut end = 0u64;
-        let mut filter_off = INDEX_HEAD_LEN as u64;
+        let mut pages_off = INDEX_HEAD_LEN as u64;
         for _ in 0..n_blocks {
-            let kind = match cur.u8()? {
-                0 => {
+            let tag = cur.u8()?;
+            let kind = match tag {
+                0 | 2 => {
                     let model = cur.uvar()? as u32;
                     if model as usize >= models.len() {
                         return Err(Error::Format("index root model reference".into()));
@@ -651,17 +780,25 @@ impl Root {
             let rows = cur.uvar()?;
             let dir_len = cur.uvar()? as u32;
             let filter_len = cur.uvar()? as u32;
+            let pages_len = if tag == 2 { cur.uvar()? as u32 } else { 0 };
             blocks.push(BlockEntry {
                 kind,
                 off,
                 len,
                 rows,
-                filter_off,
+                filter_off: 0,
                 filter_len,
+                pages_off,
+                pages_len,
                 dir_off: 0,
                 dir_len,
             });
-            filter_off += filter_len as u64;
+            pages_off += pages_len as u64;
+        }
+        let mut filter_off = pages_off;
+        for b in &mut blocks {
+            b.filter_off = filter_off;
+            filter_off += b.filter_len as u64;
         }
         let mut dir_off = filter_off;
         for b in &mut blocks {
@@ -795,6 +932,22 @@ mod tests {
         assert!(got.col(0).summary.all_null && !got.col(1).summary.all_null);
         assert!(!got.col(0).summary.per_row && got.col(1).summary.per_row);
 
+        // A paged pool's pages must cover it exactly.
+        let paged = |pages: Vec<(u32, u32)>| {
+            let mut d = BlockDir {
+                pages,
+                ..dir.clone()
+            };
+            d.set_cols(160, Vec::new());
+            let mut page = Vec::new();
+            d.encode(EntropyBackend::Zstd, 3, &mut page);
+            BlockDir::decode(&page, &budget).map(|d| d.pages)
+        };
+        assert_eq!(paged(vec![(60, 900), (40, 70)]).unwrap(), [(60, 900), (40, 70)]);
+        assert!(paged(vec![(60, 900), (41, 70)]).is_err(), "pages past the pool");
+        assert!(paged(vec![(100, 900)]).is_err(), "one page is a leaf");
+        assert!(paged(vec![(60, u32::MAX), (40, u32::MAX)]).is_err(), "over budget");
+
         // A wide model whose block uses few columns: the empty ones cost the page almost nothing.
         let mut wide_cols = cols;
         wide_cols.resize(
@@ -842,6 +995,7 @@ mod tests {
             7,
             &page,
             &[0u8; 8],
+            &[2u8; 5],
         );
         ib.block(
             BlockKind::Verbatim {
@@ -852,6 +1006,7 @@ mod tests {
             3,
             &[],
             &[1u8; 16],
+            &[],
         );
         let region = ib.finish(400, EntropyBackend::Zstd, 3);
         let len = region.len() as u64;
@@ -863,22 +1018,25 @@ mod tests {
             (400, 2, 2)
         );
         let (a, b) = (&root.blocks[0], &root.blocks[1]);
-        // Both filters, then both directories.
+        // The page filter pages, both filters, then both directories.
         assert_eq!(
             (
                 a.off,
                 a.len,
                 a.rows,
+                a.pages_off,
+                a.pages_len,
                 a.filter_off,
                 a.dir_off,
                 a.dir_len as usize
             ),
-            (30, 200, 7, 12, 36, page.len())
+            (30, 200, 7, 12, 5, 17, 41, page.len())
         );
         assert_eq!(
-            (b.off, b.rows, b.filter_off, b.filter_len, b.dir_len),
-            (260, 3, 20, 16, 0)
+            (b.off, b.rows, b.pages_len, b.filter_off, b.filter_len, b.dir_len),
+            (260, 3, 0, 25, 16, 0)
         );
+        assert_eq!(&region[a.pages_off as usize..][..5], &[2u8; 5]);
         assert_eq!(&region[b.filter_off as usize..][..16], &[1u8; 16]);
         assert_eq!(&region[a.dir_off as usize..][..page.len()], &page[..]);
         assert!(locate_root(&region[region.len() - INDEX_TAIL_LEN..], len + 1).is_err());

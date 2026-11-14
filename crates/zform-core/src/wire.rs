@@ -400,6 +400,100 @@ pub(crate) fn decompress_leaf_with(
     }
 }
 
+/// Bytes zstd reads as a structured dictionary rather than raw content.
+const ZSTD_DICT_MAGIC: [u8; 4] = 0xEC30_A437u32.to_le_bytes();
+
+/// Compresses text pool pages into leaves: the first alone, each later one against the first's
+/// bytes as zstd raw content, so any page expands with the first page and itself. Empty when
+/// the first page would read as a structured dictionary.
+pub(crate) fn compress_pages(pages: &[Vec<u8>], level: i32) -> Vec<Vec<u8>> {
+    let mut out = Vec::with_capacity(pages.len());
+    let Some(first) = pages.first().filter(|f| !f.starts_with(&ZSTD_DICT_MAGIC)) else {
+        return out;
+    };
+    let mut leaf = Vec::new();
+    compress_leaf(&mut leaf, first, EntropyBackend::Zstd, level);
+    out.push(leaf);
+    use zstd_safe::CParameter::{ChecksumFlag, CompressionLevel, ForceAttachDict, WindowLog};
+    let mut ctx = zstd_safe::CCtx::try_create();
+    // Attached, the first page is indexed once for all the others.
+    let ready = ctx.as_mut().is_some_and(|c| {
+        c.set_parameter(CompressionLevel(level)).is_ok()
+            && c.set_parameter(ChecksumFlag(false)).is_ok()
+            && c.set_parameter(ForceAttachDict(zstd_safe::DictAttachPref::ForceAttach)).is_ok()
+            && c.load_dictionary(first).is_ok()
+    });
+    for page in &pages[1..] {
+        let mut leaf = Vec::new();
+        let mut tmp = vec![0u8; zstd_safe::compress_bound(page.len())];
+        let n = ctx.as_mut().filter(|_| ready && page.len() >= 32).and_then(|c| {
+            c.reset(zstd_safe::ResetDirective::SessionOnly).ok()?;
+            // The first page stays in reach only within a frame's first window.
+            c.set_parameter(WindowLog(window_log(page.len()))).ok()?;
+            c.compress2(&mut tmp[..], page).ok()
+        });
+        match n {
+            Some(n) if n + 2 < page.len() => {
+                put_leaf(&mut leaf, EntropyBackend::Zstd, page.len(), &tmp[..n])
+            }
+            _ => put_leaf(&mut leaf, EntropyBackend::Raw, page.len(), page),
+        }
+        out.push(leaf);
+    }
+    out
+}
+
+/// The raw length a leaf header states.
+pub(crate) fn leaf_raw_len(leaf: &[u8]) -> Result<usize> {
+    let mut cur = Cursor::new(leaf);
+    EntropyBackend::from_u8(cur.u8()?)?;
+    Ok(cur.uvar()? as usize)
+}
+
+/// Expands a page leaf from [`compress_pages`] into `dst`, which must be its raw length. `first`
+/// is the first page's bytes, for every page but the first.
+pub(crate) fn expand_page(leaf: &[u8], first: Option<&[u8]>, dst: &mut [u8]) -> Result<()> {
+    let mut cur = Cursor::new(leaf);
+    let tag = EntropyBackend::from_u8(cur.u8()?)?;
+    let raw_len = cur.uvar()? as usize;
+    let comp_len = cur.uvar()? as usize;
+    let payload = cur.slice(comp_len)?;
+    if raw_len != dst.len() || cur.remaining() != 0 {
+        return Err(Error::Format("text pool page length mismatch".into()));
+    }
+    if first.is_some_and(|f| f.starts_with(&ZSTD_DICT_MAGIC)) {
+        return Err(Error::Format("text pool page 0 reads as a dictionary".into()));
+    }
+    match tag {
+        EntropyBackend::Raw if comp_len == raw_len => dst.copy_from_slice(payload),
+        EntropyBackend::Zstd => {
+            let n = ZSTD_DEC_SCRATCH.with(|cell| -> Result<usize> {
+                let mut borrow = cell.borrow_mut();
+                if borrow.is_none() {
+                    *borrow = zstd_safe::DCtx::try_create();
+                }
+                let dctx = borrow
+                    .as_mut()
+                    .ok_or_else(|| Error::Format("failed to create zstd DCtx".into()))?;
+                let _ = dctx.reset(zstd_safe::ResetDirective::SessionOnly);
+                match first {
+                    Some(f) => dctx.decompress_using_dict(dst, payload, f),
+                    None => dctx.decompress(dst, payload),
+                }
+                .map_err(|code| {
+                    let name = zstd_safe::get_error_name(code);
+                    Error::Format(format!("zstd decompress error: {name}"))
+                })
+            })?;
+            if n != raw_len {
+                return Err(Error::Format("text pool page length mismatch".into()));
+            }
+        }
+        _ => return Err(Error::Format("invalid text pool page leaf".into())),
+    }
+    Ok(())
+}
+
 /// Skips a leaf written by [`compress_leaf`] without decompressing! Essential for fast projection.
 #[inline]
 pub fn skip_leaf(cur: &mut Cursor<'_>) -> Result<usize> {

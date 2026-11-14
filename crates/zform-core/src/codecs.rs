@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use crate::cells::{Cells, Col};
+use crate::cells::{Cells, Col, Pool};
 use crate::grammar::{ModelPlan, PlanVariant};
 use crate::lex::{parse_exact_int, parse_timestamp};
 pub use crate::packs::EncodedDenseBlock;
@@ -17,7 +17,7 @@ use crate::payload::graph::{
     NESTED_COLUMN_TAG, PayloadGraph, unpack_leaf, with_encode_opts,
 };
 use crate::payload::library::Library;
-use crate::wire::{Cursor, DecodeBudget, EntropyBackend, Error, Result, put_bytes};
+use crate::wire::{Cursor, DecodeBudget, EntropyBackend, Error, Result, expand_page, put_bytes};
 
 // ============================================================================
 // 1. Per-Column Block Summary & Index Metadata
@@ -207,6 +207,7 @@ pub fn encode_dense_block_columns(
     preencoded_nested: &mut [Option<(ColSummary, Vec<u8>)>],
     standalone: &[bool],
     layout: Option<(&ModelPlan, &[u32])>,
+    paging: Option<crate::packs::Paging<'_>>,
     packs: &PackRegistry,
     backend: EntropyBackend,
     level: i32,
@@ -218,9 +219,27 @@ pub fn encode_dense_block_columns(
         preencoded_nested,
         standalone,
         layout,
+        paging,
         backend,
         level,
     )
+}
+
+/// A block's text pool as a reader holds it.
+pub enum PoolParts<'a> {
+    Leaf(&'a [u8]),
+    /// Each page's leaf, `None` if not held, and its raw length.
+    Pages(Vec<(Option<&'a [u8]>, u32)>),
+}
+
+impl PoolParts<'_> {
+    /// Compressed bytes of the leaves held.
+    pub(crate) fn held_bytes(&self) -> usize {
+        match self {
+            PoolParts::Leaf(l) => l.len(),
+            PoolParts::Pages(pages) => pages.iter().flat_map(|p| p.0).map(<[u8]>::len).sum(),
+        }
+    }
 }
 
 /// Lazily materialized block-level shared dictionaries, prose pool, and peer columns.
@@ -228,8 +247,8 @@ pub struct BlockDecodeCtx<'a> {
     pub col_blobs: Vec<Option<&'a [u8]>>,
     dict_blobs: Vec<Option<&'a [u8]>>,
     dict_cache: Vec<Option<Arc<Cells>>>,
-    pool_leaf: Option<&'a [u8]>,
-    pool_cache: Option<Arc<Vec<u8>>>,
+    pool_parts: Option<PoolParts<'a>>,
+    pool_cache: Option<Arc<Pool>>,
     pub cache: Vec<Option<Col>>,
     cells_cache: Vec<Option<Arc<Cells>>>,
     /// The model's library, which the block's code references name.
@@ -324,11 +343,45 @@ fn value_ids(cells: &Cells) -> Vec<u32> {
     out
 }
 
+/// The pages held laid out at their places in the pool, the rest left missing. Every page but
+/// the first expands against the first, so without it none does.
+fn assemble_pages(
+    pages: &[(Option<&[u8]>, u32)],
+    budget: &DecodeBudget,
+) -> Result<Pool> {
+    let total: u64 = pages.iter().map(|p| p.1 as u64).sum();
+    let Some(&(first, first_len)) = pages.first() else {
+        return Err(Error::Format("text pool without pages".into()));
+    };
+    if total > u32::MAX as u64 {
+        return Err(Error::BudgetExceeded("text pool"));
+    }
+    budget.check_alloc(total as usize, "text pool")?;
+    let mut bytes = vec![0u8; total as usize];
+    let (head, mut rest) = bytes.split_at_mut(first_len as usize);
+    let mut missing = Vec::new();
+    match first {
+        Some(leaf) => expand_page(leaf, None, head)?,
+        None => missing.push((0, first_len)),
+    }
+    let mut at = first_len;
+    for &(leaf, len) in &pages[1..] {
+        let (dst, tail) = std::mem::take(&mut rest).split_at_mut(len as usize);
+        rest = tail;
+        match leaf.filter(|_| first.is_some()) {
+            Some(leaf) => expand_page(leaf, Some(head), dst)?,
+            None => missing.push((at, at + len)),
+        }
+        at += len;
+    }
+    Ok(Pool::partial(bytes, missing))
+}
+
 impl<'a> BlockDecodeCtx<'a> {
     pub fn new(
         col_blobs: Vec<Option<&'a [u8]>>,
         dict_blobs: Vec<Option<&'a [u8]>>,
-        pool_leaf: Option<&'a [u8]>,
+        pool_parts: Option<PoolParts<'a>>,
         library: Arc<Library>,
     ) -> Self {
         let n_cols = col_blobs.len();
@@ -337,7 +390,7 @@ impl<'a> BlockDecodeCtx<'a> {
             col_blobs,
             dict_blobs,
             dict_cache: (0..n_dicts).map(|_| None).collect(),
-            pool_leaf,
+            pool_parts,
             pool_cache: None,
             cache: (0..n_cols).map(|_| None).collect(),
             cells_cache: (0..n_cols).map(|_| None).collect(),
@@ -352,11 +405,13 @@ impl<'a> BlockDecodeCtx<'a> {
         self
     }
 
-    fn ensure_pool(&mut self, budget: &DecodeBudget) -> Result<&Arc<Vec<u8>>> {
+    fn ensure_pool(&mut self, budget: &DecodeBudget) -> Result<&Arc<Pool>> {
         if self.pool_cache.is_none() {
-            let leaf = self.pool_leaf.ok_or(Error::NotLoaded)?;
-            let raw = unpack_leaf(leaf, budget)?;
-            self.pool_cache = Some(Arc::new(raw));
+            let pool = match self.pool_parts.as_ref().ok_or(Error::NotLoaded)? {
+                PoolParts::Leaf(leaf) => Pool::whole(unpack_leaf(leaf, budget)?),
+                PoolParts::Pages(pages) => assemble_pages(pages, budget)?,
+            };
+            self.pool_cache = Some(Arc::new(pool));
         }
         Ok(self.pool_cache.as_ref().unwrap())
     }
@@ -762,6 +817,7 @@ mod tests {
             &mut vec![None; n],
             &vec![false; n],
             Some((&plan, &vids)),
+            None,
             EntropyBackend::Zstd,
             3,
         );

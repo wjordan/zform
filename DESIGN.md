@@ -70,7 +70,10 @@ else, and two data regions concatenated are one valid stream.
 - A block is stored as parts: the row structure, then one part per column, plus the tables
   several columns share (a dictionary, pooled free text). A part decompresses on its own once
   the parts of the same block it depends on are present.
-- Reading any row of a block decompresses the whole of each part the query needs.
+- Reading any row of a block decompresses the whole of each part the query needs, but for a
+  large text pool, which is cut into pages of whole rows ordered by content. A record or field
+  read takes the pool's first page, which the others are compressed against, and its own, found
+  in a per-row page map; a search takes the pages whose token filters hold the needle.
 
 **Block size trades file size for read cost**, set by the writer in rows and bytes. A larger
 block gives every column more context and a selective read more to fetch and decode. The stream

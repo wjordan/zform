@@ -1418,6 +1418,199 @@ mod tests {
     }
 
     #[test]
+    fn paged_pool_reads_only_the_pages_its_rows_use() {
+        use zform_core::index::{BlockDir, Root, locate_root};
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut text = |n: usize| {
+            let mut words = Vec::with_capacity(n);
+            for _ in 0..n {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let r = x;
+                let word = (0..5 + r % 6).map(|k| (b'a' + ((r >> (5 * k)) % 26) as u8) as char);
+                words.push(word.collect::<String>());
+            }
+            words
+        };
+        // Each body has its title's words, which only a pool of both columns shares. One body
+        // is larger than a page.
+        let rows: Vec<String> = (0..600)
+            .map(|i| {
+                let title = text(6 + i % 5);
+                let n = if i == 100 { 4000 } else { 10 + i % 20 };
+                let mut body = text(n / 2);
+                body.extend(title.iter().rev().cloned());
+                body.extend(text(n - n / 2));
+                let (title, body) = (title.join(" "), body.join(" "));
+                format!("{{\"id\":{i},\"title\":\"{title}\",\"body\":\"{body}\"}}")
+            })
+            .collect();
+        let recs: Vec<&[u8]> = rows.iter().map(|r| r.as_bytes()).collect();
+        let page = 8 << 10;
+        let opts = PackOptions {
+            pool_page_bytes: page,
+            ..Default::default()
+        };
+        let mut w = Writer::new(Vec::new(), opts);
+        for r in &recs {
+            w.push(r).unwrap();
+        }
+        let (mut data, index) = w.finish().unwrap();
+        let mut restored = Vec::new();
+        unpack(&data[..], &mut restored).unwrap();
+        let framed: Vec<u8> = recs
+            .iter()
+            .flat_map(|r| [&(r.len() as u32).to_le_bytes()[..], r].concat())
+            .collect();
+        assert!(restored == framed);
+
+        // Pages of whole rows up to the page size, but for the page of the large row.
+        let budget = DecodeBudget::default();
+        let tail = &index[index.len() - INDEX_TAIL_LEN..];
+        let (off, len, crc) = locate_root(tail, index.len() as u64).unwrap();
+        let root = Root::decode(&index[off as usize..][..len as usize], crc, &budget).unwrap();
+        assert_eq!(root.blocks.len(), 1);
+        let b = &root.blocks[0];
+        let dir_page = &index[b.dir_off as usize..][..b.dir_len as usize];
+        let dir = BlockDir::decode(dir_page, &budget).unwrap();
+        let (pool_off, _) = dir.pool.expect("a text pool");
+        assert!(dir.pages.len() > 8, "{:?}", dir.pages);
+        let over: Vec<u32> = dir.pages.iter().map(|p| p.1).filter(|&r| r > page as u32).collect();
+        assert!(over.len() == 1 && over[0] > 4000 * 4, "{over:?}");
+        let page_at: Vec<(u64, u64)> = dir
+            .pages
+            .iter()
+            .scan(b.off + pool_off as u64, |at, p| {
+                Some((std::mem::replace(at, *at + p.0 as u64), p.0 as u64))
+            })
+            .collect();
+
+        fn serve(data: &[u8], index: &[u8], ranges: &[ByteRange]) -> Vec<Vec<u8>> {
+            let buf = |r: &ByteRange| match r.region {
+                Region::Data => data[r.off as usize..r.end() as usize].to_vec(),
+                Region::Index => index[r.off as usize..r.end() as usize].to_vec(),
+            };
+            ranges.iter().map(buf).collect()
+        }
+        let touched = |read: &[ByteRange]| -> Vec<usize> {
+            (0..page_at.len())
+                .filter(|&i| {
+                    let (at, n) = page_at[i];
+                    read.iter().any(|r| r.region == Region::Data && r.off < at + n && at < r.end())
+                })
+                .collect()
+        };
+
+        // A record, or a field of it, takes the first page and its own.
+        let read = std::cell::RefCell::new(Vec::<ByteRange>::new());
+        let fetch = |ranges: &[ByteRange]| {
+            read.borrow_mut().extend_from_slice(ranges);
+            Ok(serve(&data, &index, ranges))
+        };
+        for (row, field) in [(7u64, false), (100, false), (7, true), (300, true)] {
+            let mut cache = RangeCache::default();
+            let file = drive(&mut cache, fetch, |c| {
+                file::File::open(c, index.len() as u64, budget)
+            })
+            .unwrap();
+            let mut session = file.session();
+            let one = RowSet::from_sorted([row]);
+            let mut got = Vec::new();
+            drive(&mut cache, fetch, |c| {
+                got.clear();
+                match field {
+                    false => session.records(c, &one, |_, rec| {
+                        let _: () = got.extend_from_slice(rec);
+                        Ok(())
+                    }),
+                    true => session.fields(c, &["body"], &one, |_, _, v| {
+                        let _: () = got.extend_from_slice(v.unwrap());
+                        Ok(())
+                    }),
+                }
+            })
+            .unwrap();
+            let rec = std::str::from_utf8(recs[row as usize]).unwrap();
+            let want = match field {
+                false => rec,
+                true => &rec[rec.find("\"body\":").unwrap() + 7..rec.len() - 1],
+            };
+            assert_eq!(std::str::from_utf8(&got).unwrap(), want);
+            let pages = touched(&std::mem::take(&mut *read.borrow_mut()));
+            assert!(pages.len() <= 2 && pages[0] == 0, "row {row} read pages {pages:?}");
+        }
+
+        // A search takes the first page and those whose filters hold the words, here a title's.
+        let rec = std::str::from_utf8(recs[250]).unwrap();
+        let word = rec[rec.find("\"title\":\"").unwrap() + 9..].split('"').next().unwrap();
+        let want: Vec<u64> = (0..recs.len() as u64)
+            .filter(|&r| {
+                let rec = recs[r as usize];
+                let edge = |i: usize| rec.get(i).is_none_or(|b| !b.is_ascii_alphanumeric());
+                (0..rec.len().saturating_sub(word.len())).any(|i| {
+                    &rec[i..i + word.len()] == word.as_bytes()
+                        && edge(i.wrapping_sub(1))
+                        && edge(i + word.len())
+                })
+            })
+            .collect();
+        let search = |index: &[u8], pred: &Predicate| {
+            let read = std::cell::RefCell::new(Vec::<ByteRange>::new());
+            let fetch = |ranges: &[ByteRange]| {
+                read.borrow_mut().extend_from_slice(ranges);
+                Ok(serve(&data, index, ranges))
+            };
+            let mut cache = RangeCache::default();
+            let len = index.len() as u64;
+            let file = drive(&mut cache, fetch, |c| file::File::open(c, len, budget)).unwrap();
+            let mut session = file.session();
+            let rows = drive(&mut cache, fetch, |c| session.matches(c, pred, None));
+            let rows = rows.and_then(|rows| {
+                let mut got = Vec::new();
+                drive(&mut cache, fetch, |c| {
+                    got.clear();
+                    session.records(c, &rows, |r, _| {
+                        let _: () = got.push(r);
+                        Ok(())
+                    })
+                })?;
+                Ok(got)
+            });
+            (rows, touched(&read.into_inner()))
+        };
+        let (got, pages) = search(&index, &Predicate::Word(word.into()));
+        assert_eq!(got.unwrap(), want);
+        assert!(pages.len() <= 3 && pages[0] == 0, "{word} read pages {pages:?}");
+        let (_, every) = search(&index, &Predicate::Contains(b" ".to_vec()));
+        assert_eq!(every.len(), page_at.len());
+
+        // A damaged page filter page or row page map is an error, not a panic.
+        let n = dir.pages.len();
+        let mut bad = index.clone();
+        bad[b.pages_off as usize..][..n].fill(40);
+        assert!(search(&bad, &Predicate::Word(word.into())).0.is_err());
+        let w = (usize::BITS - n.leading_zeros()) as usize;
+        let mut bad = index.clone();
+        bad[b.pages_off as usize + n..][..(600 * w).div_ceil(8)].fill(0xff);
+        if n + 1 < 1 << w {
+            assert!(search(&bad, &Predicate::Word(word.into())).0.is_err());
+        }
+
+        // A damaged page is an error, not a panic.
+        data[page_at[1].0 as usize] = 0x7f;
+        let src = MemSource {
+            data: &data,
+            index: &index,
+        };
+        let Step::Ready(file) = file::File::open(&src, index.len() as u64, budget).unwrap() else {
+            panic!()
+        };
+        let all = RowSet::range(0, recs.len() as u64);
+        assert!(file.session().records(&src, &all, |_, _| Ok(())).is_err());
+    }
+
+    #[test]
     fn file_queries_fetch_only_what_they_need() {
         // One shape of record, so every block answers from its columns.
         let rows: Vec<String> = (0..6000)

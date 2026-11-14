@@ -1,6 +1,7 @@
 //! Query bench over a file from `file::Writer`: bytes requested, round trips and time.
 //!
-//!   qbench pack   <base> <profile.zfp|-> <level> <block MiB> [filter bits]   < records.ndjson
+//!   qbench pack   <base> <profile.zfp|-> <level> <block MiB> [filter bits] [pool page KiB]
+//!                                                    < records.ndjson
 //!   qbench fetch  <base> <field> <value>             records where field == value
 //!   qbench among  <base> <field> <value>             the same, told which blocks hold such records,
 //!                                                    as a host with its own index of the field is
@@ -86,6 +87,9 @@ fn pack(base: &str, args: &[String]) {
     opts.block_bytes = args[2].parse::<usize>().expect("block MiB") << 20;
     if let Some(bits) = args.get(3) {
         opts.filter_bits = bits.parse().expect("filter bits");
+    }
+    if let Some(kib) = args.get(4) {
+        opts.pool_page_bytes = kib.parse::<usize>().expect("pool page KiB") << 10;
     }
     let out = BufWriter::with_capacity(
         1 << 20,
@@ -176,6 +180,7 @@ fn filters(base: &str) {
     let (mut dir, mut bytes, mut fill, mut pass) = (0u64, 0u64, 0f64, 0f64);
     // Where the data region's bytes are: row structure, shared dictionaries, text pool, columns.
     let mut parts = [0u64; 4];
+    let (mut pools, mut paged, mut pages) = (0, 0, 0);
     for b in &root.blocks {
         if let zform_core::index::BlockKind::Structured { .. } = b.kind {
             let page = &index[b.dir_off as usize..][..b.dir_len as usize];
@@ -184,11 +189,14 @@ fn filters(base: &str) {
             parts[0] += d.struct_len as u64;
             parts[1] += d.dicts.iter().map(|x| x.1 as u64).sum::<u64>();
             parts[2] += d.pool.map_or(0, |x| x.1 as u64);
+            pools += usize::from(d.pool.is_some());
+            paged += usize::from(!d.pages.is_empty());
+            pages += d.pages.len();
             parts[3] += d.col_spans().map(|c| c.1 as u64).sum::<u64>();
         }
     }
     eprintln!(
-        "structure {} dicts {} pool {} columns {}",
+        "structure {} dicts {} pool {} columns {}; pools {pools}, paged {paged} in {pages} pages",
         parts[0], parts[1], parts[2], parts[3]
     );
     for b in &root.blocks {

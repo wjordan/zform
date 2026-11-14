@@ -13,7 +13,7 @@ use crate::container::block_col;
 use crate::grammar::ModelPlan;
 use crate::lex::{escape_json_str_exact, unescape_json_str_exact};
 use crate::wire::{Cursor, DecodeBudget, EntropyBackend, Error, Result, put_bytes, put_uvarint};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub const J_NONE: u8 = 0;
 pub const J_OBJECT: u8 = 1;
@@ -2226,6 +2226,28 @@ pub fn train_json_tree(
     }
     if parsed_count < 2 {
         return None;
+    }
+
+    // A scalar key that varies under one parent varies under every parent: the sample may have
+    // missed the rare value here, and a value baked into a layout costs an opaque row later.
+    let scalar = |tp: &TPath| tp.kinds[J_OBJECT as usize] == 0 && tp.kinds[J_ARRAY as usize] == 0;
+    let mut varying: HashSet<&[u8]> = HashSet::new();
+    for tp in &tr.paths {
+        for (key, &c) in &tp.kids {
+            if tr.paths[c].varies && scalar(&tr.paths[c]) {
+                varying.insert(key);
+            }
+        }
+    }
+    let spread: Vec<usize> = tr
+        .paths
+        .iter()
+        .flat_map(|tp| tp.kids.iter())
+        .filter(|&(key, &c)| varying.contains(key.as_slice()) && scalar(&tr.paths[c]))
+        .map(|(_, &c)| c)
+        .collect();
+    for c in spread {
+        tr.paths[c].varies = true;
     }
 
     // Decide initial path roles

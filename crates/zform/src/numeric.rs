@@ -349,11 +349,11 @@ pub fn decode_f64_with_base(
             return Err(Error::InvalidArgument("numeric base length".into()));
         }
         budget.check_alloc(count.saturating_mul(8), "numeric base")?;
-        Some(std::sync::Arc::new(
+        Some(std::sync::Arc::new(zform_core::cells::Pool::whole(
             base.iter()
                 .flat_map(|v| v.to_bits().to_le_bytes())
                 .collect(),
-        ))
+        )))
     } else {
         None
     };
