@@ -4,7 +4,7 @@
 //! whose model makes that exact, and reports the rest as unknown for the caller to rebuild.
 
 use crate::cells::{Col, NOT_HELD, NULL_CELL, underflow};
-use crate::codecs::{ColSummary, ESCAPES, letters_of};
+use crate::codecs::{ANY_LETTERS, ColSummary, ESCAPES, letters_of};
 use crate::container::BlockRows;
 use crate::grammar::{ModelPlan, PlanVariant, parse_logfmt_line};
 use crate::index::{
@@ -321,12 +321,13 @@ impl FieldPlan {
         fp
     }
 
-    /// A plan that walks to the values of `paths` and of the paths they derive from.
-    fn of_paths(jt: &JsonTreePlan, paths: &[usize]) -> Self {
+    /// A plan that walks to the values of `paths` and of the paths they derive from, and reports
+    /// `hooks`.
+    fn of_paths(jt: &JsonTreePlan, paths: &[usize], hooks: Vec<Vec<Vec<(u16, u32)>>>) -> Self {
         let n = jt.paths.len();
         let mut fp = FieldPlan {
             track: vec![false; n],
-            hooks: vec![Vec::new(); n],
+            hooks,
             rem: vec![None; n],
             consts: Vec::new(),
             cols: Vec::new(),
@@ -344,6 +345,7 @@ impl FieldPlan {
             jt,
             &JsonWalk {
                 track: &fp.track,
+                hooks: &fp.hooks,
                 ..JsonWalk::default()
             },
         );
@@ -453,39 +455,56 @@ impl FieldPlan {
     }
 }
 
-/// Whether `needle` can lie inside the Base64 spelling of the printable ASCII text a Base64
-/// candidate holds: at one of the four offsets into a 4-character group, every byte the needle's
-/// bits touch agrees with some printable byte.
-fn b64_may_hold(needle: &[u8]) -> bool {
-    let six = |c: u8| match c {
+fn b64_digit(c: u8) -> Option<u8> {
+    match c {
         b'A'..=b'Z' => Some(c - b'A'),
         b'a'..=b'z' => Some(c - b'a' + 26),
         b'0'..=b'9' => Some(c - b'0' + 52),
         b'+' => Some(62),
         b'/' => Some(63),
         _ => None,
-    };
-    // Padding ends a value; such a needle is rare enough to keep without a test.
-    if needle.contains(&b'=') {
-        return needle.iter().all(|&c| c == b'=' || six(c).is_some());
     }
-    let Some(v) = needle.iter().map(|&c| six(c)).collect::<Option<Vec<u8>>>() else {
-        return false;
-    };
-    (0..4).any(|a| {
+}
+
+/// How `needle` can lie inside the Base64 spelling of the printable ASCII text a Base64 candidate
+/// holds. `None` when it cannot: at none of the four offsets into a 4-character group does every
+/// byte the needle's bits touch agree with a printable byte. Otherwise, by offset where it can,
+/// the bytes the needle spells whole, one of which the text then holds; empty when an offset
+/// spells none, or the needle has padding, so no text can be ruled out.
+fn b64_cores(needle: &[u8]) -> Option<Vec<Vec<u8>>> {
+    // Padding ends a value; such a needle is rare enough to keep without a test.
+    if needle.is_empty() || needle.contains(&b'=') {
+        return needle.iter().all(|&c| c == b'=' || b64_digit(c).is_some()).then(Vec::new);
+    }
+    let v: Vec<u8> = needle.iter().map(|&c| b64_digit(c)).collect::<Option<_>>()?;
+    let (mut cores, mut screens) = (Vec::new(), true);
+    for a in 0..4 {
         let (lo, hi) = (6 * a, 6 * (a + v.len()));
         let last = hi.div_ceil(8) - 1;
-        (lo / 8..=last).all(|b| {
+        let mut core = Vec::new();
+        let fits = (lo / 8..=last).all(|b| {
             let (mut mask, mut val) = (0u8, 0u8);
             for i in (0..8).filter(|i| (lo..hi).contains(&(8 * b + i))) {
                 let g = 8 * b + i - lo;
                 mask |= 0x80 >> i;
                 val |= ((v[g / 6] >> (5 - g % 6)) & 1) << (7 - i);
             }
+            if mask == 0xff {
+                core.push(val);
+            }
             // Zero bits that end the needle may be the padding after a value's last byte.
             (b == last && hi % 8 != 0 && val == 0) || (0x20..0x7fu8).any(|x| x & mask == val)
-        })
-    })
+        });
+        if fits {
+            screens &= !core.is_empty();
+            cores.push(core);
+        }
+    }
+    match (cores.is_empty(), screens) {
+        (true, _) => None,
+        (false, true) => Some(cores),
+        (false, false) => Some(Vec::new()),
+    }
 }
 
 /// What a variant's rows need to answer a substring test.
@@ -514,9 +533,186 @@ pub(crate) struct NeedlePlan {
     word: bool,
     /// The needle can match a `"` or the bare token `null`, which a quoted column adds to cells.
     quote_sensitive: bool,
-    /// When JSON rows are scanned and the needle can lie inside a Base64 value, which is in no
-    /// cell: the walk to the paths that write such values.
-    b64: Option<FieldPlan>,
+    /// When JSON rows are scanned and the needle can lie outside every cell, in a derived value
+    /// or in a shape's text: the walk that finds those rows.
+    derived: Option<DerivedWalk>,
+}
+
+/// JSON paths whose values a substring test rebuilds, and shapes whose text holds the needle.
+struct DerivedWalk {
+    /// By path, by shape: fires on rows that take a shape holding the needle.
+    hooks: Vec<Vec<Vec<(u16, u32)>>>,
+    /// By path, by candidate: the values it derives are rebuilt.
+    cands: Vec<Vec<bool>>,
+    /// By path: every value is rebuilt, and its column is not scanned.
+    every: Vec<bool>,
+    /// `b64_cores` of the needle.
+    b64_cores: Vec<Finder<'static>>,
+    /// By the letters a block's path columns hold: its walk, built once.
+    walks: Mutex<HashMap<Vec<u32>, Option<Arc<FieldPlan>>>>,
+}
+
+impl DerivedWalk {
+    /// The walk for one block: to the paths whose rebuilt values can hold the needle, or one of
+    /// its Base64 cores, in a way no cell does, given the letters the block's columns hold.
+    fn for_block(&self, plan: &ModelPlan, dir: &BlockDir, needle: &[u8]) -> Option<Arc<FieldPlan>> {
+        let jt = plan.json_tree.as_ref()?;
+        let col = |c: u16| match plan.columns.get(c as usize) {
+            None => 0,
+            Some(_) if dir.col(c as usize).summary.all_null => 0,
+            Some(def) if def.nested_plan.is_some() => ANY_LETTERS,
+            Some(_) => dir.col(c as usize).summary.letters,
+        };
+        let rebuilds = self.every.contains(&true) || self.cands.iter().flatten().any(|&c| c);
+        // Nothing below reads the block but these letters.
+        let key: Vec<u32> = match rebuilds {
+            true => jt.paths.iter().map(|p| col(p.value_col)).collect(),
+            false => Vec::new(),
+        };
+        let mut walks = self.walks.lock().unwrap();
+        if let Some(fp) = walks.get(&key) {
+            return fp.clone();
+        }
+        let mut paths = Vec::new();
+        let mut memo = vec![None; key.len()];
+        for (pi, p) in jt.paths.iter().enumerate().filter(|_| rebuilds) {
+            let mut walk = self.every.get(pi) == Some(&true);
+            for (c, &on) in p.cands.iter().zip(self.cands.get(pi).into_iter().flatten()) {
+                if !on {
+                    continue;
+                }
+                let (lits, refs) = cand_parts(c);
+                let gaps: Vec<u32> = refs
+                    .iter()
+                    .map(|&r| path_letters(jt, &key, &mut memo, r as usize, pi, 0))
+                    .collect();
+                walk |= match c {
+                    JsonCand::MultiConcat { b64: true, .. } => {
+                        self.b64_cores.is_empty()
+                            || self.b64_cores.iter().any(|core| {
+                                may_lie_in(core.needle(), &lits, &gaps, false)
+                            })
+                    }
+                    _ => may_lie_in(needle, &lits, &gaps, true),
+                };
+            }
+            if walk {
+                paths.push(pi);
+            }
+        }
+        let fp = (!(paths.is_empty() && self.hooks.iter().all(Vec::is_empty)))
+            .then(|| Arc::new(FieldPlan::of_paths(jt, &paths, self.hooks.clone())));
+        walks.insert(key, fp.clone());
+        fp
+    }
+}
+
+/// A candidate as the text `lits[0] ref[0] lits[1] … lits[k]` it builds, before any Base64.
+fn cand_parts(c: &JsonCand) -> (Vec<&[u8]>, &[u16]) {
+    match c {
+        JsonCand::Copy { ref_path } => (vec![&[], &[]], std::slice::from_ref(ref_path)),
+        JsonCand::Affix { prefix, ref_path, suffix } => {
+            (vec![prefix, suffix], std::slice::from_ref(ref_path))
+        }
+        JsonCand::MultiConcat { lits, refs, .. } => (lits.iter().map(Vec::as_slice).collect(), refs),
+    }
+}
+
+/// The letters the values of path `r`, as a part of a value of path `own`, may show, given `cols`,
+/// the letters of each path's column.
+fn path_letters(
+    jt: &JsonTreePlan,
+    cols: &[u32],
+    memo: &mut [Option<u32>],
+    r: usize,
+    own: usize,
+    depth: usize,
+) -> u32 {
+    // A path's own part is a cell of its column.
+    if r == own {
+        return cols[r];
+    }
+    if let Some(l) = memo[r] {
+        return l;
+    }
+    // As deep as `materialize` follows refs.
+    if depth > 8 {
+        return ANY_LETTERS;
+    }
+    let mut l = cols[r];
+    for c in &jt.paths[r].cands {
+        l |= match c {
+            JsonCand::MultiConcat { b64: true, .. } => ANY_LETTERS,
+            _ => {
+                let (lits, refs) = cand_parts(c);
+                lits.iter().fold(0, |a, x| a | letters_of(x))
+                    | refs
+                        .iter()
+                        .fold(0, |a, &x| a | path_letters(jt, cols, memo, x as usize, r, depth + 1))
+            }
+        };
+    }
+    memo[r] = Some(l);
+    l
+}
+
+/// Whether `n` can lie in a text `lits[0] gap lits[1] … gap lits[k]`, where gap `i` is any run of
+/// bytes whose letters are among `gaps[i]`. With `crossing`, only a placement that takes a
+/// literal byte or reaches into two gaps counts: one no single gap holds.
+fn may_lie_in(n: &[u8], lits: &[&[u8]], gaps: &[u32], crossing: bool) -> bool {
+    // A state is `(part, at, from)`: literal `part / 2` before its byte `at`, or gap `part / 2`
+    // for odd `part`; `from` is the gap a placement has kept to so far, `NONE` before its first
+    // byte, or `MIXED`.
+    const NONE: u32 = u32::MAX;
+    const MIXED: u32 = u32::MAX - 1;
+    let allowed = |class: u32, b: u8| {
+        let l = (b | 0x20).wrapping_sub(b'a');
+        match (l < 26, b == b'\\') {
+            (true, _) => class & (1 << l) != 0,
+            (_, true) => class & ESCAPES != 0,
+            _ => true,
+        }
+    };
+    // Moves past literal ends and into the literal after a gap, which may be empty.
+    let settle = |mut st: (usize, usize, u32), out: &mut Vec<(usize, usize, u32)>| loop {
+        let (part, at, from) = st;
+        if part % 2 == 1 {
+            out.push(st);
+            st = (part + 1, 0, from);
+        } else if at < lits[part / 2].len() {
+            out.push(st);
+            return;
+        } else if part / 2 < gaps.len() {
+            st = (part + 1, 0, from);
+        } else {
+            return;
+        }
+    };
+    let mut cur = Vec::new();
+    for i in 0..lits.len() {
+        (0..lits[i].len()).for_each(|at| settle((2 * i, at, NONE), &mut cur));
+    }
+    (0..gaps.len()).for_each(|i| settle((2 * i + 1, 0, NONE), &mut cur));
+    let mut next = Vec::new();
+    for &b in n {
+        next.clear();
+        for &(part, at, from) in &cur {
+            if part % 2 == 0 && lits[part / 2][at] == b {
+                settle((part, at + 1, MIXED), &mut next);
+            } else if part % 2 == 1 && allowed(gaps[part / 2], b) {
+                let gap = (part / 2) as u32;
+                let from = if from == NONE || from == gap { gap } else { MIXED };
+                settle((part, 0, from), &mut next);
+            }
+        }
+        next.sort_unstable();
+        next.dedup();
+        std::mem::swap(&mut cur, &mut next);
+        if cur.is_empty() {
+            return false;
+        }
+    }
+    !crossing || cur.iter().any(|s| s.2 == MIXED)
 }
 
 /// True when a match of `needle` could lie partly in one of `lits` and partly outside it, or two
@@ -573,7 +769,8 @@ impl NeedlePlan {
         };
         let mut vars = Vec::with_capacity(plan.variants.len());
         let mut unknown_kinds = 0u16;
-        let mut b64 = None;
+        let mut derived = None;
+        let mut unscanned = Vec::new();
         for (vi, v) in plan.variants.iter().enumerate() {
             let (var, kind) = match v {
                 PlanVariant::Shape(s) => {
@@ -625,8 +822,52 @@ impl NeedlePlan {
                     // A value built from others repeats their cells, which are tested where
                     // they stand, so only the text between stored values has to join.
                     let mut joined = true;
-                    for p in &jt.paths {
-                        for shape in &p.shapes {
+                    let b64_needle = b64_cores(needle);
+                    let overlaps = |l: &[u8]| {
+                        has(l) || literals_can_overlap_needle(std::iter::once(l), needle)
+                    };
+                    // A derived value may hold the needle in no cell when the needle meets
+                    // its literal text, or when it is spelled in Base64.
+                    let rebuilt = |c: &JsonCand| match c {
+                        JsonCand::Copy { .. } => false,
+                        JsonCand::Affix { prefix, suffix, .. } => [prefix, suffix]
+                            .into_iter()
+                            .any(|l| !l.is_empty() && overlaps(l)),
+                        JsonCand::MultiConcat { b64: true, .. } => {
+                            overlaps(b"\"") || b64_needle.is_some()
+                        }
+                        JsonCand::MultiConcat { lits: ls, .. } => {
+                            ls.iter().enumerate().any(|(i, l)| {
+                                !(l.is_empty() && (i == 0 || i + 1 == ls.len())) && overlaps(l)
+                            })
+                        }
+                    };
+                    // A free part's cell stands as a word only where the text beside it in the
+                    // value is no word byte.
+                    let free_joins = |c: &JsonCand, own: usize| match c {
+                        JsonCand::MultiConcat { lits: ls, refs, .. } => {
+                            refs.iter().position(|&r| r as usize == own).is_none_or(|j| {
+                                let open = |b: Option<&u8>| b.is_some_and(|&b| !is_word(b));
+                                open(ls[j].last()) && open(ls[j + 1].first())
+                            })
+                        }
+                        _ => true,
+                    };
+                    let mut hooks = vec![Vec::new(); jt.paths.len()];
+                    for (pi, p) in jt.paths.iter().enumerate() {
+                        // Every row that takes a shape whose text holds the needle matches.
+                        let sure_shape = |sh: &[crate::json_tree::JsonSlotPart]| {
+                            sh.iter().any(|t| sure(&t.literal))
+                        };
+                        let any_sure = p.shapes.iter().any(|sh| sure_shape(sh));
+                        if any_sure {
+                            hooks[pi] = p
+                                .shapes
+                                .iter()
+                                .map(|sh| if sure_shape(sh) { vec![(0, 0)] } else { Vec::new() })
+                                .collect();
+                        }
+                        for shape in p.shapes.iter().filter(|sh| !any_sure || !sure_shape(sh)) {
                             for (i, part) in shape.iter().enumerate() {
                                 // An empty literal at the start or end of a shape joins nothing.
                                 if !(part.literal.is_empty()
@@ -640,45 +881,38 @@ impl NeedlePlan {
                                 joined &= joins(&part.literal) && joins(&part.sep);
                             }
                         }
-                        for cand in &p.cands {
-                            match cand {
-                                JsonCand::Copy { .. } => {}
-                                JsonCand::Affix { prefix, suffix, .. } => {
-                                    lits.extend(
-                                        [prefix.as_slice(), suffix.as_slice()]
-                                            .into_iter()
-                                            .filter(|l| !l.is_empty()),
-                                    );
-                                }
-                                // Of a Base64 value, only its quotes are literal text.
-                                JsonCand::MultiConcat { b64: true, .. } => lits.push(b"\""),
-                                JsonCand::MultiConcat { lits: ls, .. } => {
-                                    let n = ls.len();
-                                    lits.extend(
-                                        ls.iter()
-                                            .enumerate()
-                                            .filter(|(i, l)| {
-                                                !(l.is_empty() && (*i == 0 || *i + 1 == n))
-                                            })
-                                            .map(|(_, l)| l.as_slice()),
-                                    );
-                                }
-                            }
-                        }
                     }
+                    // Outside word mode `sure` is `has`, so no literal left here holds the needle.
                     let exact = joined
-                        && !lits.iter().any(|l| has(l))
+                        && !(word && lits.iter().any(|l| has(l)))
                         && !literals_can_overlap_needle(lits.into_iter(), needle);
-                    let b64_paths: Vec<usize> = (0..jt.paths.len())
-                        .filter(|&pi| {
-                            jt.paths[pi]
-                                .cands
-                                .iter()
-                                .any(|c| matches!(c, JsonCand::MultiConcat { b64: true, .. }))
+                    let every = |(pi, p): (usize, &crate::json_tree::JsonPathDef)| {
+                        word && !p.cands.iter().all(|c| free_joins(c, pi))
+                    };
+                    let rebuilds = || {
+                        jt.paths.iter().enumerate().any(|(pi, p)| {
+                            every((pi, p)) || p.cands.iter().any(rebuilt)
                         })
-                        .collect();
-                    if exact && !b64_paths.is_empty() && b64_may_hold(needle) {
-                        b64 = Some(FieldPlan::of_paths(jt, &b64_paths));
+                    };
+                    if exact && (hooks.iter().any(|h| !h.is_empty()) || rebuilds()) {
+                        let cands = jt.paths.iter().map(|p| p.cands.iter().map(rebuilt).collect()).collect();
+                        let every = jt.paths.iter().enumerate().map(every).collect::<Vec<_>>();
+                        unscanned.extend(
+                            (0..jt.paths.len())
+                                .filter(|&pi| every[pi])
+                                .map(|pi| jt.paths[pi].value_col),
+                        );
+                        derived = Some(DerivedWalk {
+                            hooks,
+                            cands,
+                            every,
+                            b64_cores: b64_needle
+                                .iter()
+                                .flatten()
+                                .map(|c| Finder::new(c).into_owned())
+                                .collect(),
+                            walks: Mutex::default(),
+                        });
                     }
                     (
                         if exact {
@@ -696,7 +930,10 @@ impl NeedlePlan {
             vars.push(var);
         }
         // A column two variants write has occurrences this code cannot place on rows.
-        let scan_cols: Vec<bool> = (0..n_cols).map(|c| users[c] == 1 && verbatim[c]).collect();
+        let mut scan_cols: Vec<bool> = (0..n_cols).map(|c| users[c] == 1 && verbatim[c]).collect();
+        for c in unscanned.into_iter().filter(|&c| c != u16::MAX) {
+            scan_cols[c as usize] = false;
+        }
         for (vi, v) in plan.variants.iter().enumerate() {
             let shared = |c: u16| users[c as usize] > 1;
             let (bad, kind) = match v {
@@ -720,18 +957,18 @@ impl NeedlePlan {
             }
         }
         let all_true = vars.contains(&VarNeedle::AllTrue);
-        let b64_open = if b64.is_some() { KIND_JSON } else { 0 };
+        let derived_open = if derived.is_some() { KIND_JSON } else { 0 };
         NeedlePlan {
             vars,
             unknown_kinds,
-            open_kinds: unknown_kinds | b64_open | if all_true { KIND_SHAPE } else { 0 },
+            open_kinds: unknown_kinds | derived_open | if all_true { KIND_SHAPE } else { 0 },
             scan_cols,
             letters: letters_of(needle),
             finder: finder.into_owned(),
             word,
             quote_sensitive: needle.contains(&b'"')
                 || memchr::memmem::find(b"null", needle).is_some(),
-            b64,
+            derived,
         }
     }
 
@@ -918,7 +1155,7 @@ pub(crate) fn needs(pred: &Predicate, m: &BlockMeta<'_>, plans: &mut Plans, need
         Predicate::Contains(needle) | Predicate::Word(needle) => {
             let np = plans.needle(m, needle, matches!(pred, Predicate::Word(_)));
             need.whole |= m.kinds & np.unknown_kinds != 0;
-            if let Some(fp) = &np.b64 {
+            if let Some(fp) = np.derived.as_ref().and_then(|d| d.for_block(m.plan, m.dir, np.finder.needle())) {
                 fp.needs(m.kinds, m.dir, need);
             }
             // A column with a cell for every row needs no structure to place its cells.
@@ -1247,9 +1484,28 @@ fn eval_contains(
             hits.push((cid, occs));
         }
     }
-    if let (Some(fp), Some(jt), Some(jvi)) = (&np.b64, &plan.json_tree, json_variant(plan)) {
+    if !hits.is_empty() {
+        let occ_rows = cell_rows(plan, rows.json_streams(), &rows.variant_ids, &want)?;
+        for (cid, occs) in hits {
+            let at = &occ_rows[cid];
+            if rows.col(cid, budget)?.len() != at.len() {
+                return Err(Error::Format(
+                    "column occurrences do not match the row structure".into(),
+                ));
+            }
+            occs.iter()
+                .for_each(|&occ| tri[at[occ as usize] as usize] = YES);
+        }
+    }
+    // Only rows no cell has settled need the walk.
+    let walked = match &np.derived {
+        Some(d) if tri.contains(&NO) => d.for_block(plan, m.dir, np.finder.needle()).map(|fp| (d, fp)),
+        _ => None,
+    };
+    if let (Some((d, fp)), Some(jt), Some(jvi)) = (walked, &plan.json_tree, json_variant(plan)) {
         let walk = JsonWalk {
             track: &fp.track,
+            hooks: &fp.hooks,
             ..JsonWalk::default()
         };
         let map = map_json_block_structure(
@@ -1262,12 +1518,35 @@ fn eval_contains(
         )?;
         let mut text = Vec::new();
         for ev in &map.events {
-            let PathVal::Derived { cand, .. } = ev.val else {
+            let p = ev.path as usize;
+            if tri[ev.row as usize] != NO {
                 continue;
+            }
+            let (test, b64) = match ev.val {
+                PathVal::Hook(_) => {
+                    tri[ev.row as usize] = YES;
+                    continue;
+                }
+                PathVal::Derived { cand, .. } => (
+                    d.cands[p].get(cand as usize) == Some(&true),
+                    matches!(
+                        jt.paths[p].cands.get(cand as usize),
+                        Some(JsonCand::MultiConcat { b64: true, .. })
+                    ),
+                ),
+                _ => (false, false),
             };
-            let cands = &jt.paths[ev.path as usize].cands;
-            if !matches!(cands.get(cand as usize), Some(JsonCand::MultiConcat { b64: true, .. })) {
+            if !(test || d.every[p]) {
                 continue;
+            }
+            // Text whose Base64 holds the needle holds one of its cores; most values do not.
+            if b64 && !d.b64_cores.is_empty() {
+                text.clear();
+                b64_text(&map, ev, rows, &mut text, budget)?;
+                let has = |c: &Finder<'_>| c.find(&text).is_some();
+                if !d.b64_cores.iter().any(has) {
+                    continue;
+                }
             }
             text.clear();
             materialize(&map, ev, rows, &mut text, budget, 0)?;
@@ -1276,22 +1555,37 @@ fn eval_contains(
             }
         }
     }
-    if hits.is_empty() {
-        return Ok(tri);
-    }
-
-    let occ_rows = cell_rows(plan, rows.json_streams(), &rows.variant_ids, &want)?;
-    for (cid, occs) in hits {
-        let at = &occ_rows[cid];
-        if rows.col(cid, budget)?.len() != at.len() {
-            return Err(Error::Format(
-                "column occurrences do not match the row structure".into(),
-            ));
-        }
-        occs.iter()
-            .for_each(|&occ| tri[at[occ as usize] as usize] = YES);
-    }
     Ok(tri)
+}
+
+/// Appends the text a Base64 candidate's value encodes.
+fn b64_text(
+    map: &JsonBlockMap,
+    ev: &PathEvent,
+    rows: &mut BlockRows<'_>,
+    out: &mut Vec<u8>,
+    budget: &DecodeBudget,
+) -> Result<()> {
+    let jt = rows.plan.json_tree.as_ref().ok_or_else(underflow)?;
+    let (PathVal::Derived { cand, srcs }, Some(p)) = (ev.val, jt.paths.get(ev.path as usize))
+    else {
+        return Err(underflow());
+    };
+    let Some(JsonCand::MultiConcat { lits, refs, .. }) = p.cands.get(cand as usize) else {
+        return Err(underflow());
+    };
+    out.extend_from_slice(&lits[0]);
+    for k in 0..refs.len() {
+        let src = map.srcs[srcs as usize + k];
+        let at = out.len();
+        materialize(map, &map.events[src as usize], rows, out, budget, 1)?;
+        if out.len() - at >= 2 && out[at] == b'"' && out[out.len() - 1] == b'"' {
+            out.pop();
+            out.remove(at);
+        }
+        out.extend_from_slice(&lits[k + 1]);
+    }
+    Ok(())
 }
 
 /// By column of `want`, the row of each of its cells, as JSON and shape rows place them. Cells
@@ -1648,15 +1942,15 @@ mod tests {
             let body = enc.split(|&c| c == b'=').next().unwrap();
             for s in 0..body.len() {
                 for e in s + 1..=body.len() {
-                    assert!(b64_may_hold(&body[s..e]), "{:?}", &body[s..e]);
+                    assert!(b64_cores(&body[s..e]).is_some(), "{:?}", &body[s..e]);
                 }
             }
-            assert!(b64_may_hold(&enc));
+            assert!(b64_cores(&enc).is_some());
         }
         for n in ["clickhouse", "terminating", "kgDOexc", "2024", "main"] {
-            assert!(!b64_may_hold(n.as_bytes()), "{n}");
+            assert!(b64_cores(n.as_bytes()).is_none(), "{n}");
         }
-        assert!(!b64_may_hold(b"a.b"));
+        assert!(b64_cores(b"a.b").is_none());
     }
 
     #[test]

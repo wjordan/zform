@@ -465,6 +465,38 @@ mod tests {
     }
 
     #[test]
+    fn needles_beside_derived_text_rebuild_no_record() {
+        // The avatar's digit is a free part between letters; `segfault` begins with the letter
+        // its literal ends in, and `avatar_url` is shape text.
+        let mut raw = Vec::new();
+        for i in 0..400u64 {
+            let uid = 10_000 + i * 7919 % 900_000;
+            let msg = if i % 50 == 7 { "segfault at" } else { "ok at" };
+            raw.extend_from_slice(
+                format!(
+                    "{{\"login\":\"dev{}\",\"id\":{uid},\"avatar_url\":\"https://avatars{}.cdn.test/u/{uid}?v=4\",\"msg\":\"{msg} {i}\"}}\n",
+                    i % 23,
+                    i % 13
+                )
+                .as_bytes(),
+            );
+        }
+        let comp = assert_roundtrip(&raw, &PackOptions::default());
+        let recs = lines(&raw);
+        for pred in [
+            contains("segfault"),
+            contains("avatar_url"),
+            contains("avatars12."),
+            contains("s1"),
+            word("2"),
+            word("avatars1"),
+        ] {
+            let (_, stats) = assert_grep(&comp, &recs, &pred);
+            assert_eq!(stats.rebuilt, 0, "{pred:?}");
+        }
+    }
+
+    #[test]
     fn base64_and_free_part_values_answer_queries() {
         // A Base64 node id over the sibling id, an avatar with a varying digit, a url whose
         // number comes later; some rows fit none of these.

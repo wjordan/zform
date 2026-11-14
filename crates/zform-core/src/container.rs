@@ -43,7 +43,7 @@ pub const DEFAULT_BLOCK_ROWS: usize = 65_536;
 pub const DEFAULT_BLOCK_BYTES: usize = 8 << 20;
 /// Largest substring filter of one block, in bits. A filter shrinks to fit what its block holds.
 pub const DEFAULT_FILTER_BITS: usize = 1 << 17;
-pub const DEFAULT_POOL_PAGE_BYTES: usize = 192 << 10;
+pub const DEFAULT_POOL_PAGE_BYTES: usize = 384 << 10;
 
 #[derive(Debug, Clone)]
 pub struct PackOptions {
