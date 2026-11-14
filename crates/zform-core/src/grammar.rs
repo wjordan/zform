@@ -949,7 +949,12 @@ pub fn tokenize_template_line(line: &[u8]) -> Vec<(usize, usize, SlotClass)> {
 
 fn try_scan_timestamp_at(line: &[u8], i: usize) -> Option<(usize, SlotClass)> {
     let rem = &line[i..];
-    if rem.len() >= 19 && rem[4] == b'-' && rem[7] == b'-' && rem[13] == b':' && rem[16] == b':' {
+    if rem.len() >= 19
+        && rem[4] == b'-'
+        && rem[7] == b'-'
+        && matches!(rem[13], b':' | b'.')
+        && rem[16] == rem[13]
+    {
         let mut e = 19usize;
         if e < rem.len() && (rem[e] == b'.' || rem[e] == b',') {
             e += 1;
@@ -1529,31 +1534,67 @@ impl BlockReconstructor {
         ctx: &mut BlockDecodeCtx<'_>,
         budget: &DecodeBudget,
     ) -> Result<()> {
-        let var = plan
-            .variants
-            .get(variant_id as usize)
-            .ok_or_else(|| Error::Format(format!("variant_id {variant_id} out of range")))?;
-        match var {
-            PlanVariant::Shape(s) => s.slots.iter().for_each(|&c| self.col_pos[c as usize] += 1),
-            PlanVariant::ShapeCell { col, cols } => {
-                let (ci, si) = self.cell_shape((variant_id, *col, cols), plan, ctx, budget)?;
-                for &c in &self.cell_shapes[ci].shapes[si].slots {
-                    self.col_pos[c as usize] += 1;
+        self.skip_rows(&[variant_id], plan, ctx, budget)
+    }
+
+    /// `skip_next` across rows of variants `vids`; a run of JSON rows is skipped at once.
+    pub fn skip_rows(
+        &mut self,
+        vids: &[u32],
+        plan: &ModelPlan,
+        ctx: &mut BlockDecodeCtx<'_>,
+        budget: &DecodeBudget,
+    ) -> Result<()> {
+        let mut json = 0;
+        for &variant_id in vids {
+            let var = plan
+                .variants
+                .get(variant_id as usize)
+                .ok_or_else(|| Error::Format(format!("variant_id {variant_id} out of range")))?;
+            match var {
+                PlanVariant::JsonTree => json += 1,
+                PlanVariant::Shape(s) => {
+                    s.slots.iter().for_each(|&c| self.col_pos[c as usize] += 1)
+                }
+                PlanVariant::ShapeCell { col, cols } => {
+                    // The shape cell is read at its place among the rows before it.
+                    self.skip_json(std::mem::take(&mut json), plan, budget)?;
+                    let (ci, si) = self.cell_shape((variant_id, *col, cols), plan, ctx, budget)?;
+                    for &c in &self.cell_shapes[ci].shapes[si].slots {
+                        self.col_pos[c as usize] += 1;
+                    }
                 }
             }
-            PlanVariant::JsonTree => {
-                let jt = plan
-                    .json_tree
-                    .as_ref()
-                    .ok_or_else(|| Error::Format("JsonTree variant without JsonTreePlan".into()))?;
-                let jr = self
-                    .json_rec
-                    .as_mut()
-                    .ok_or_else(|| Error::Format("missing JsonTreeBlockReconstructor".into()))?;
-                jr.skip_row(jt, &mut self.col_pos, budget)?;
-            }
         }
-        Ok(())
+        self.skip_json(json, plan, budget)
+    }
+
+    /// The column and structure cursors, to `reset` to.
+    pub fn mark(&self) -> (Vec<usize>, Vec<usize>) {
+        let streams = self.json_rec.as_ref().map(|j| j.struct_pos.clone());
+        (self.col_pos.clone(), streams.unwrap_or_default())
+    }
+
+    pub fn reset(&mut self, (cols, streams): (Vec<usize>, Vec<usize>)) {
+        self.col_pos = cols;
+        if let Some(j) = self.json_rec.as_mut() {
+            j.struct_pos = streams;
+        }
+    }
+
+    fn skip_json(&mut self, n: usize, plan: &ModelPlan, budget: &DecodeBudget) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        let jt = plan
+            .json_tree
+            .as_ref()
+            .ok_or_else(|| Error::Format("JsonTree variant without JsonTreePlan".into()))?;
+        let jr = self
+            .json_rec
+            .as_mut()
+            .ok_or_else(|| Error::Format("missing JsonTreeBlockReconstructor".into()))?;
+        jr.skip_rows(n, jt, &mut self.col_pos, budget)
     }
 }
 
@@ -1686,6 +1727,22 @@ mod tests {
         let vars = split.variant_ids.iter();
         let vars = vars.map(|&v| model.variants[v as usize].clone()).collect();
         (model, vars)
+    }
+
+    #[test]
+    fn first_timestamp_shares_a_column_after_variable_prefixes() {
+        let rows: Vec<Vec<u8>> = (0..16)
+            .map(|i| {
+                let msg = if i < 8 { "boot task" } else { "exit code" };
+                format!("{} 2024-02-29-23.59.{i:02}.123456 {msg} {}", 100 + i, i * 3)
+                    .into_bytes()
+            })
+            .collect();
+        let rows: Vec<&[u8]> = rows.iter().map(|r| r.as_slice()).collect();
+        let (plan, _) = round_trip(&rows, &rows);
+        let timestamps: Vec<_> = plan.columns.iter().filter(|c| c.name.starts_with("$ts.")).collect();
+        assert_eq!(timestamps.len(), 1);
+        assert_eq!(timestamps[0].name, "$ts.0");
     }
 
     #[test]

@@ -1167,7 +1167,6 @@ impl<'f> Session<'f> {
         if !missing.is_empty() {
             return Ok(Step::Missing(missing));
         }
-        let mut rec = Vec::new();
         for (&b, paged) in blocks.iter().zip(paged) {
             let (e, first) = (&file.root.blocks[b], file.starts[b]);
             let sel = rows.within(first, first + e.rows).flat_map(|(s, t)| s..t);
@@ -1193,15 +1192,13 @@ impl<'f> Session<'f> {
                 }
                 None => BlockRows::open(src.get(whole(e)).unwrap(), e.rows as usize, plan, budget)?,
             };
-            for r in sel {
-                block.seek(r as usize, budget)?;
-                rec.clear();
-                block.emit(&mut rec, budget).map_err(|err| match err {
+            let sel: Vec<usize> = sel.map(|r| r as usize).collect();
+            block
+                .emit_rows(&sel, budget, |r, rec| f(first + r as u64, rec))
+                .map_err(|err| match err {
                     Error::NotLoaded => Error::Format("row page map misses a page".into()),
                     err => err,
                 })?;
-                f(first + r as u64, &rec)?;
-            }
             self.stats.blocks_partial += usize::from(paged.is_some());
             self.stats.blocks_whole += usize::from(paged.is_none());
         }

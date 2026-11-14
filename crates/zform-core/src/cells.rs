@@ -122,7 +122,7 @@ pub(crate) fn ends_of(lens: &[u32], total: usize) -> Result<Vec<u32>> {
     Ok(ends)
 }
 
-/// The span of a paged cell in a page not held, which reads as `NotLoaded`.
+/// The span of a paged cell not held, which reads as `NotLoaded`.
 pub(crate) const NOT_HELD: (u32, u32) = (u32::MAX, 0);
 
 /// Marks a `Quoted` cell that is the bare token `null`.
@@ -200,8 +200,8 @@ pub enum Col {
         base: usize,
         ends: Vec<u32>,
     },
-    /// Cells at `(start, end)` in the block's paged text pool, `NOT_HELD` for one in a page
-    /// not held.
+    /// Cells at `(start, end)` in the block's paged text pool, or in a pool of only the cells a
+    /// reader asked for; `NOT_HELD` for one not held.
     Paged {
         pool: Arc<Pool>,
         spans: Vec<(u32, u32)>,

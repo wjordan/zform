@@ -663,7 +663,9 @@ fn train_templates_arm<'a>(rows: &[&'a [u8]], opts: &TrainOptions, plan: &mut Mo
 
             let (base_key, group) = if cls == SlotClass::Int && prev_lit.ends_with(b"blk_") {
                 ("$blk_id".to_string(), "blk_id")
-            } else if cls == SlotClass::Timestamp && si == 0 {
+            } else if cls == SlotClass::Timestamp
+                && !classes[..si].contains(&SlotClass::Timestamp)
+            {
                 ("$ts.0".to_string(), "")
             } else if cls == SlotClass::IpPort {
                 let pk = sanitize_ctx_bytes(prev_tail);

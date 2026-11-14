@@ -1334,6 +1334,10 @@ pub struct JsonTreeBlockReconstructor {
     pub struct_pos: Vec<usize>,
     scope_ranges: Vec<Option<(usize, usize)>>,
     tmp: Vec<u8>,
+    /// `skip_order` of the tree, once a skip needs it.
+    order: Option<Option<Vec<u16>>>,
+    /// By path: value visits and array visits, for `skip_rows`.
+    visits: (Vec<usize>, Vec<usize>),
 }
 
 impl JsonTreeBlockReconstructor {
@@ -1344,6 +1348,8 @@ impl JsonTreeBlockReconstructor {
             struct_pos: vec![0usize; ns],
             scope_ranges: vec![None; n_paths],
             tmp: Vec::new(),
+            order: None,
+            visits: Default::default(),
         }
     }
 
@@ -1524,14 +1530,115 @@ impl JsonTreeBlockReconstructor {
         Ok(())
     }
 
-    /// Advances `struct_pos` and `col_pos` across one skipped JSON row without touching `col_vals`!
-    pub fn skip_row(
+    /// Advances `struct_pos` and `col_pos` across `n` skipped JSON rows, reading no column.
+    ///
+    /// Paths go parent first, each taking its visits' worth of its own stream at once: a shape
+    /// stream is counted by shape and each shape's parts handed their share, a count stream is
+    /// summed into its elements' visits. Row by row, every part of every shape is touched.
+    pub fn skip_rows(
         &mut self,
+        n: usize,
         jt: &JsonTreePlan,
         col_pos: &mut [usize],
         budget: &DecodeBudget,
     ) -> Result<()> {
-        self.skip_path(0, jt, col_pos, budget, 0)
+        let order = self.order.take().unwrap_or_else(|| skip_order(jt));
+        let res = match &order {
+            Some(o) => self.skip_counted(n, o, jt, col_pos, budget),
+            None => (0..n).try_for_each(|_| self.skip_path(0, jt, col_pos, budget, 0)),
+        };
+        self.order = Some(order);
+        res
+    }
+
+    fn skip_counted(
+        &mut self,
+        n: usize,
+        order: &[u16],
+        jt: &JsonTreePlan,
+        col_pos: &mut [usize],
+        budget: &DecodeBudget,
+    ) -> Result<()> {
+        let np = jt.paths.len();
+        // By path: times its value is visited, and times it is visited as an array.
+        let (visits, arrays) = &mut self.visits;
+        visits.clear();
+        visits.resize(np, 0);
+        arrays.clear();
+        arrays.resize(np, 0);
+        visits[0] = n;
+        let mut hist = [0usize; 257];
+        for &p in order {
+            let p = p as usize;
+            let (v, a) = (visits[p], arrays[p]);
+            let pdef = &jt.paths[p];
+            let mut stored = 0;
+            if v > 0 && pdef.shapes.is_empty() {
+                stored = v;
+                if !pdef.cands.is_empty() {
+                    let sels = take(&self.struct_streams, &mut self.struct_pos, pdef.sel_stream, v)?;
+                    for &s in sels {
+                        let s = s as usize;
+                        if s > pdef.cands.len() {
+                            return Err(Error::Format("JsonTree sel out of range".into()));
+                        }
+                        hist[s] += 1;
+                    }
+                    stored = hist[0];
+                    for (c, h) in pdef.cands.iter().zip(&mut hist[1..]) {
+                        stored += if c.has_free(p) { *h } else { 0 };
+                        *h = 0;
+                    }
+                    hist[0] = 0;
+                }
+            } else if v > 0 {
+                let ids = take(&self.struct_streams, &mut self.struct_pos, pdef.shape_stream, v)?;
+                for &s in ids {
+                    let s = s as usize;
+                    if s > pdef.shapes.len() {
+                        return Err(Error::Format("JsonTree shape_id out of bounds".into()));
+                    }
+                    hist[s] += 1;
+                }
+                stored = std::mem::take(&mut hist[0]);
+                for (shape, h) in pdef.shapes.iter().zip(&mut hist[1..]) {
+                    let h = std::mem::take(h);
+                    if h == 0 {
+                        continue;
+                    }
+                    for part in shape {
+                        let kid = part.path_idx as usize;
+                        match part.kind {
+                            SlotKind::None => {}
+                            SlotKind::Array => arrays[kid] += h,
+                            _ => visits[kid] += h,
+                        }
+                    }
+                }
+            }
+            if stored > 0
+                && let Some(c) = col_pos.get_mut(pdef.value_col as usize)
+            {
+                *c += stored;
+            }
+            if a > 0 {
+                let counts = take(&self.struct_streams, &mut self.struct_pos, pdef.count_stream, a)?;
+                let mut elems = 0usize;
+                for &c in counts {
+                    if c as usize > budget.max_records_per_block {
+                        return Err(Error::BudgetExceeded("JsonTree array count"));
+                    }
+                    elems += c as usize;
+                }
+                if elems > 0 {
+                    let e = visits
+                        .get_mut(pdef.elem_path as usize)
+                        .ok_or_else(|| Error::Format("JsonTree array without elements".into()))?;
+                    *e += elems;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn skip_path(
@@ -1605,6 +1712,66 @@ impl JsonTreeBlockReconstructor {
         }
         Ok(())
     }
+}
+
+/// The next `n` values of structure stream `si`.
+fn take<'s>(streams: &'s [Vec<u32>], pos: &mut [usize], si: u16, n: usize) -> Result<&'s [u32]> {
+    let si = si as usize;
+    let (Some(s), Some(at)) = (streams.get(si), pos.get_mut(si)) else {
+        return Err(Error::Format("json struct stream index out of bounds".into()));
+    };
+    let vals = s
+        .get(*at..*at + n)
+        .ok_or_else(|| Error::Format("json struct stream underflow".into()))?;
+    *at += n;
+    Ok(vals)
+}
+
+/// Paths in an order that puts each after every path that can lead to it, for counting visits;
+/// `None` when the tree allows none, or two paths read one stream and so share its order.
+fn skip_order(jt: &JsonTreePlan) -> Option<Vec<u16>> {
+    let n = jt.paths.len();
+    let mut kids: Vec<Vec<u16>> = vec![Vec::new(); n];
+    let mut array = vec![false; n];
+    for (p, pdef) in jt.paths.iter().enumerate() {
+        for part in pdef.shapes.iter().flatten() {
+            if part.kind != SlotKind::None {
+                kids[p].push(part.path_idx);
+                array[part.path_idx as usize] |= part.kind == SlotKind::Array;
+            }
+        }
+    }
+    let mut owner = vec![false; jt.n_struct_streams];
+    let mut claim = |s: u16| match owner.get_mut(s as usize) {
+        Some(o) => !std::mem::replace(o, true),
+        None => true,
+    };
+    for (p, pdef) in jt.paths.iter().enumerate() {
+        let own = match pdef.shapes.is_empty() {
+            true => pdef.cands.is_empty() || claim(pdef.sel_stream),
+            false => claim(pdef.shape_stream),
+        };
+        if !own || (array[p] && !claim(pdef.count_stream)) {
+            return None;
+        }
+        if array[p] && (pdef.elem_path as usize) < n {
+            kids[p].push(pdef.elem_path);
+        }
+    }
+    let mut ins = vec![0u32; n];
+    kids.iter().flatten().for_each(|&k| ins[k as usize] += 1);
+    let mut order: Vec<u16> = (0..n as u16).filter(|&p| ins[p as usize] == 0).collect();
+    let mut i = 0;
+    while i < order.len() {
+        for &k in &kids[order[i] as usize] {
+            ins[k as usize] -= 1;
+            if ins[k as usize] == 0 {
+                order.push(k);
+            }
+        }
+        i += 1;
+    }
+    (order.len() == n).then_some(order)
 }
 
 /// Appends the next unread cell of value column `cid` as it appears in the record.

@@ -1361,6 +1361,30 @@ fn iso_timestamps_patch_other_layouts_and_impossible_dates() {
 }
 
 #[test]
+fn numeric_timestamps_preserve_clock_separators_and_exceptions() {
+    let t0 = secs_of(2024, 2, 28, 23, 59, 57);
+    for sep in ['T', 't', ' ', '-'] {
+        for clock_sep in [b':', b'.'] {
+            let mut rows: Vec<Vec<u8>> = (0..16)
+                .map(|i| {
+                    let mut row = iso(t0 + i, sep, Some(('.', 6, i as u64 * 13_727)), "")
+                        .into_bytes();
+                    row[13] = clock_sep;
+                    row[16] = clock_sep;
+                    row
+                })
+                .collect();
+            rows[7] = b"2023-02-29-00.00.00.000000".to_vec();
+            roundtrip(&TimestampIsoPack, &refs(&rows));
+        }
+    }
+    refuses_strs(
+        &TimestampIsoPack,
+        &["2024-02-29-00.00:00.000000"; 4],
+    );
+}
+
+#[test]
 fn iso_timestamps_refuse_short_or_foreign_columns() {
     refuses_strs(&TimestampIsoPack, &["2024-01-01T00:00:00Z"; 3]);
     refuses_strs(

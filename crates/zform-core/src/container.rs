@@ -1503,22 +1503,58 @@ impl<'a> BlockRows<'a> {
             .reconstruct_next(vid, self.plan, &mut self.ctx, out, budget)
     }
 
-    /// Moves past the row under the cursor.
-    pub fn skip(&mut self, budget: &DecodeBudget) -> Result<()> {
-        let &vid = self
-            .variant_ids
-            .get(self.next)
-            .ok_or_else(|| Error::Format("block row underflow".into()))?;
-        self.next += 1;
-        self.recon.skip_next(vid, self.plan, &mut self.ctx, budget)
+    /// Calls `f(row, record)` for each of `rows`, ascending, from the cursor on. Columns are
+    /// built only as far as these rows read them, which takes the cursors around each row first.
+    pub fn emit_rows(
+        &mut self,
+        rows: &[usize],
+        budget: &DecodeBudget,
+        mut f: impl FnMut(usize, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        // Marks cost a copy of the cursors each; a reader of many rows reads most cells anyway.
+        let marks = match rows.len() <= 64 {
+            true => {
+                let (mut marks, mut read) = (Vec::new(), Vec::new());
+                for &r in rows {
+                    self.seek(r, budget)?;
+                    let m = self.recon.mark();
+                    self.seek(r + 1, budget)?;
+                    read.push((m.0.clone(), self.recon.mark().0));
+                    marks.push(m);
+                }
+                self.ctx.read_only(read);
+                marks
+            }
+            false => Vec::new(),
+        };
+        let mut marks = marks.into_iter();
+        let mut rec = Vec::new();
+        for &r in rows {
+            match marks.next() {
+                Some(m) => {
+                    self.recon.reset(m);
+                    self.next = r;
+                }
+                None => self.seek(r, budget)?,
+            }
+            rec.clear();
+            self.emit(&mut rec, budget)?;
+            f(r, &rec)?;
+        }
+        Ok(())
     }
 
     /// Moves the cursor forward to `row`.
     pub fn seek(&mut self, row: usize, budget: &DecodeBudget) -> Result<()> {
-        while self.next < row {
-            self.skip(budget)?;
+        if row <= self.next {
+            return Ok(());
         }
-        Ok(())
+        let vids = self
+            .variant_ids
+            .get(self.next..row)
+            .ok_or_else(|| Error::Format("block row underflow".into()))?;
+        self.next = row;
+        self.recon.skip_rows(vids, self.plan, &mut self.ctx, budget)
     }
 }
 

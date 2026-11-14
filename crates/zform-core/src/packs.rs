@@ -116,9 +116,9 @@ impl ColumnProfile {
             if (19..=36).contains(&len)
                 && r[4] == b'-'
                 && r[7] == b'-'
-                && matches!(r[10], b'T' | b't' | b' ')
-                && r[13] == b':'
-                && r[16] == b':'
+                && matches!(r[10], b'T' | b't' | b' ' | b'-')
+                && matches!(r[13], b':' | b'.')
+                && r[16] == r[13]
             {
                 p.any_iso_ts = true;
             }
@@ -2039,12 +2039,13 @@ impl CodecPack for PythonMtPack {
     }
 }
 
-/// Pack 5: Generalized ISO-8601 timestamps (`YYYY-MM-DD[T|t| ]HH:MM:SS[(.|,)f{1..9}][Z|z|±HH:MM|±HHMM]`).
+/// Pack 5: Numeric calendar timestamps, including ISO-8601 and dotted clocks.
 pub struct TimestampIsoPack;
 
 #[derive(Clone, PartialEq, Eq)]
 struct IsoLayout {
     sep: u8,
+    clock_sep: u8,
     frac_sep: u8,
     frac_digits: u8,
     tz_len: u8,
@@ -2075,11 +2076,15 @@ impl TimestampIsoPack {
         if !(19..=36).contains(&s.len()) {
             return None;
         }
-        if s[4] != b'-' || s[7] != b'-' || s[13] != b':' || s[16] != b':' {
+        if s[4] != b'-'
+            || s[7] != b'-'
+            || !matches!(s[13], b':' | b'.')
+            || s[16] != s[13]
+        {
             return None;
         }
         let sep = s[10];
-        if !matches!(sep, b'T' | b't' | b' ') {
+        if !matches!(sep, b'T' | b't' | b' ' | b'-') {
             return None;
         }
         let y = Self::parse_two(&s[0..2])? * 100 + Self::parse_two(&s[2..4])?;
@@ -2159,6 +2164,7 @@ impl TimestampIsoPack {
         Some((
             IsoLayout {
                 sep,
+                clock_sep: s[13],
                 frac_sep,
                 frac_digits,
                 tz_len: tz.len() as u8,
@@ -2239,10 +2245,10 @@ impl TimestampIsoPack {
         let s1 = b.ri(
             Op::OrI,
             s1_digits,
-            ((layout.sep as i64) << 16) | ((b':' as i64) << 40),
+            ((layout.sep as i64) << 16) | ((layout.clock_sep as i64) << 40),
         );
 
-        let s2 = b.ri(Op::OrI, b.ri(Op::ShlI, sc, 8), b':' as i64);
+        let s2 = b.ri(Op::OrI, b.ri(Op::ShlI, sc, 8), layout.clock_sep as i64);
         let mut sinks = vec![(s0, 8u8), (s1, 8u8), (s2, 3u8)];
 
         if has_frac {

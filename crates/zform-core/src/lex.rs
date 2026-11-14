@@ -310,12 +310,15 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
 /// - `bits 4..8`: fractional digit width (`0..=9`)
 /// - `bits 8..11`: tz style (`0 = none`, `1 = 'Z'`, `2 = 'z'`, `3 = ±HH:MM`, `4 = ±HHMM`, `5 = -00:00`, `6 = -0000`)
 /// - `bits 11..19`: signed tz offset in 15-minute increments (`i8 as u8`, `-64..=64`)
+/// - `bit 19`: numeric date/time separator is `'-'`
+/// - `bit 20`: numeric date/time separator is `'t'`
+/// - `bit 21`: numeric clock separator is `'.'`
 pub fn parse_timestamp(src: &[u8]) -> Option<(i64, u32)> {
     let cand = if src.len() >= 19
         && src[4] == b'-'
         && src[7] == b'-'
-        && src[13] == b':'
-        && src[16] == b':'
+        && matches!(src[13], b':' | b'.')
+        && src[16] == src[13]
     {
         parse_iso8601(src)
     } else if src.len() == 26 && src[2] == b'/' && src[6] == b'/' && src[11] == b':' {
@@ -346,9 +349,11 @@ fn parse_iso8601(src: &[u8]) -> Option<(i64, u32)> {
     let y = parse_4d(&src[0..4])?;
     let m = parse_2d(&src[5..7])?;
     let d = parse_2d(&src[8..10])?;
-    let sep_space = match src[10] {
+    let sep_bits = match src[10] {
         b'T' => 0u32,
-        b' ' => 1u32,
+        b' ' => 1 << 2,
+        b'-' => 1 << 19,
+        b't' => 1 << 20,
         _ => return None,
     };
     let hh = parse_2d(&src[11..13])?;
@@ -423,7 +428,8 @@ fn parse_iso8601(src: &[u8]) -> Option<(i64, u32)> {
     let epoch_ns = utc_secs
         .checked_mul(1_000_000_000)?
         .checked_add(subsec_ns)?;
-    let layout = (sep_space << 2)
+    let layout = sep_bits
+        | (u32::from(src[13] == b'.') << 21)
         | (frac_comma << 3)
         | (frac_len << 4)
         | (tz_style << 8)
@@ -525,16 +531,25 @@ pub fn format_timestamp(epoch_ns: i64, layout: u32, out: &mut Vec<u8>) {
 
     match kind {
         0 => {
+            let clock_sep = if layout & (1 << 21) != 0 { b'.' } else { b':' };
             push_4d(out, y);
             out.push(b'-');
             push_2d(out, m);
             out.push(b'-');
             push_2d(out, d);
-            out.push(if flag2 != 0 { b' ' } else { b'T' });
+            out.push(if layout & (1 << 19) != 0 {
+                b'-'
+            } else if layout & (1 << 20) != 0 {
+                b't'
+            } else if flag2 != 0 {
+                b' '
+            } else {
+                b'T'
+            });
             push_2d(out, hh);
-            out.push(b':');
+            out.push(clock_sep);
             push_2d(out, mm);
-            out.push(b':');
+            out.push(clock_sep);
             push_2d(out, ss);
             if (1..=9).contains(&frac_len) {
                 out.push(if frac_comma != 0 { b',' } else { b'.' });
@@ -1045,6 +1060,28 @@ mod tests {
                 parse_base64(text.as_bytes(), &mut Vec::new()).is_none(),
                 "{text}"
             );
+        }
+    }
+
+    #[test]
+    fn numeric_timestamp_separators_preserve_time_and_bytes() {
+        let expected = parse_timestamp(b"2024-02-29T23:59:59.123456+05:30").unwrap().0;
+        for sep in ['T', 't', ' ', '-'] {
+            for clock_sep in [':', '.'] {
+                let text = format!("2024-02-29{sep}23{clock_sep}59{clock_sep}59.123456+05:30");
+                let (ns, layout) = parse_timestamp(text.as_bytes()).unwrap();
+                assert_eq!(ns, expected);
+                let mut back = Vec::new();
+                format_timestamp(ns, layout, &mut back);
+                assert_eq!(back, text.as_bytes());
+            }
+        }
+        for text in [
+            "2023-02-29-23.59.59.123456",
+            "2024-02-29-23.59:59.123456",
+            "2024-02-29-23.59.59.123456x",
+        ] {
+            assert!(parse_timestamp(text.as_bytes()).is_none(), "{text}");
         }
     }
 

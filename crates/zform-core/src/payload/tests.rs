@@ -1304,6 +1304,38 @@ fn dictionary_columns_decode_to_lazy_dictionary_views() {
 }
 
 #[test]
+fn a_reader_of_some_cells_gets_only_those_built() {
+    use super::graph::ExtInputs;
+    use crate::wire::Error;
+    let budget = DecodeBudget::default();
+    let vals: Vec<i64> = (0..3000).map(|i| (i * 7919) % 100_003 - 500).collect();
+    let reads = [(3, 5), (700, 701)];
+    for deltas in [false, true] {
+        let mut gb = GraphBuilder::new(vals.len());
+        let ints = gb.add_ints(&vals);
+        let mut root = gb.add_prog_cells(prog_fmt_int(deltas, 7), vec![ints], vec![]);
+        if !deltas {
+            root = gb.add_quote_or_null(root, None);
+        }
+        let graph = PayloadGraph::decode(&gb.finish(root).encode(), &budget).unwrap();
+        let ext = ExtInputs::empty();
+        let whole = CoreDecoder::decode_col(&graph, &ext, &budget).unwrap();
+        let some = CoreDecoder::decode_col_reading(&graph, &ext, &budget, Some(&reads)).unwrap();
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        for r in [3, 4, 700] {
+            assert_eq!(some.get(r, &mut a).unwrap(), whole.get(r, &mut b).unwrap());
+        }
+        // Nothing past the last read is built; a program without scans skips the gaps too.
+        assert_eq!(some.len(), 701, "deltas={deltas}");
+        let gap = some.get(5, &mut a).map(<[u8]>::to_vec);
+        match deltas {
+            true => assert_eq!(gap.unwrap(), whole.get(5, &mut b).unwrap()),
+            false => assert!(matches!(gap, Err(Error::NotLoaded))),
+        }
+    }
+}
+
+#[test]
 fn templates_from_columns_and_shared_constants_match_per_row_expansion() {
     let rows: Vec<&[u8]> = vec![b"a\x1f\x00b", b"\x1f\x02-\x1f\x00", b"plain"];
     let mut gb = GraphBuilder::new(3);

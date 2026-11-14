@@ -16,7 +16,7 @@ use crate::wire::{
 };
 
 use super::engine::CompiledProgram;
-use super::ir::{Builder, Invalid, Len, Program, TableBuf, Width};
+use super::ir::{Builder, Invalid, Len, Op, Program, TableBuf, Width};
 use super::library::{Code, Library, code_discount, table_bytes};
 use super::recur::{CompiledRecurrence, RecurrenceSpec};
 
@@ -2609,6 +2609,7 @@ impl CoreDecoder {
             budget,
             &vec![false; graph.nodes.len()],
             &mut uses,
+            &[],
         )?;
         match std::mem::replace(&mut values[graph.root as usize], Val::Empty) {
             Val::Ints(values) if values.len() == rows => Ok(values),
@@ -2637,6 +2638,18 @@ impl CoreDecoder {
         graph: &PayloadGraph,
         ext: &ExtInputs<'_>,
         budget: &DecodeBudget,
+    ) -> Result<Col> {
+        Self::decode_col_reading(graph, ext, budget, None)
+    }
+
+    /// [`Self::decode_col`] for a reader of only the cells in `reads`, ascending `(start, end)`
+    /// ranges. A column built row by row stops after the last; one built by a program without
+    /// scans builds just those, and its other cells are `NotLoaded`. Any other column is whole.
+    pub fn decode_col_reading(
+        graph: &PayloadGraph,
+        ext: &ExtInputs<'_>,
+        budget: &DecodeBudget,
+        reads: Option<&[(usize, usize)]>,
     ) -> Result<Col> {
         let rows = graph.rows as usize;
         if rows == 0 {
@@ -2686,9 +2699,43 @@ impl CoreDecoder {
             }
         }
 
-        let mut vals = Self::execute_nodes(&graph.nodes, rows, ext, budget, &skip, &mut rem_uses)?;
-        let col = Self::build_col(root, &graph.nodes, &skip, &mut vals, budget)?;
-        if col.len() != rows {
+        let upto = reads.and_then(|r| r.last()).map_or(usize::MAX, |r| r.1);
+        // The program that builds the cells, when it builds each from its own row alone.
+        let sparse = reads.and_then(|_| {
+            let t = match &graph.nodes[root] {
+                GraphNode::QuoteOrNull { inner, map: None } if rem_uses[*inner as usize] == 1 => {
+                    *inner as usize
+                }
+                _ => root,
+            };
+            let GraphNode::ProgramCells { prog, .. } = &graph.nodes[t] else {
+                return None;
+            };
+            let scans = prog.ops.iter().any(|i| {
+                matches!(i.op, Op::ScanAdd | Op::ScanXor | Op::ScanF64Add)
+            });
+            (!scans).then_some(t)
+        });
+        if let Some(t) = sparse {
+            skip[t] = true;
+        }
+        let lens = prefix_lens(&graph.nodes, root, upto);
+        let mut vals =
+            Self::execute_nodes(&graph.nodes, rows, ext, budget, &skip, &mut rem_uses, &lens)?;
+        let col = match (sparse, reads) {
+            (Some(t), Some(reads)) => {
+                let cells = sparse_cells(&graph.nodes[t], &vals, rows.min(upto), reads, budget)?;
+                match t == root {
+                    true => cells,
+                    false => Col::Quoted {
+                        inner: Box::new(cells),
+                        map: Vec::new(),
+                    },
+                }
+            }
+            _ => Self::build_col(root, &graph.nodes, &skip, &mut vals, budget)?,
+        };
+        if col.len() != rows && col.len() != rows.min(upto) {
             return Err(Error::Format("PayloadGraph root row count mismatch".into()));
         }
         Ok(col)
@@ -2823,6 +2870,7 @@ impl CoreDecoder {
         budget: &DecodeBudget,
         skip: &[bool],
         rem_uses: &mut [u32],
+        upto: &[usize],
     ) -> Result<Vec<Val>> {
         let mut vals: Vec<Val> = Vec::with_capacity(nodes.len());
         // Constant cells used only as `TemplateCells` templates are read from the node itself.
@@ -2842,6 +2890,8 @@ impl CoreDecoder {
                 vals.push(Val::Empty);
                 continue;
             }
+            // A node cut short reads the same leading rows of its row inputs.
+            let upto = upto.get(idx).copied().unwrap_or(usize::MAX);
             let val = match node {
                 GraphNode::Bytes { leaf } => Val::Buf(unpack_leaf(leaf, budget)?),
                 GraphNode::IntStream(s) => Val::Ints(s.unpack(budget)?),
@@ -3009,9 +3059,9 @@ impl CoreDecoder {
                 }
                 GraphNode::ProgramI64 { prog, inputs, bufs } => {
                     let mut in_refs = Vec::with_capacity(inputs.len());
-                    let mut n_rows = rows;
+                    let mut n_rows = rows.min(upto);
                     for &iid in inputs {
-                        let col = as_ints(&vals[iid as usize])?;
+                        let col = head(as_ints(&vals[iid as usize])?, upto);
                         if in_refs.is_empty() {
                             n_rows = col.len();
                         } else if col.len() != n_rows {
@@ -3035,9 +3085,9 @@ impl CoreDecoder {
                 }
                 GraphNode::ProgramCells { prog, inputs, bufs } => {
                     let mut in_refs = Vec::with_capacity(inputs.len());
-                    let mut n_rows = rows;
+                    let mut n_rows = rows.min(upto);
                     for &iid in inputs {
-                        let col = as_ints(&vals[iid as usize])?;
+                        let col = head(as_ints(&vals[iid as usize])?, upto);
                         if in_refs.is_empty() {
                             n_rows = col.len();
                         } else if col.len() != n_rows {
@@ -3049,42 +3099,7 @@ impl CoreDecoder {
                     for &bid in bufs {
                         tbufs.push(TableBuf::from_bytes(as_table_bytes(&vals[bid as usize])?));
                     }
-                    let rb = prog.row_bytes();
-                    let cap = n_rows
-                        .checked_mul(rb)
-                        .ok_or(Error::BudgetExceeded("ProgramCells"))?;
-                    budget.check_alloc(cap + 8, "ProgramCells")?;
-                    // Fixed-width cells of a lane's low bytes skip the program engine.
-                    if let (Some(&x), [(0, Len::Fixed(w))], true) =
-                        (in_refs.first(), &prog.sinks[..], prog.ops.is_empty())
-                    {
-                        let mut data = vec![0u8; cap];
-                        match *w {
-                            8 => fill_low_bytes::<8>(x, &mut data),
-                            4 => fill_low_bytes::<4>(x, &mut data),
-                            2 => fill_low_bytes::<2>(x, &mut data),
-                            w => {
-                                for (d, v) in data.chunks_exact_mut(w as usize).zip(x) {
-                                    d.copy_from_slice(&v.to_le_bytes()[..w as usize]);
-                                }
-                            }
-                        }
-                        Val::Cells(Cells::from_fixed(n_rows, rb, data)?)
-                    } else if !prog.varlen() {
-                        let mut data = vec![0u8; cap];
-                        CompiledProgram::with(prog, |cp| {
-                            cp.eval_fixed(&in_refs, &tbufs, n_rows, &mut data)
-                        });
-                        Val::Cells(Cells::from_fixed(n_rows, rb, data)?)
-                    } else {
-                        let mut ends = vec![0u32; n_rows];
-                        let mut data = vec![0u8; cap + 8];
-                        let written = CompiledProgram::with(prog, |cp| {
-                            cp.eval_cells(&in_refs, &tbufs, n_rows, &mut ends, &mut data)
-                        });
-                        data.truncate(written);
-                        Val::Cells(Cells::from_parts(data, ends)?)
-                    }
+                    Val::Cells(program_cells(prog, &in_refs, &tbufs, n_rows, budget)?)
                 }
                 GraphNode::PatchCells {
                     base,
@@ -3134,7 +3149,7 @@ impl CoreDecoder {
                     Val::Cells(Cells::from_parts(data, ends)?)
                 }
                 GraphNode::MtfInts { codes, misses } => {
-                    let codes_col = as_ints(&vals[*codes as usize])?;
+                    let codes_col = head(as_ints(&vals[*codes as usize])?, upto);
                     let misses_col = as_ints(&vals[*misses as usize])?;
                     budget.check_alloc(codes_col.len().saturating_mul(8), "MtfInts")?;
                     let mut ring = Recency::new(MTF_WINDOW, codes_col.len());
@@ -3155,7 +3170,7 @@ impl CoreDecoder {
                         };
                         out.push(v);
                     }
-                    if misses_it.next().is_some() {
+                    if upto == usize::MAX && misses_it.next().is_some() {
                         return Err(Error::Format("MtfInts trailing misses".into()));
                     }
                     Val::Ints(out)
@@ -3648,6 +3663,130 @@ fn as_cells(v: &Val) -> Result<&Cells> {
         Val::SharedCells(c) => Ok(c),
         _ => Err(Error::Format("expected Cells node".into())),
     }
+}
+
+fn head(col: &[i64], n: usize) -> &[i64] {
+    &col[..col.len().min(n)]
+}
+
+/// By node: how many leading rows of its output are read when the root's first `upto` are.
+/// Rows flow one to one only through programs, whose scans run forward, the codes of `MtfInts`
+/// and a quote without a map; any other input is read whole (`usize::MAX`, as is every node
+/// when the list is empty).
+fn prefix_lens(nodes: &[GraphNode], root: usize, upto: usize) -> Vec<usize> {
+    if upto == usize::MAX || root >= nodes.len() {
+        return Vec::new();
+    }
+    let mut lens = vec![0usize; nodes.len()];
+    lens[root] = upto;
+    for idx in (0..nodes.len()).rev() {
+        // Unreachable from the root: run whole, as before.
+        if lens[idx] == 0 {
+            lens[idx] = usize::MAX;
+        }
+        let n = lens[idx];
+        let mut need = |d: u16, n: usize| {
+            if let Some(l) = lens.get_mut(d as usize) {
+                *l = (*l).max(n);
+            }
+        };
+        match &nodes[idx] {
+            GraphNode::ProgramI64 { inputs, bufs, .. }
+            | GraphNode::ProgramCells { inputs, bufs, .. } => {
+                inputs.iter().for_each(|&d| need(d, n));
+                bufs.iter().for_each(|&d| need(d, usize::MAX));
+            }
+            GraphNode::MtfInts { codes, misses } => {
+                need(*codes, n);
+                need(*misses, usize::MAX);
+            }
+            GraphNode::QuoteOrNull { inner, map: None } => need(*inner, n),
+            node => node.for_each_dep(|d| need(d, usize::MAX)),
+        }
+    }
+    lens
+}
+
+/// The cells of `n_rows` rows a program builds from its inputs' rows.
+fn program_cells(
+    prog: &Code,
+    in_refs: &[&[i64]],
+    tbufs: &[TableBuf<'_>],
+    n_rows: usize,
+    budget: &DecodeBudget,
+) -> Result<Cells> {
+    let rb = prog.row_bytes();
+    let cap = n_rows
+        .checked_mul(rb)
+        .ok_or(Error::BudgetExceeded("ProgramCells"))?;
+    budget.check_alloc(cap + 8, "ProgramCells")?;
+    // Fixed-width cells of a lane's low bytes skip the program engine.
+    if let (Some(&x), [(0, Len::Fixed(w))], true) =
+        (in_refs.first(), &prog.sinks[..], prog.ops.is_empty())
+    {
+        let mut data = vec![0u8; cap];
+        match *w {
+            8 => fill_low_bytes::<8>(x, &mut data),
+            4 => fill_low_bytes::<4>(x, &mut data),
+            2 => fill_low_bytes::<2>(x, &mut data),
+            w => {
+                for (d, v) in data.chunks_exact_mut(w as usize).zip(x) {
+                    d.copy_from_slice(&v.to_le_bytes()[..w as usize]);
+                }
+            }
+        }
+        Cells::from_fixed(n_rows, rb, data)
+    } else if !prog.varlen() {
+        let mut data = vec![0u8; cap];
+        CompiledProgram::with(prog, |cp| cp.eval_fixed(in_refs, tbufs, n_rows, &mut data));
+        Cells::from_fixed(n_rows, rb, data)
+    } else {
+        let mut ends = vec![0u32; n_rows];
+        let mut data = vec![0u8; cap + 8];
+        let written = CompiledProgram::with(prog, |cp| {
+            cp.eval_cells(in_refs, tbufs, n_rows, &mut ends, &mut data)
+        });
+        data.truncate(written);
+        Cells::from_parts(data, ends)
+    }
+}
+
+/// The first `n` cells of a row-local `ProgramCells` node, built only where `reads` reads.
+fn sparse_cells(
+    node: &GraphNode,
+    vals: &[Val],
+    n: usize,
+    reads: &[(usize, usize)],
+    budget: &DecodeBudget,
+) -> Result<Col> {
+    let GraphNode::ProgramCells { prog, inputs, bufs } = node else {
+        return Err(Error::Format("sparse cells of a node that is no program".into()));
+    };
+    let at: Vec<usize> = reads.iter().flat_map(|&(s, e)| s..e.min(n)).collect();
+    let mut cols = Vec::with_capacity(inputs.len());
+    for &iid in inputs {
+        let col = as_ints(&vals[iid as usize])?;
+        if col.len() < n {
+            return Err(Error::Format("ProgramCells input length mismatch".into()));
+        }
+        cols.push(at.iter().map(|&r| col[r]).collect::<Vec<i64>>());
+    }
+    let in_refs: Vec<&[i64]> = cols.iter().map(Vec::as_slice).collect();
+    let mut tbufs = Vec::with_capacity(bufs.len());
+    for &bid in bufs {
+        tbufs.push(TableBuf::from_bytes(as_table_bytes(&vals[bid as usize])?));
+    }
+    let cells = program_cells(prog, &in_refs, &tbufs, at.len(), budget)?;
+    let mut spans = vec![NOT_HELD; n];
+    let mut start = 0u32;
+    for (&r, &end) in at.iter().zip(cells.ends()) {
+        spans[r] = (start, end);
+        start = end;
+    }
+    Ok(Col::Paged {
+        pool: Arc::new(Pool::whole(cells.bytes().to_vec())),
+        spans,
+    })
 }
 
 fn take_shared_cells(v: &mut Val) -> Result<Arc<Cells>> {

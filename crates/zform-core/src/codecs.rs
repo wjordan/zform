@@ -257,6 +257,10 @@ pub struct BlockDecodeCtx<'a> {
     layout: Option<(&'a ModelPlan, Arc<[u32]>)>,
     /// By column: each cell's value id, the rank of its first occurrence among distinct values.
     key_ids: Vec<Option<Arc<Vec<u32>>>>,
+    /// By row a reader said it reads: each column's cursor before the row and after it.
+    rows_read: Vec<(Vec<usize>, Vec<usize>)>,
+    /// By column: whether the cached column holds only the cells `rows_read` reads.
+    cut: Vec<bool>,
 }
 
 /// For each cell of column `at`, the index of the first cell of column `key` in the same record.
@@ -397,7 +401,30 @@ impl<'a> BlockDecodeCtx<'a> {
             library,
             layout: None,
             key_ids: (0..n_cols).map(|_| None).collect(),
+            rows_read: Vec::new(),
+            cut: vec![false; n_cols],
         }
+    }
+
+    /// Promises that only the cells of `rows`, given as each column's cursor before a row and
+    /// after it, will be read, so a column may be built only that far. A column another one
+    /// reads is still built whole.
+    pub fn read_only(&mut self, rows: Vec<(Vec<usize>, Vec<usize>)>) {
+        self.rows_read = rows;
+    }
+
+    /// The cells of column `c` the rows read, as ascending ranges; `None` for all.
+    fn reads(&self, c: usize) -> Option<Vec<(usize, usize)>> {
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        for (before, after) in &self.rows_read {
+            let (s, e) = (*before.get(c)?, *after.get(c)?);
+            match out.last_mut() {
+                _ if s >= e => {}
+                Some(last) if last.1 == s => last.1 = e,
+                _ => out.push((s, e)),
+            }
+        }
+        (!out.is_empty()).then_some(out)
     }
 
     pub fn with_layout(mut self, plan: &'a ModelPlan, variant_ids: Arc<[u32]>) -> Self {
@@ -438,7 +465,10 @@ pub fn ensure_dense_block_column<'c>(
     ctx: &'c mut BlockDecodeCtx<'_>,
     budget: &DecodeBudget,
 ) -> Result<&'c Col> {
-    ensure_col_inner(col_idx, ctx, budget, 0)?;
+    if ctx.cache.get(col_idx).is_none_or(Option::is_none) {
+        let reads = ctx.reads(col_idx);
+        ensure_col_inner(col_idx, ctx, budget, 0, reads.as_deref())?;
+    }
     Ok(ctx.cache[col_idx].as_ref().unwrap())
 }
 
@@ -447,11 +477,12 @@ fn ensure_col_inner(
     ctx: &mut BlockDecodeCtx<'_>,
     budget: &DecodeBudget,
     depth: usize,
+    reads: Option<&[(usize, usize)]>,
 ) -> Result<()> {
     if col_idx >= ctx.col_blobs.len() {
         return Err(Error::Format("column index out of bounds".into()));
     }
-    if ctx.cache[col_idx].is_some() {
+    if ctx.cache[col_idx].is_some() && !(ctx.cut[col_idx] && reads.is_none()) {
         return Ok(());
     }
     if depth > 16 {
@@ -478,7 +509,7 @@ fn ensure_col_inner(
                 "horizontal forward or self column reference".into(),
             ));
         }
-        ensure_col_inner(pid, ctx, budget, depth + 1)?;
+        ensure_col_inner(pid, ctx, budget, depth + 1, None)?;
         if !as_cells {
             peers.push(Arc::default());
             continue;
@@ -535,7 +566,8 @@ fn ensure_col_inner(
         peers: &peers,
         aligned: &aligned,
     };
-    let col = CoreDecoder::decode_col(&graph, &ext, budget)?;
+    let col = CoreDecoder::decode_col_reading(&graph, &ext, budget, reads)?;
+    ctx.cut[col_idx] = reads.is_some();
     ctx.cache[col_idx] = Some(col);
     Ok(())
 }
