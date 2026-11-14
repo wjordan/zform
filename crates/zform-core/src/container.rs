@@ -2,12 +2,12 @@
 //! previous frame's, and self-contained blocks. The encoder collects the index region as it goes.
 
 use crate::cells::{Cells, Col, underflow};
-use crate::dictionary::{Dictionary, DictionaryBuilder, Scope};
 use crate::codecs::{
     ANY_LETTERS, BlockDecodeCtx, ColSummary, PoolParts, Seeds, column_deps, decode_present_slice,
     decode_u32_seq, encode_dense_block_columns, encode_present_slice, encode_u32_seq,
     ensure_dense_block_column, with_seeds,
 };
+use crate::dictionary::{Dictionary, DictionaryBuilder, Scope};
 use crate::framing::{
     FramedChunk, FramingSpec, ResolvedFraming, emit_framed_record, split_chunk, split_json_array,
 };
@@ -15,8 +15,8 @@ use crate::grammar::{
     BlockReconstructor, ModelPlan, OccRef, PlanVariant, SplitResult, split_records_with_plan,
 };
 use crate::index::{
-    BlockDir, BlockKind, ColEntry, FilterBuilder, INDEX_MAGIC, IndexBuilder, KIND_JSON, KIND_RESIDUAL,
-    KIND_SHAPE, KIND_SHAPE_CELL, page_filter_page, tokens,
+    BlockDir, BlockKind, ColEntry, FilterBuilder, INDEX_MAGIC, IndexBuilder, KIND_JSON,
+    KIND_RESIDUAL, KIND_SHAPE, KIND_SHAPE_CELL, page_filter_page, tokens,
 };
 use crate::json_tree::{decode_json_struct_streams, encode_json_struct_streams};
 use crate::lex::parse_base64;
@@ -123,7 +123,10 @@ pub struct FrameFit {
 
 /// About 256 KiB of `samples`: a layout of a few percent there still clears the trainer's floor.
 fn keep_rows(samples: &[&[u8]]) -> Vec<Vec<u8>> {
-    sample_strided(samples, 4096, 256 << 10).iter().map(|r| r.to_vec()).collect()
+    sample_strided(samples, 4096, 256 << 10)
+        .iter()
+        .map(|r| r.to_vec())
+        .collect()
 }
 
 // ============================================================================
@@ -342,7 +345,11 @@ impl StreamEncoder {
                         self.opts.block_bytes,
                         filter_bits,
                         // Pages serve readers that come through the index.
-                        if self.opts.index { self.opts.pool_page_bytes } else { 0 },
+                        if self.opts.index {
+                            self.opts.pool_page_bytes
+                        } else {
+                            0
+                        },
                         code,
                         &mut body,
                     )
@@ -829,6 +836,7 @@ fn encode_block_columns(
     filter_bits: Option<usize>,
     page_bytes: usize,
 ) -> PendingBlock {
+    let _mixing = packs.encoding_scope();
     let split = split_records_with_plan(recs, plan);
     let n_cols = plan.columns.len();
 
@@ -994,6 +1002,20 @@ fn encode_nested_column_tagged(
     if !fallbacks.is_empty() {
         let (_, _, _, fb_enc) = encode_present_slice(&fallbacks, backend, level, 1);
         out.extend_from_slice(&fb_enc);
+    }
+    if packs.plain_nested_fallback && !is_json_tagged && !child_recs.is_empty() {
+        // A child model can cost more than the whole messages, especially when one block
+        // repeats only a few of them. The existing raw mode keeps that choice local to a block.
+        let mut flat = Vec::new();
+        put_uvarint(&mut flat, occ_len as u64);
+        flat.extend([NESTED_COLUMN_TAG, 0]);
+        encode_u32_seq(&vec![3; occ_len], backend, level, &mut flat);
+        put_bytes(&mut flat, &[]);
+        let (_, _, _, payload) = encode_present_slice(&logical, backend, level, 1);
+        flat.extend_from_slice(&payload);
+        if flat.len() < out.len() {
+            out = flat;
+        }
     }
     (summary, out)
 }
@@ -1646,7 +1668,9 @@ pub fn decode_frame_payload<W: Write>(
 
 pub fn pack_stream<R: Read, W: Write>(reader: R, mut writer: W, opts: &PackOptions) -> Result<()> {
     let mut enc = StreamEncoder::new(opts.clone());
-    for_each_chunk(reader, opts, |fc| enc.encode_framed(fc, &mut writer).map(drop))?;
+    for_each_chunk(reader, opts, |fc| {
+        enc.encode_framed(fc, &mut writer).map(drop)
+    })?;
     enc.finish(&mut writer)
 }
 
@@ -1712,11 +1736,7 @@ fn for_each_chunk<R: Read>(
                     stride,
                     header_bytes,
                 } => {
-                    let h = if first {
-                        header_bytes as usize
-                    } else {
-                        0
-                    };
+                    let h = if first { header_bytes as usize } else { 0 };
                     let s = stride.max(1) as usize;
                     if win.len() > h + s {
                         h + ((win.len() - h) / s) * s
@@ -1789,7 +1809,8 @@ pub fn unpack_stream<R: Read, W: Write>(
                     None
                 };
                 if (hdr.flags & FLAG_DICTIONARY) != 0 {
-                    let id = exp_xxh.ok_or_else(|| Error::Format("dictionary frame has no id".into()))?;
+                    let id = exp_xxh
+                        .ok_or_else(|| Error::Format("dictionary frame has no id".into()))?;
                     dict.set(Some(Arc::new(Dictionary::read(&payload, id, budget)?)));
                     continue;
                 }
@@ -1799,93 +1820,38 @@ pub fn unpack_stream<R: Read, W: Write>(
     }
 }
 
-pub fn inspect_stream<R: Read>(mut reader: R, budget: &DecodeBudget) -> Result<InspectReport> {
-    let mut rep = InspectReport::default();
-    let mut prev_plan: Option<ModelPlan> = None;
-    loop {
-        match read_next_frame_header(&mut reader, budget)? {
-            NextFrameKind::Eof => break,
-            NextFrameKind::Index { skip_bytes } => {
-                rep.index_bytes += skip_bytes as u64 + 12;
-                std::io::copy(
-                    &mut (&mut reader).take(skip_bytes as u64),
-                    &mut std::io::sink(),
-                )?;
-                prev_plan = None;
-            }
-            NextFrameKind::Data(hdr) if (hdr.flags & FLAG_DICTIONARY) != 0 => {
-                std::io::copy(
-                    &mut (&mut reader).take(hdr.payload_len as u64 + 8),
-                    &mut std::io::sink(),
-                )?;
-                rep.total_compressed_bytes += hdr.payload_len as u64 + 32;
-                rep.column_bytes.push(("$dictionary".into(), hdr.payload_len as u64));
-            }
-            NextFrameKind::Data(hdr) => {
-                rep.frames += 1;
-                if (hdr.flags & FLAG_SYNC_POINT) != 0 {
-                    rep.sync_frames += 1;
-                }
-                if (hdr.flags & FLAG_PASSTHROUGH) != 0 {
-                    rep.passthrough_frames += 1;
-                }
-                rep.total_uncompressed_bytes += hdr.raw_len as u64;
-                rep.total_records += hdr.record_count as u64;
-                let mut payload = budget.alloc_vec(hdr.payload_len, "inspect payload")?;
-                reader.read_exact(&mut payload)?;
-                let mut extra = 24u64;
-                if (hdr.flags & FLAG_HAS_CHECKSUM) != 0 {
-                    let mut cb = [0u8; 8];
-                    reader.read_exact(&mut cb)?;
-                    extra += 8;
-                }
-                rep.total_compressed_bytes += hdr.payload_len as u64 + extra;
-                if (hdr.flags & FLAG_PASSTHROUGH) == 0 {
-                    let bdir = parse_frame_blocks(&hdr, &payload, &mut prev_plan, budget)?;
-                    if let Some(p) = &prev_plan {
-                        rep.variant_count = rep.variant_count.max(p.variants.len());
-                        for c in &p.columns {
-                            if !rep.column_names.contains(&c.name) {
-                                rep.column_names.push(c.name.clone());
-                            }
-                        }
-                        let add_stat = |rep: &mut InspectReport, name: &str, nb: u64| {
-                            if nb == 0 {
-                                return;
-                            }
-                            if let Some(ent) = rep.column_bytes.iter_mut().find(|x| x.0 == name) {
-                                ent.1 += nb;
-                            } else {
-                                rep.column_bytes.push((name.to_string(), nb));
-                            }
-                        };
-                        for &(nrows, bslice) in &bdir.blocks {
-                            let _ = nrows;
-                            if let Ok(pb) = BlockParts::of_block(bslice, p, budget) {
-                                if let Structure::Whole(s) = pb.structure {
-                                    add_stat(&mut rep, "$structure", s.len() as u64);
-                                }
-                                let sd_bytes: u64 =
-                                    pb.dicts.iter().flatten().map(|b| b.len() as u64).sum();
-                                add_stat(&mut rep, "$shared_dicts", sd_bytes);
-                                add_stat(
-                                    &mut rep,
-                                    "$prose_pool",
-                                    pb.pool.map_or(0, |b| b.held_bytes() as u64),
-                                );
-                                for (cid, blob) in pb.cols.iter().enumerate() {
-                                    add_stat(
-                                        &mut rep,
-                                        &p.columns[cid].name,
-                                        blob.map_or(0, |b| b.len() as u64),
-                                    );
-                                }
-                            }
-                        }
+pub use crate::inspect::inspect_stream;
+
+#[cfg(test)]
+mod nested_tests {
+    use super::*;
+
+    #[test]
+    fn nested_messages_keep_plain_bytes_and_json_tags_when_model_is_unhelpful() {
+        let train: Vec<Vec<u8>> = (0..8)
+            .map(|i| format!("a={i} b={}", i * 3).into_bytes())
+            .collect();
+        let refs: Vec<&[u8]> = train.iter().map(Vec::as_slice).collect();
+        let plan = crate::block::train(&refs, &TrainOptions::default(), None);
+        for tagged in [false, true] {
+            let rows: Vec<Vec<u8>> = (0..32)
+                .map(|i| {
+                    let mut row = Vec::new();
+                    if tagged {
+                        row.push((i % 2) as u8);
                     }
-                }
+                    row.extend_from_slice(b"a wholly different message with \"quotes\"");
+                    row
+                })
+                .collect();
+            let vals: Vec<&[u8]> = rows.iter().map(Vec::as_slice).collect();
+            let packs = PackRegistry::default().with_plain_nested_fallback();
+            let (_, wire) =
+                encode_nested_column_tagged(&vals, tagged, &plan, &packs, EntropyBackend::Zstd, 3);
+            let back = decode_nested_column_tagged(&wire, &plan, &DecodeBudget::default()).unwrap();
+            for (i, want) in rows.iter().enumerate() {
+                assert_eq!(back.get(i).unwrap(), want);
             }
         }
     }
-    Ok(rep)
 }

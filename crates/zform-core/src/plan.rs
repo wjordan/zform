@@ -8,7 +8,7 @@ use crate::framing::{FramingSpec, ResolvedFraming, split_chunk};
 use crate::grammar::{
     FrontEnd, ModelPlan, PlanVariant, Shape, SlotClass, TemplateVariant, csv_shape, envelope_shape,
     logfmt_shape, match_template, parse_k8s_cri, parse_logfmt_line, parse_syslog_envelope,
-    split_csv_exact, split_records_with_plan, tokenize_template_line,
+    split_csv_exact, split_csv_fields, split_records_with_plan, tokenize_template_line,
 };
 use crate::json_tree::{JsonDoc, train_json_tree};
 use crate::lex::parse_exact_int;
@@ -469,9 +469,10 @@ fn train_csv_if_tabular(rows: &[&[u8]], plan: &mut ModelPlan) -> bool {
         let mut counts: BTreeMap<usize, usize> = BTreeMap::new();
         let probe = rows.len().min(128);
         for &r in rows.iter().take(probe) {
-            let approx_n = r.iter().filter(|&&b| b == delim).count() + 1;
-            if (3..=48).contains(&approx_n) && split_csv_exact(r, delim, approx_n).is_some() {
-                *counts.entry(approx_n).or_insert(0) += 1;
+            if let Some((fields, _)) = split_csv_fields(r, delim, None)
+                && fields.len() >= 3
+            {
+                *counts.entry(fields.len()).or_insert(0) += 1;
             }
         }
         if let Some((&n_fields, &hits)) = counts.iter().max_by_key(|e| e.1)
@@ -502,7 +503,7 @@ fn train_csv_if_tabular(rows: &[&[u8]], plan: &mut ModelPlan) -> bool {
             };
             plan.push_variant(cell, FrontEnd::CsvCell { delim });
             for mask in layouts {
-                let s = csv_shape(delim, &fields, mask);
+                let s = csv_shape(delim, &fields, &mask);
                 plan.push_variant(PlanVariant::Shape(s), FrontEnd::Csv);
             }
             return true;

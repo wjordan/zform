@@ -9,6 +9,7 @@
 //! lagged recurrences.
 
 mod chain;
+mod context_mix;
 pub mod engine;
 pub mod graph;
 pub mod ir;

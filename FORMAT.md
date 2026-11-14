@@ -152,6 +152,11 @@ The structural model maps those occurrences back to records and assembles record
 
 A new writer-side pack can use existing primitives without changing readers. A new node kind, instruction, or entropy backend requires reader support.
 
+Writer-side `RelationPack`s use the same graph representation. The optional HDFS pack emits
+peer references, integer parsing and formatting, keyed lookups, and exact patches. No HDFS
+identifier or additional node kind appears on the wire; only enabling context mixing can add
+the integer transport kind `9` described below.
+
 ### worked example
 
 One possible graph for the cells `auth`, `auth`, `cart` is:
@@ -285,6 +290,7 @@ An `IntStream` starts with `kind: u8`, then `length: uvarint`, followed by the o
 | `6` | ZigZag byte head and exceptions | `head: leaf_blob`, `tail: IntStream` |
 | `7` | Shifted constant | `shift: u8`, `coefficient: ivarint` |
 | `8` | Centered Rice | `bytes: blob` |
+| `9` | Context mixture | `min: ivarint`, `bits: u8`, `table_bits: u8`, `bytes: blob` |
 
 - **Constant:** repeat `value`. A shifted constant repeats `coefficient << shift`; the shift is 1–63 and must preserve the signed coefficient without overflow.
 - **Run length:** the expanded leaf holds `n_runs: uvarint`, then `(value: ivarint, count: uvarint)` pairs. Counts sum to `length`.
@@ -293,6 +299,27 @@ An `IntStream` starts with `kind: u8`, then `length: uvarint`, followed by the o
 - **Byte planes:** `width` is 1, 2, 4, or 8. The expanded leaf holds `length * width` bytes: all low bytes of unsigned offsets from `min`, then all second bytes, and so on. Interleave and add `min` with 64-bit wrapping arithmetic.
 - **Byte head and exceptions:** the expanded head holds one byte per lane. Bytes 0–254 represent offsets from `min` (kind `5`) or ZigZag codes (kind `6`). Byte 255 consumes the next tail value and adds 255 to obtain the offset or ZigZag code. Each exception consumes exactly one tail value. Kind `5` tails must be nonnegative; kind `6` tails carry unsigned bit patterns in signed lanes. A tail is never itself kind `5` or `6`.
 - **Centered Rice:** `bytes` contains `center: ivarint`, `k: u8`, then a least-significant-bit-first bitstream. ZigZag-encode each signed difference from `center`. Write `code >> k` zero bits, one bit, then the low `k` bits. `k` is 0–63. Decoders reject arithmetic overflow, truncation, trailing bytes, and nonzero padding.
+- **Context mixture:** kind `9` fixes the integer-only model and range coder in
+  [`payload/context_mix.rs`](crates/zform-core/src/payload/context_mix.rs).
+  `length` is nonzero, `bits` is 1–16, and `table_bits` is 8–14. Each value is an unsigned
+  `bits`-wide offset from `min`, coded most-significant bit first. Add `min` with wrapping
+  arithmetic to reconstruct signed lanes. `bytes` is the arithmetic stream itself, without
+  another entropy-leaf wrapper. It ends with four range-flush bytes.
+
+Kind `9` starts three tables of `2^table_bits` counters at probability 32768 and count zero.
+The contexts are the partial bit prefix (starting at 1), the preceding value plus prefix,
+and the preceding pair plus prefix. Previous values start at zero. Table indexing uses the
+fixed hashes and bit layouts in the reference implementation. A counter's probability uses
+16 fractional bits; its update rate is `floor(65536 / (count + 2))`, with count capped at 63.
+Probability updates use signed arithmetic shifts and clamp to 1–65535.
+
+Each bit depth has three mixture weights, initially `[21845, 21845, 21846]`, summing to 65536.
+Predict with the weighted probability sum shifted right 16, clamped to 1–65535. After the bit,
+update weights from their likelihoods and blend 31/32 of that posterior with 1/32 uniform weight.
+Assign rounding remainder to the third weight. Then update the model counters. No state
+carries into another integer stream. Decoder limits cover parameters, compressed bytes, output
+allocation, and model memory; truncated or trailing arithmetic bytes are errors. Predictions
+are part of this wire kind: a different model requires a different kind, not an encoder tweak.
 
 Delta reconstruction, common integer factors, floating-point scaling, and formatting are programs around these transports. They have no separate `IntStream` mode or domain tag.
 
@@ -345,6 +372,7 @@ row_modes: u32_seq | child_block: blob | [fallback_graph: blob]
 | Program execution | [`payload/engine.rs`](crates/zform-core/src/payload/engine.rs) |
 | Recurrence encoding and execution | [`payload/recur.rs`](crates/zform-core/src/payload/recur.rs) |
 | Centered Rice bitstream | [`payload/rice.rs`](crates/zform-core/src/payload/rice.rs) |
+| Context-mixture bitstream | [`payload/context_mix.rs`](crates/zform-core/src/payload/context_mix.rs) |
 | Library entries and constant overrides | [`payload/library.rs`](crates/zform-core/src/payload/library.rs) |
 | Writer-side pattern recognition and graph selection | [`packs.rs`](crates/zform-core/src/packs.rs) |
 | Block dependency loading | [`codecs.rs`](crates/zform-core/src/codecs.rs) |

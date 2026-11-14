@@ -239,7 +239,7 @@ pub struct CsvRoute {
     delim: u8,
     fields: Vec<u16>,
     /// Quote mask of each layout variant.
-    layouts: HashMap<u64, u32>,
+    layouts: HashMap<Vec<u64>, u32>,
 }
 
 /// Complete, self-contained structural model embedded in `ZFM1` frames and `ZFP1` profile files.
@@ -313,7 +313,7 @@ impl ModelPlan {
                     });
                 }
                 FrontEnd::CsvCell { delim }
-                    if r.csv.is_none() && (1..=62).contains(&cols.len()) =>
+                    if r.csv.is_none() && (1..=MAX_CSV_FIELDS).contains(&cols.len()) =>
                 {
                     r.csv = Some(CsvRoute {
                         cell: vi,
@@ -363,9 +363,11 @@ impl ModelPlan {
                 FrontEnd::Csv if r.csv.is_some() => {
                     let cs = r.csv.as_mut().unwrap();
                     let quoted = |i: usize| s.literals.get(i).is_some_and(|l| l.ends_with(b"\""));
-                    let mask =
-                        (0..cs.fields.len()).fold(0u64, |m, i| m | u64::from(quoted(i)) << i);
-                    if csv_shape(cs.delim, &cs.fields, mask) == *s {
+                    let mut mask = vec![0u64; cs.fields.len().div_ceil(64)];
+                    for i in 0..cs.fields.len() {
+                        mask[i / 64] |= u64::from(quoted(i)) << (i % 64);
+                    }
+                    if csv_shape(cs.delim, &cs.fields, &mask) == *s {
                         cs.layouts.entry(mask).or_insert(vi);
                     }
                 }
@@ -1084,8 +1086,14 @@ pub fn match_template<'a>(
 // ============================================================================
 
 /// The shape of a CSV row whose fields `mask` marks are quoted.
-pub fn csv_shape(delim: u8, fields: &[u16], mask: u64) -> Shape {
-    let q = |i: usize| if mask >> i & 1 != 0 { &b"\""[..] } else { b"" };
+pub fn csv_shape(delim: u8, fields: &[u16], mask: &[u64]) -> Shape {
+    let q = |i: usize| {
+        if mask[i / 64] >> (i % 64) & 1 != 0 {
+            &b"\""[..]
+        } else {
+            b""
+        }
+    };
     let n = fields.len();
     let mut literals = vec![q(0).to_vec()];
     literals.extend((1..n).map(|i| [q(i - 1), &[delim], q(i)].concat()));
@@ -1100,35 +1108,52 @@ pub fn split_csv_exact(
     line: &[u8],
     delim: u8,
     expected_fields: usize,
-) -> Option<(Vec<&[u8]>, u64)> {
-    if expected_fields == 0 || expected_fields > 62 {
+) -> Option<(Vec<&[u8]>, Vec<u64>)> {
+    split_csv_fields(line, delim, Some(expected_fields))
+}
+
+pub(crate) const MAX_CSV_FIELDS: usize = 1024;
+
+pub(crate) fn split_csv_fields(
+    line: &[u8],
+    delim: u8,
+    expected_fields: Option<usize>,
+) -> Option<(Vec<&[u8]>, Vec<u64>)> {
+    if expected_fields.is_some_and(|n| n == 0 || n > MAX_CSV_FIELDS) {
         return None;
     }
-    let mut cells = Vec::with_capacity(expected_fields);
-    let mut mask = 0u64;
+    let capacity = expected_fields.unwrap_or(16);
+    let mut cells = Vec::with_capacity(capacity);
+    let mut mask = Vec::with_capacity(capacity.div_ceil(64));
     let mut pos = 0usize;
-    for f in 0..expected_fields {
+    loop {
+        let f = cells.len();
+        if f == MAX_CSV_FIELDS || expected_fields.is_some_and(|n| f == n) {
+            return None;
+        }
+        if f.is_multiple_of(64) {
+            mask.push(0u64);
+        }
         if pos < line.len() && line[pos] == b'"' {
             let start = pos + 1;
             let mut end = start;
-            while end < line.len() && line[end] != b'"' {
-                end += 1;
+            while end < line.len() {
+                if line[end] != b'"' {
+                    end += 1;
+                } else if line.get(end + 1) == Some(&b'"') {
+                    end += 2;
+                } else {
+                    break;
+                }
             }
             if end >= line.len() {
                 return None;
             }
-            let after = end + 1;
-            if f + 1 < expected_fields {
-                if after >= line.len() || line[after] != delim {
-                    return None;
-                }
-                pos = after + 1;
-            } else if after != line.len() {
+            pos = end + 1;
+            if pos < line.len() && line[pos] != delim {
                 return None;
-            } else {
-                pos = after;
             }
-            mask |= 1u64 << f;
+            mask[f / 64] |= 1u64 << (f % 64);
             cells.push(&line[start..end]);
         } else {
             let start = pos;
@@ -1139,15 +1164,14 @@ pub fn split_csv_exact(
                 pos += 1;
             }
             cells.push(&line[start..pos]);
-            if f + 1 < expected_fields {
-                if pos >= line.len() || line[pos] != delim {
-                    return None;
-                }
-                pos += 1;
-            } else if pos != line.len() {
-                return None;
-            }
         }
+        if pos == line.len() {
+            break;
+        }
+        pos += 1;
+    }
+    if expected_fields.is_some_and(|n| cells.len() != n) {
+        return None;
     }
     Some((cells, mask))
 }
@@ -1284,7 +1308,7 @@ pub fn split_records_with_plan<'a>(records: &[&'a [u8]], plan: &ModelPlan) -> Sp
             let fixed = cs.layouts.get(&mask).copied();
             if fixed.is_none() {
                 shape_buf.clear();
-                csv_shape(cs.delim, &cs.fields, mask).encode(&mut shape_buf);
+                csv_shape(cs.delim, &cs.fields, &mask).encode(&mut shape_buf);
             }
             layout = Some((fixed, cs.cell, cs.shape_col));
         }
@@ -1761,6 +1785,46 @@ mod tests {
         let (_, vars) = round_trip(&train, &rows);
         assert!(matches!(vars[0], PlanVariant::Shape(_)));
         assert!(matches!(vars[1], PlanVariant::ShapeCell { .. }));
+    }
+
+    #[test]
+    fn wide_csv_keeps_quoted_commas_escaped_quotes_and_new_layouts() {
+        let row = |n: usize, extra_quotes: bool| {
+            (0..130)
+                .map(|i| match i {
+                    65 => "\"city, district\"".to_string(),
+                    128 => "\"a\"\"b\"".to_string(),
+                    129 => String::new(),
+                    64 | 127 if extra_quotes => format!("\"{}\"", i + n),
+                    _ => (i + n).to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+                .into_bytes()
+        };
+        let training: Vec<Vec<u8>> = (0..8).map(|n| row(n, false)).collect();
+        let train: Vec<&[u8]> = training.iter().map(Vec::as_slice).collect();
+        let changed = row(9, true);
+        let (model, variants) = round_trip(&train, &[changed.as_slice(), train[0]]);
+        assert!(model.routes.csv.is_some());
+        assert!(matches!(variants[0], PlanVariant::ShapeCell { .. }));
+        assert!(matches!(variants[1], PlanVariant::Shape(_)));
+        assert!(reload(&model).unwrap().routes.csv.is_some());
+    }
+
+    #[test]
+    fn csv_splitter_bounds_fields_and_refuses_malformed_quotes() {
+        let (fields, _) = split_csv_exact(b",\"\",", b',', 3).unwrap();
+        assert_eq!(fields, [b""; 3]);
+        for row in [b"\"a,b,c".as_slice(), b"a\"b,c,d", b"\"a\"x,b,c", b"a,b"] {
+            assert!(split_csv_exact(row, b',', 3).is_none());
+        }
+        let limit = vec![b','; MAX_CSV_FIELDS - 1];
+        assert_eq!(
+            split_csv_fields(&limit, b',', None).unwrap().0.len(),
+            MAX_CSV_FIELDS
+        );
+        assert!(split_csv_fields(&vec![b','; MAX_CSV_FIELDS], b',', None).is_none());
     }
 
     #[test]

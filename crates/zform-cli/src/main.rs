@@ -5,10 +5,11 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use zform::inspect::inspect_breakdown;
 use zform::{
-    Archive, DecodeBudget, EntropyBackend, FramingSpec, PackOptions, Predicate,
-    Profile, Stats, TrainOptions, build_dictionary, inspect_stream, logical, pack, train,
-    train_seekable, unpack_with_budget,
+    Archive, DecodeBudget, EntropyBackend, FramingSpec, PackOptions, Predicate, Profile, Stats,
+    TrainOptions, build_dictionary, inspect_stream, logical, pack, train, train_seekable,
+    unpack_with_budget,
 };
 
 fn usage() -> &'static str {
@@ -19,7 +20,7 @@ USAGE:
   zform pack    [OPTIONS] [INPUT] [-o OUTPUT]
   zform unpack  [OPTIONS] [INPUT] [-o OUTPUT]
   zform train   [OPTIONS] <INPUT> -o <PROFILE.zfp> [--extend <PRIOR.zfp>]
-  zform inspect [INPUT]
+  zform inspect [-v|--json] [INPUT]
   zform grep    [FILTERS] [SUBSTRING] <FILE>
   zform select  -f <f1,f2,...> [FILTERS] [--tsv] <FILE>
   zform [-d] [-c] [-t] [-l <1..19>] [--fast|--best|--lz4] [INPUT] [-o OUTPUT]
@@ -29,6 +30,8 @@ OPTIONS:
   -l, --level <1..19>       Compression level (default: 3)
   --fast                    Fast preset (level 1, 4,096 training rows)
   --best                    High-density preset (level 19, 65,536 training rows, file dictionary)
+  --context-mixing          Try smaller context-coded integer streams (slower, opt-in)
+  --hdfs-predictors         Try HDFS field relationships (opt-in)
   --lz4                     Compress columns with LZ4 instead of zstd
   --profile <FILE.zfp>      Use (or extend on `train --extend`) a ZFP1 structural profile
   --fixed-profile           Disable online drift retraining when `--profile` is set
@@ -43,6 +46,12 @@ OPTIONS:
   --no-checksum             Omit per-frame XXH64 content checksum
   --no-index                Omit the trailing index region (`grep` / `select` need it)
   -h, --help                Print this help message
+
+INSPECT:
+  -v, --verbose             Also print where the bytes go, largest first: each column and block
+                            part, nested models' parts indented, with share of the file, bytes
+                            per record, and the coding graph that spent the most bytes
+  --json                    Print that breakdown as one JSON object, every graph shape included
 
 FILTERS (`grep` and `select`; several are combined with AND):
   -e, --contains <BYTES>    Records containing these bytes
@@ -235,6 +244,8 @@ fn cmd_pack(args: &[String]) -> Result<(), String> {
                 opts.train.max_sample_bytes = 64 << 20;
             }
             "--lz4" => opts.backend = EntropyBackend::Lz4,
+            "--context-mixing" => opts.packs = opts.packs.with_context_mixing(),
+            "--hdfs-predictors" => opts.packs = opts.packs.with_hdfs_predictors(),
             "--raw" => opts.backend = EntropyBackend::Raw,
             "--profile" => {
                 i += 1;
@@ -477,6 +488,7 @@ fn cmd_train(args: &[String]) -> Result<(), String> {
 
 fn cmd_inspect(args: &[String]) -> Result<(), String> {
     let verbose = args.iter().any(|a| a == "-v" || a == "--verbose");
+    let json = args.iter().any(|a| a == "--json");
     let input = args
         .iter()
         .find(|a| !a.starts_with('-') || a.as_str() == "-")
@@ -498,14 +510,22 @@ fn cmd_inspect(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
     let rdr = open_input(input)?;
-    let rep = inspect_stream(rdr, &DecodeBudget::default()).map_err(|e| e.to_string())?;
+    let budget = DecodeBudget::default();
+    let deep = json || verbose;
+    let (rep, tree) = if deep {
+        let (rep, tree) = inspect_breakdown(rdr, &budget).map_err(|e| e.to_string())?;
+        (rep, Some(tree))
+    } else {
+        let rep = inspect_stream(rdr, &budget).map_err(|e| e.to_string())?;
+        (rep, None)
+    };
     let ratio = if rep.total_compressed_bytes > 0 {
         rep.total_uncompressed_bytes as f64 / rep.total_compressed_bytes as f64
     } else {
         0.0
     };
-    println!(
-        "{{\"kind\":\"ZFM1-stream\",\"frames\":{},\"sync_frames\":{},\"passthrough_frames\":{},\"records\":{},\"raw_bytes\":{},\"compressed_bytes\":{},\"ratio\":{:.3},\"index_bytes\":{},\"variants\":{},\"columns\":{}}}",
+    let summary = format!(
+        "\"kind\":\"ZFM1-stream\",\"frames\":{},\"sync_frames\":{},\"passthrough_frames\":{},\"records\":{},\"raw_bytes\":{},\"compressed_bytes\":{},\"ratio\":{:.3},\"index_bytes\":{},\"variants\":{},\"columns\":{}",
         rep.frames,
         rep.sync_frames,
         rep.passthrough_frames,
@@ -517,12 +537,10 @@ fn cmd_inspect(args: &[String]) -> Result<(), String> {
         rep.variant_count,
         rep.column_names.len()
     );
-    if verbose {
-        let mut sorted = rep.column_bytes.clone();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
-        for (name, bytes) in sorted.into_iter().take(20) {
-            eprintln!("  {:>9} B  {}", bytes, name);
-        }
+    match tree {
+        Some(t) if json => println!("{{{summary},\"breakdown\":{}}}", t.json()),
+        Some(t) => print!("{{{summary}}}\n{}", t.tree(t.bytes, rep.total_records)),
+        None => println!("{{{summary}}}"),
     }
     Ok(())
 }

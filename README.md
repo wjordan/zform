@@ -43,6 +43,12 @@ zform pack < app.log > app.zfm
 # Pack a JSON document (elements of its main array become records)
 zform pack cloudtrail.json -o cloudtrail.zfm
 
+# Try context mixing on selected integer streams for smaller files (slower decoding)
+zform pack --context-mixing app.log -o app.zfm
+
+# Try HDFS field predictions through the same payload engine
+zform pack --hdfs-predictors --context-mixing HDFS.log -o hdfs.zfm
+
 # Inspect stream metadata, ratio, and top columns by compressed size
 zform inspect -v events.zfm
 
@@ -135,7 +141,7 @@ The instructions describe two layers:
 - **Record layout.** A record follows a *shape*: literal text with slots filled from columns. The writer's front ends for `logfmt`, CSV/TSV, CRI and syslog envelopes, fixed-width binary structs and learned free-text templates all produce shapes, with separators, keys and quotes as literal text. Nested JSON has a tree model of its own.
 - **Column values.** A column carries a small graph of operations over byte buffers and integer streams: dictionaries, deltas, references to other columns (a copy, or a lookup by a shared key such as a block id), and short programs that do arithmetic and format bytes. Writer-side codec packs recognise timestamps, decimals, UUIDs, network addresses, hex ids and pseudo-random sequences (`java.util.Random`, Python's Mersenne Twister) and express each in those operations.
 
-The reader therefore has no timestamp, `logfmt` or generator code. Programs have no branches, loops or writes to memory, so a reader validates one in a single pass and bounds its cost before running it. Code that blocks share is stored once with the model. An application can register its own `CodecPack` to model its data without changing the format.
+The reader therefore has no timestamp, `logfmt` or generator code. Programs have no branches, loops or writes to memory, so a reader validates one in a single pass and bounds its cost before running it. Code that blocks share is stored once with the model. An application can register its own `CodecPack` for a column or `RelationPack` for relationships between columns without changing the format.
 
 The `.zfm` container serves streaming pipelines and indexed archives:
 

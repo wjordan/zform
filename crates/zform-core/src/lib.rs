@@ -11,6 +11,7 @@ pub mod file;
 pub mod framing;
 pub mod grammar;
 pub mod index;
+pub mod inspect;
 pub mod json_tree;
 pub mod lex;
 pub mod packs;
@@ -26,7 +27,9 @@ pub use container::{
 pub use dictionary::{Dictionary, DictionaryBuilder};
 pub use framing::{FramingSpec, ResolvedFraming};
 pub use grammar::ModelPlan;
-pub use packs::{CodecPack, ColumnProfile, PackRegistry};
+pub use packs::{
+    CodecPack, ColumnProfile, HdfsRelations, PackRegistry, RelationContext, RelationPack,
+};
 pub use payload::graph::{CoreDecoder, PayloadGraph};
 pub use plan::{Profile, TrainOptions, train_from_bytes};
 pub use query::{Predicate, eval_raw_record, logical, raw_field_values};

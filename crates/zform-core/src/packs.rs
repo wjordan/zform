@@ -7,6 +7,7 @@
 //! the pack that produced it.
 
 use crate::container::DEFAULT_FILTER_BITS;
+use crate::dictionary::with_current;
 use crate::index::{FilterBuilder, MAX_PAGES, tokens};
 use std::cell::{OnceCell, RefCell};
 use std::fmt;
@@ -20,8 +21,12 @@ use crate::payload::graph::{
 };
 use crate::payload::ir::{Builder, Len, Op, Program, V};
 use crate::payload::recur::RecurrenceSpec;
-use crate::dictionary::with_current;
 use crate::wire::{EntropyBackend, compress_pages};
+
+mod bgl;
+pub use bgl::{BglClockPack, BglNodePack};
+mod hdfs;
+pub use hdfs::HdfsRelations;
 
 // ============================================================================
 // 1. Writer-Side Pre-Filtering Profile & CodecPack Registry
@@ -182,13 +187,35 @@ pub trait CodecPack: Send + Sync {
     fn try_encode(&self, rows: &[&[u8]]) -> Option<PayloadGraph>;
 }
 
-/// Runtime registry of writer-side [`CodecPack`]s.
+/// A placed column and its record layout, available only to writer-side relation packs.
+pub struct RelationContext<'a, 'v> {
+    pub column: usize,
+    pub columns: &'a [Vec<&'v [u8]>],
+    pub plan: &'a ModelPlan,
+    pub variant_ids: &'a [u32],
+}
+
+/// Predicts a column from earlier columns using ordinary payload graph operations.
+/// The registry prices the complete graph and rejects forward/self peer references.
+pub trait RelationPack: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn try_encode(
+        &self,
+        context: &RelationContext<'_, '_>,
+        packs: &PackRegistry,
+    ) -> Option<PayloadGraph>;
+}
+
+/// Runtime registry of writer-side [`CodecPack`]s and [`RelationPack`]s.
 ///
 /// Cloning a `PackRegistry` is cheap (`Arc`-backed), and callers may register domain-specific
 /// packs at runtime via [`PackRegistry::register`] without modifying [`CoreDecoder`](crate::payload::graph::CoreDecoder).
 #[derive(Clone)]
 pub struct PackRegistry {
     packs: Vec<Arc<dyn CodecPack>>,
+    relations: Vec<Arc<dyn RelationPack>>,
+    pub(crate) plain_nested_fallback: bool,
+    context_mixing: bool,
 }
 
 impl fmt::Debug for PackRegistry {
@@ -196,6 +223,11 @@ impl fmt::Debug for PackRegistry {
         let names: Vec<&'static str> = self.packs.iter().map(|p| p.name()).collect();
         f.debug_struct("PackRegistry")
             .field("packs", &names)
+            .field(
+                "relations",
+                &self.relations.iter().map(|p| p.name()).collect::<Vec<_>>(),
+            )
+            .field("context_mixing", &self.context_mixing)
             .finish()
     }
 }
@@ -226,7 +258,39 @@ impl Default for PackRegistry {
 impl PackRegistry {
     /// Creates an empty pack registry (falls back to generic dictionary / raw-slice encoding).
     pub fn new() -> Self {
-        Self { packs: Vec::new() }
+        Self {
+            packs: Vec::new(),
+            relations: Vec::new(),
+            plain_nested_fallback: false,
+            context_mixing: false,
+        }
+    }
+
+    /// Also price plain nested messages as whole strings, at the cost of an extra encoding.
+    pub fn with_plain_nested_fallback(mut self) -> Self {
+        self.plain_nested_fallback = true;
+        self
+    }
+
+    /// Prices bounded context mixing alongside existing integer transports. This trades
+    /// additional encoding and decoding work for smaller selected streams; default is off.
+    pub fn with_context_mixing(mut self) -> Self {
+        self.context_mixing = true;
+        self
+    }
+
+    /// Prices HDFS task/partition and block-attribute predictions; default is off.
+    pub fn with_hdfs_predictors(mut self) -> Self {
+        self.register_relation(HdfsRelations);
+        self
+    }
+
+    pub fn register_relation<P: RelationPack + 'static>(&mut self, pack: P) {
+        self.relations.push(Arc::new(pack));
+    }
+
+    pub(crate) fn encoding_scope(&self) -> crate::payload::graph::ContextMixScope {
+        crate::payload::graph::ContextMixScope::new(self.context_mixing)
     }
 
     /// Registers a custom [`CodecPack`] at runtime.
@@ -241,7 +305,14 @@ impl PackRegistry {
     /// Evaluates matching packs and generic dictionary/raw fallback on `rows`, returning the
     /// smallest self-describing [`PayloadGraph`].
     pub fn encode_best_graph(&self, rows: &[&[u8]]) -> PayloadGraph {
-        self.encode_best_graph_inner(rows, 0).0
+        let graph = crate::payload::graph::with_context_mixing(false, || {
+            self.encode_best_graph_inner(rows, 0).0
+        });
+        if self.context_mixing {
+            graph.with_context_mixing()
+        } else {
+            graph
+        }
     }
 
     /// Encodes `rows` into serialized [`PayloadGraph`] wire bytes.
@@ -1347,9 +1418,13 @@ pub fn prog_fmt_int(is_deltas: bool, seed: i64) -> Program {
 
 /// Formats fixed-width zero-padded unsigned integers (`width` in `2..=16`).
 fn prog_fmt_zero_padded_uint(width: usize, seed: i64) -> Program {
+    prog_fmt_zero_padded(width, Some(seed))
+}
+
+fn prog_fmt_zero_padded(width: usize, seed: Option<i64>) -> Program {
     let b = Builder::new(1);
     let d = b.input(0);
-    let val = b.scan_add(d, seed);
+    let val = seed.map_or(d, |seed| b.scan_add(d, seed));
     if width <= 8 {
         let scale = 10i64.pow((8 - width) as u32);
         let scaled = if scale == 1 {
@@ -1839,11 +1914,7 @@ impl JavaLcgPack {
         let steps = b.scan_add(b.input(0), 0);
         let forward = b.ri(Op::AndI, steps, LCG_MASK as i64);
         let is_back = b.ri(Op::ShrI, forward, 47);
-        let back_left = b.rr(
-            Op::Sub,
-            b.konst(1i64 << 48),
-            forward,
-        );
+        let back_left = b.rr(Op::Sub, b.konst(1i64 << 48), forward);
         let mut left = b.select(is_back, back_left, forward);
         let dir_base = b.ri(Op::MulI, is_back, 48 * 16);
         let mut state = b.konst(anchor as i64);
@@ -2076,11 +2147,7 @@ impl TimestampIsoPack {
         if !(19..=36).contains(&s.len()) {
             return None;
         }
-        if s[4] != b'-'
-            || s[7] != b'-'
-            || !matches!(s[13], b':' | b'.')
-            || s[16] != s[13]
-        {
+        if s[4] != b'-' || s[7] != b'-' || !matches!(s[13], b':' | b'.') || s[16] != s[13] {
             return None;
         }
         let sep = s[10];
@@ -2176,10 +2243,21 @@ impl TimestampIsoPack {
     }
 
     fn prog_iso(layout: &IsoLayout, seed_sec: i64, seed_sub: i64) -> Program {
+        Self::prog_iso_inner(layout, seed_sec, seed_sub, false)
+    }
+
+    fn prog_iso_inner(layout: &IsoLayout, seed_sec: i64, seed_sub: i64, combined: bool) -> Program {
         let has_frac = layout.frac_digits > 0;
-        let b = Builder::new(if has_frac { 2 } else { 1 });
-        let sec_d = b.input(0);
-        let t = b.scan_add(sec_d, seed_sec);
+        let b = Builder::new(if has_frac && !combined { 2 } else { 1 });
+        let (t, tick_sub) = if combined {
+            let scale = 10i64.pow(layout.frac_digits as u32);
+            let ticks = b.scan_add(b.input(0), seed_sec * scale + seed_sub);
+            let seconds = b.div_wide(ticks, scale as u64);
+            let sub = b.rr(Op::Sub, ticks, b.ri(Op::MulI, seconds, scale));
+            (seconds, Some(sub))
+        } else {
+            (b.scan_add(b.input(0), seed_sec), None)
+        };
 
         let (days, sod) = div_mod_const(&b, t, 86_400);
         let z = b.ri(Op::AddI, days, 719_468);
@@ -2252,8 +2330,7 @@ impl TimestampIsoPack {
         let mut sinks = vec![(s0, 8u8), (s1, 8u8), (s2, 3u8)];
 
         if has_frac {
-            let sub_d = b.input(1);
-            let sub = b.scan_add(sub_d, seed_sub);
+            let sub = tick_sub.unwrap_or_else(|| b.scan_add(b.input(1), seed_sub));
             let fsep_v = b.konst(layout.frac_sep as i64);
             sinks.push((fsep_v, 1));
             let fd = layout.frac_digits as usize;
@@ -3189,11 +3266,7 @@ impl Ipv4Pack {
         let has_s = b.select(suf, one, zero);
         let is_slash = b.ri(Op::ShrI, b.ri(Op::AddI, suf, -65537), 63);
         let is_colon = is_slash;
-        let delim = b.select(
-            is_colon,
-            b.konst(b':' as i64),
-            b.konst(b'/' as i64),
-        );
+        let delim = b.select(is_colon, b.konst(b':' as i64), b.konst(b'/' as i64));
         let num = b.select(
             is_colon,
             b.ri(Op::AddI, suf, -1),
@@ -3858,7 +3931,10 @@ impl CodecPack for NumericTemplatePack {
             slots.push(gb.merge_graph(&slot_g));
             texts.push(Vec::new());
         }
-        texts.last_mut().unwrap().extend_from_slice(&literals[n_slots]);
+        texts
+            .last_mut()
+            .unwrap()
+            .extend_from_slice(&literals[n_slots]);
         if slots.len() > 64 {
             return None;
         }
@@ -4415,14 +4491,14 @@ fn whole_pool(cols: &[&[&[u8]]]) -> PoolEnc {
 
 /// The pool cut into pages of whole rows, so a record reads one page and the first. Rows go in
 /// order of their longest cell's leading bytes, which puts like rows, and repeats, together.
-fn page_pool(
-    cols: &[&[&[u8]]],
-    rows: &[Vec<u32>],
-    page_bytes: usize,
-    level: i32,
-) -> PoolEnc {
+fn page_pool(cols: &[&[&[u8]]], rows: &[Vec<u32>], page_bytes: usize, level: i32) -> PoolEnc {
     const KEY: usize = 32;
-    let n_rows = rows.iter().flatten().map(|&r| r as usize + 1).max().unwrap_or(0);
+    let n_rows = rows
+        .iter()
+        .flatten()
+        .map(|&r| r as usize + 1)
+        .max()
+        .unwrap_or(0);
     let mut row_bytes = vec![0usize; n_rows];
     let mut key: Vec<&[u8]> = vec![&[]; n_rows];
     let mut longest = vec![0usize; n_rows];
@@ -4449,8 +4525,9 @@ fn page_pool(
         cur += row_bytes[r];
     }
     let mut pages = vec![Vec::new(); n_pages as usize];
-    let mut filters: Vec<_> =
-        (0..n_pages).map(|_| FilterBuilder::new(DEFAULT_FILTER_BITS)).collect();
+    let mut filters: Vec<_> = (0..n_pages)
+        .map(|_| FilterBuilder::new(DEFAULT_FILTER_BITS))
+        .collect();
     let mut col_pages = Vec::with_capacity(cols.len());
     let mut col_bases = Vec::with_capacity(cols.len());
     for (vals, rs) in cols.iter().zip(rows) {
@@ -4473,15 +4550,24 @@ fn page_pool(
         .map(|(vals, (ids, bases))| {
             let lens: Vec<i64> = vals.iter().map(|v| v.len() as i64).collect();
             // A run's place in its page, made a place in the pool.
-            let bases: Vec<i64> = bases.iter().zip(&starts).map(|(b, s)| (b + s) as i64).collect();
+            let bases: Vec<i64> = bases
+                .iter()
+                .zip(&starts)
+                .map(|(b, s)| (b + s) as i64)
+                .collect();
             let mut gb = GraphBuilder::new(vals.len());
             let p_node = gb.add_ext_pool();
             let s_node = gb.add_paged_slice(p_node, &lens, ids, &bases);
             gb.finish(s_node).encode()
         })
         .collect();
-    let filters = filters.into_iter().map(FilterBuilder::finish_page).collect();
-    let rows = (0..n_rows).map(|r| (row_bytes[r] > 0) as u32 * (page_of[r] + 1)).collect();
+    let filters = filters
+        .into_iter()
+        .map(FilterBuilder::finish_page)
+        .collect();
+    let rows = (0..n_rows)
+        .map(|r| (row_bytes[r] > 0) as u32 * (page_of[r] + 1))
+        .collect();
     (compress_pages(&pages, level), specs, filters, rows)
 }
 
@@ -4596,6 +4682,7 @@ impl PackRegistry {
         backend: EntropyBackend,
         level: i32,
     ) -> EncodedDenseBlock {
+        let _mixing = crate::payload::graph::ContextMixScope::new(false);
         with_encode_opts(backend, level, || {
             let n_cols = occ_streams.len();
             let mut col_blobs = Vec::with_capacity(n_cols);
@@ -4624,11 +4711,11 @@ impl PackRegistry {
             // Keyed lookups need a layout that places every cell, and reuse each column's first
             // distinct values.
             let shaped = layout.filter(|(plan, vids)| {
-                vids.iter().all(|&v| {
-                    matches!(plan.variants.get(v as usize), Some(PlanVariant::Shape(_)))
-                })
+                vids.iter()
+                    .all(|&v| matches!(plan.variants.get(v as usize), Some(PlanVariant::Shape(_))))
             });
-            let heads: Vec<OnceCell<FastSet<&[u8]>>> = (0..n_cols).map(|_| OnceCell::new()).collect();
+            let heads: Vec<OnceCell<FastSet<&[u8]>>> =
+                (0..n_cols).map(|_| OnceCell::new()).collect();
 
             // Phase 1: Single-column `PayloadGraph` + horizontal `ExtPeer` derivations.
             for cid in 0..n_cols {
@@ -4760,7 +4847,7 @@ impl PackRegistry {
                         if hits * 4 >= occ_len {
                             let t_refs: Vec<&[u8]> =
                                 templated.iter().map(|x| x.as_slice()).collect();
-                            let t_graph = self.encode_best_graph(&t_refs);
+                            let t_graph = self.encode_best_graph_inner(&t_refs, 0).0;
                             let mut gb = GraphBuilder::new(occ_len);
                             let t_node = gb.merge_graph(&t_graph);
                             let mut slot_nodes = Vec::with_capacity(interp_srcs.len());
@@ -4944,7 +5031,11 @@ impl PackRegistry {
                             cid,
                             occ_streams,
                             preencoded_nested,
-                            |c| heads[c].get_or_init(|| occ_streams[c].iter().take(1024).copied().collect()),
+                            |c| {
+                                heads[c].get_or_init(|| {
+                                    occ_streams[c].iter().take(1024).copied().collect()
+                                })
+                            },
                             |key, at| align_cells(plan, vids, key, at).ok(),
                         )
                         && cand_cost + 12 < best_cost
@@ -4952,6 +5043,33 @@ impl PackRegistry {
                         best_blob = cand;
                         best_cost = cand_cost;
                         used_ext[cid] = true;
+                    }
+                }
+
+                if !must_standalone
+                    && occ_len >= 64
+                    && let Some((plan, vids)) = shaped
+                {
+                    let context = RelationContext {
+                        column: cid,
+                        columns: occ_streams,
+                        plan,
+                        variant_ids: vids,
+                    };
+                    for pack in &self.relations {
+                        if let Some(graph) = pack.try_encode(&context, self)
+                            && graph.rows as usize == occ_len
+                            && graph.ext_peers.iter().all(|&peer| (peer as usize) < cid)
+                            && !graph.ext_pool
+                            && graph.ext_dict.is_none()
+                        {
+                            let (cand, cost) = graph.priced();
+                            if cost + 32 < best_cost {
+                                best_blob = cand;
+                                best_cost = cost;
+                                used_ext[cid] = true;
+                            }
+                        }
                     }
                 }
 
@@ -5048,7 +5166,8 @@ impl PackRegistry {
                 let mut entries: Vec<(&[u8], u32)> = merged.into_iter().collect();
                 entries.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
                 let entry_slices: Vec<&[u8]> = entries.iter().map(|e| e.0).collect();
-                let (dict_blob, dict_cost) = self.encode_best_graph(&entry_slices).priced();
+                let (dict_blob, dict_cost) =
+                    self.encode_best_graph_inner(&entry_slices, 0).0.priced();
 
                 let mut lut: FastMap<&[u8], i64> = fast_map_with_capacity(entry_slices.len());
                 for (id, &s) in entry_slices.iter().enumerate() {
@@ -5099,9 +5218,8 @@ impl PackRegistry {
             // Phase 3: Block-level `ProseSlice` (`ExtPool` + `SliceBuf`) across long-text columns.
             let mut prose_cols = Vec::<usize>::new();
             let mut total_prose_bytes = 0usize;
-            let paging = paging.filter(|_| {
-                backend == EntropyBackend::Zstd && with_current(|d| d.is_none())
-            });
+            let paging =
+                paging.filter(|_| backend == EntropyBackend::Zstd && with_current(|d| d.is_none()));
             // A column another column reads decodes whole, so a paged pool leaves it out.
             let mut read_by_peer = vec![false; n_cols];
             if paging.is_some() {
@@ -5186,6 +5304,19 @@ impl PackRegistry {
                 }
             }
 
+            if self.context_mixing {
+                for blob in col_blobs.iter_mut().chain(&mut shared_dict_blobs) {
+                    // Nested wrappers have already optimized their own constituent payloads.
+                    if let Ok(graph) =
+                        PayloadGraph::decode(blob, &crate::wire::DecodeBudget::default())
+                    {
+                        let mixed = graph.with_context_mixing().encode();
+                        if mixed.len() < blob.len() {
+                            *blob = mixed;
+                        }
+                    }
+                }
+            }
             EncodedDenseBlock {
                 shared_dict_blobs,
                 pool_pages,

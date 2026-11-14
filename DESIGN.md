@@ -57,6 +57,60 @@ predicate run once per dictionary value. `decode_cells` materializes byte string
 `zform::numeric` APIs use the same payload format outside record files.
 [`FORMAT.md` §4](FORMAT.md#4-model-and-column-payloads) specifies the wire representation.
 
+### context mixing
+
+`zform pack --context-mixing input.log -o output.zfm` enables an optional density pass.
+Library writers use `PackRegistry::default().with_context_mixing()` in their pack options.
+Default and fast encoding keep their existing choices.
+
+The planner first chooses the column graphs, shared dictionaries, and text pools. The density
+pass then tries context mixing on integer transports in those selected graphs. Trying it inside
+every pack candidate spent most of its time on graphs the planner discarded. Row-structure
+streams also participate. Programs, peer dependencies, dictionary views, and block indexes do
+not change; a selective read still fetches only its declared parts.
+
+This generalizes the experiment's prediction of dictionary IDs, flags, and small residuals.
+Three binary models predict from the current bit prefix, the preceding integer, and the preceding
+pair. Their mixture adapts using integer arithmetic. The transport has no log-format names,
+hardware topology, field parser, floating-point math, or state shared between payloads.
+Each stream uses at most 192 KiB of counter tables and resets at its boundary.
+
+Candidates need at least 512 values and an offset width of 1–16 bits. A prefix probe rejects
+clear losses; a complete candidate must save at least 32 bytes and approximately 2% of its
+integer stream, including framing. Constants, wide values, and streams already below 128 bytes
+skip the trial. Timestamps, numeric reconstruction, and byte formatting remain ordinary payload
+programs. The latency-oriented `add_ints_fast` path does not run this search.
+
+Context mixing trades decode speed for density, so it is opt-in even with `--best`.
+The reader implements one bounded integer transport, kind `9`; the lane VM gains no mutable
+hash tables or arbitrary loops. Older readers cannot decode a payload that selects this kind.
+Cross-field contexts could be a later extension with explicit graph dependencies, but the
+current transport uses only its own preceding values.
+
+### predictive relationships
+
+`zform pack --hdfs-predictors --context-mixing HDFS.log -o hdfs.zfm` enables HDFS relationships
+before the density pass. Library writers use `PackRegistry::with_hdfs_predictors()` or register
+their own `RelationPack`. A relation pack sees a column, its peers, and the record layout;
+it returns a self-describing payload graph. Single-column models still use `CodecPack`.
+
+`HdfsRelations` recognizes task/partition paths and size fields from template literals.
+It predicts a partition number from the task number, preserving zero padding and the filename
+hyphen. `ExtPeer`, `ParseAsciiInt`, a formatting program, and `PatchCells` reconstruct the bytes.
+For sizes, it tries a table holding the first attribute observed for each block ID. `ExtAlign`
+and `MatchIndex` locate the block's first occurrence; `IndexCells` reads its table entry.
+Changes become exact patches. Missing keys or ambiguous multi-key records decline the candidate.
+
+The registry accepts only graphs with earlier peer dependencies and at least 32 bytes of savings
+over the current choice, including graph and shared-code costs. Standalone columns skip relation
+packs. Context mixing then prices integer transports in the selected graph. Relations need no
+new reader opcode or HDFS knowledge in the reader. Their state and dependencies stay within the
+block, and the existing index records which peers a selective read needs.
+
+The HDFS pack remains opt-in. Task/partition reuse saved more than the per-block size model on
+the measured samples. Emitter- and operation-keyed recent-block caches did not reliably improve
+the existing block-ID encoding, so they remain benchmark experiments rather than decoder features.
+
 ## file layout
 
 A file is two byte regions. Offsets inside each are relative to its start, so a host can place

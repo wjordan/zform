@@ -23,6 +23,28 @@ use super::recur::{CompiledRecurrence, RecurrenceSpec};
 thread_local! {
     static ENC_OPTS: Cell<(EntropyBackend, i32)> =
         const { Cell::new((EntropyBackend::Zstd, 3)) };
+    static CONTEXT_MIXING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Enables the bounded integer context-mixing candidate within `f`. The fast numeric path
+/// remains unchanged. State belongs to each stream; nothing carries across payloads or blocks.
+pub fn with_context_mixing<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+    let _guard = ContextMixScope::new(enabled);
+    f()
+}
+
+pub(crate) struct ContextMixScope(bool);
+
+impl ContextMixScope {
+    pub(crate) fn new(enabled: bool) -> Self {
+        Self(CONTEXT_MIXING.with(|c| c.replace(enabled)))
+    }
+}
+
+impl Drop for ContextMixScope {
+    fn drop(&mut self) {
+        CONTEXT_MIXING.with(|c| c.set(self.0));
+    }
 }
 
 /// Runs `f` with `(backend, level)` active as the default leaf entropy settings for [`GraphBuilder`].
@@ -158,6 +180,13 @@ pub enum IntStream {
         len: u32,
         bytes: Vec<u8>,
     },
+    ContextMix {
+        len: u32,
+        min: i64,
+        bits: u8,
+        table_bits: u8,
+        bytes: Vec<u8>,
+    },
     ForPlanes {
         len: u32,
         min: i64,
@@ -180,7 +209,60 @@ pub enum IntStream {
 impl IntStream {
     /// Automatically chooses the smallest domain-agnostic encoding for `vals`.
     pub fn auto_encode(vals: &[i64]) -> Self {
-        Self::auto_encode_inner(vals, true)
+        let base = Self::auto_encode_inner(vals, true);
+        if CONTEXT_MIXING.with(Cell::get) {
+            Self::consider_context_mix(vals, base)
+        } else {
+            base
+        }
+    }
+
+    fn consider_context_mix(vals: &[i64], base: Self) -> Self {
+        if vals.len() < 512 || matches!(base, Self::Const { .. }) {
+            return base;
+        }
+        let min = *vals.iter().min().unwrap();
+        let max = *vals.iter().max().unwrap();
+        let span = (max as u64).wrapping_sub(min as u64);
+        let bits = (64 - span.leading_zeros()) as u8;
+        if !(1..=16).contains(&bits) {
+            return base;
+        }
+        let mut wire = Vec::new();
+        base.encode(&mut wire);
+        if wire.len() < 128 {
+            return base;
+        }
+        let target = wire.len() - 32.max(wire.len() / 50);
+        let table_bits = (usize::BITS - vals.len().leading_zeros()).clamp(8, 14) as u8;
+        if vals.len() > 2048 {
+            let sample = &vals[..2048];
+            let sample_base = Self::auto_encode_inner(sample, true);
+            wire.clear();
+            sample_base.encode(&mut wire);
+            // A small warm-up loss can recover on a longer lane; clear losses stop here.
+            let limit = wire.len() + wire.len() / 8;
+            if super::context_mix::encode(sample, min, bits, table_bits, limit).is_none() {
+                return base;
+            }
+        }
+        let Some(bytes) = super::context_mix::encode(vals, min, bits, table_bits, target) else {
+            return base;
+        };
+        let candidate = Self::ContextMix {
+            len: vals.len() as u32,
+            min,
+            bits,
+            table_bits,
+            bytes,
+        };
+        wire.clear();
+        candidate.encode(&mut wire);
+        if wire.len() <= target {
+            candidate
+        } else {
+            base
+        }
     }
 
     fn auto_encode_inner(vals: &[i64], allow_tail: bool) -> Self {
@@ -414,6 +496,7 @@ impl IntStream {
             Self::Const { len, .. }
             | Self::Rle { len, .. }
             | Self::Rice { len, .. }
+            | Self::ContextMix { len, .. }
             | Self::ForBitpack { len, .. }
             | Self::ZigZagVarint { len, .. }
             | Self::ForPlanes { len, .. }
@@ -428,6 +511,20 @@ impl IntStream {
 
     pub fn encode(&self, out: &mut Vec<u8>) {
         match self {
+            Self::ContextMix {
+                len,
+                min,
+                bits,
+                table_bits,
+                bytes,
+            } => {
+                out.push(9);
+                put_uvarint(out, *len as u64);
+                put_ivarint(out, *min);
+                out.extend_from_slice(&[*bits, *table_bits]);
+                put_uvarint(out, bytes.len() as u64);
+                out.extend_from_slice(bytes);
+            }
             Self::Const { val, len } => {
                 let shift = val.trailing_zeros().min(63);
                 let coefficient = *val >> shift;
@@ -524,11 +621,26 @@ impl IntStream {
         }
         let kind = cur.u8()?;
         let len_u64 = cur.uvar()?;
-        if len_u64 > (budget.max_single_alloc_bytes / 8) as u64 {
+        if len_u64 > u32::MAX as u64 || len_u64 > (budget.max_single_alloc_bytes / 8) as u64 {
             return Err(Error::BudgetExceeded("IntStream length"));
         }
         let len = len_u64 as u32;
         match kind {
+            9 => {
+                let min = cur.ivar()?;
+                let bits = cur.u8()?;
+                let table_bits = cur.u8()?;
+                let bytes = cur.bytes()?;
+                super::context_mix::validate(len as usize, bits, table_bits, bytes.len(), budget)?;
+                budget.check_alloc(bytes.len(), "context mixing bytes")?;
+                Ok(Self::ContextMix {
+                    len,
+                    min,
+                    bits,
+                    table_bits,
+                    bytes: bytes.to_vec(),
+                })
+            }
             8 => Ok(Self::Rice {
                 len,
                 bytes: cur.bytes()?.to_vec(),
@@ -615,6 +727,13 @@ impl IntStream {
         match self {
             Self::Const { val, len } => Ok(vec![*val; *len as usize]),
             Self::Rice { len, bytes } => super::rice::decode(bytes, *len as usize, budget),
+            Self::ContextMix {
+                len,
+                min,
+                bits,
+                table_bits,
+                bytes,
+            } => super::context_mix::decode(bytes, *len as usize, *min, *bits, *table_bits, budget),
             Self::Rle { len, leaf } => {
                 let n = *len as usize;
                 let raw = unpack_leaf(leaf, budget)?;
@@ -1104,6 +1223,35 @@ pub struct PayloadGraph {
 }
 
 impl PayloadGraph {
+    /// Tries context mixing only on this graph's selected integer transports. Programs,
+    /// dependencies and lazy cell views stay intact; losing pack candidates pay no mixer cost.
+    pub fn with_context_mixing(mut self) -> Self {
+        let budget = DecodeBudget::default();
+        for node in &mut self.nodes {
+            let GraphNode::IntStream(stream) = node else {
+                continue;
+            };
+            if stream.len() < 512
+                || matches!(
+                    stream,
+                    IntStream::Const { .. } | IntStream::ContextMix { .. }
+                )
+            {
+                continue;
+            }
+            let mut wire = Vec::new();
+            stream.encode(&mut wire);
+            if wire.len() < 128 {
+                continue;
+            }
+            if let Ok(values) = stream.unpack(&budget) {
+                let base = std::mem::replace(stream, IntStream::Const { val: 0, len: 0 });
+                *stream = IntStream::consider_context_mix(&values, base);
+            }
+        }
+        self
+    }
+
     pub fn empty() -> Self {
         Self {
             rows: 0,
@@ -1398,6 +1546,47 @@ impl PayloadGraph {
             root: root as u16,
         })
     }
+}
+
+/// [`PayloadGraph::decode_linked`], with the wire bytes of each node in node order. The rest of
+/// `b` is the graph's header and root.
+pub(crate) fn decode_linked_sizes(
+    b: &[u8],
+    lib: &Library,
+    budget: &DecodeBudget,
+) -> Result<(PayloadGraph, Vec<usize>)> {
+    let graph = PayloadGraph::decode_linked(b, lib, budget)?;
+    let mut sizes = Vec::with_capacity(graph.nodes.len());
+    if graph.rows == 0 {
+        return Ok((graph, sizes));
+    }
+    let mut cur = Cursor::new(b);
+    cur.uvar()?;
+    let flags = cur.u8()?;
+    if matches!(flags, 8 | 16) {
+        let at = cur.pos;
+        IntStream::decode_wire(&mut cur, budget, 0)?;
+        sizes.push(cur.pos - at);
+        if flags == 16 {
+            sizes.push(cur.remaining());
+        }
+        return Ok((graph, sizes));
+    }
+    if flags & EXT_FLAG_DICT != 0 {
+        cur.uvar()?;
+    }
+    if flags & EXT_FLAG_PEERS != 0 {
+        for _ in 0..cur.uvar()? {
+            cur.uvar()?;
+        }
+    }
+    let n_nodes = cur.uvar()? as usize;
+    for idx in 0..n_nodes {
+        let at = cur.pos;
+        decode_node(&mut cur, idx, lib, budget)?;
+        sizes.push(cur.pos - at);
+    }
+    Ok((graph, sizes))
 }
 
 /// Builder for a single-column [`PayloadGraph`].
@@ -2711,9 +2900,10 @@ impl CoreDecoder {
             let GraphNode::ProgramCells { prog, .. } = &graph.nodes[t] else {
                 return None;
             };
-            let scans = prog.ops.iter().any(|i| {
-                matches!(i.op, Op::ScanAdd | Op::ScanXor | Op::ScanF64Add)
-            });
+            let scans = prog
+                .ops
+                .iter()
+                .any(|i| matches!(i.op, Op::ScanAdd | Op::ScanXor | Op::ScanF64Add));
             (!scans).then_some(t)
         });
         if let Some(t) = sparse {
@@ -3451,10 +3641,13 @@ fn match_index(
             out.push(0);
             continue;
         }
-        let pos = usize::try_from(n).ok().filter(|&n| n < groups).and_then(|n| {
-            let (lo, hi) = (starts[n] as i64, starts[n + 1] as i64);
-            (code > 0 && code <= hi - lo).then(|| by_key[(lo + code - 1) as usize])
-        });
+        let pos = usize::try_from(n)
+            .ok()
+            .filter(|&n| n < groups)
+            .and_then(|n| {
+                let (lo, hi) = (starts[n] as i64, starts[n + 1] as i64);
+                (code > 0 && code <= hi - lo).then(|| by_key[(lo + code - 1) as usize])
+            });
         out.push(pos.ok_or_else(|| Error::Format("MatchIndex code out of bounds".into()))? as i64);
     }
     Ok(out)
@@ -3760,7 +3953,9 @@ fn sparse_cells(
     budget: &DecodeBudget,
 ) -> Result<Col> {
     let GraphNode::ProgramCells { prog, inputs, bufs } = node else {
-        return Err(Error::Format("sparse cells of a node that is no program".into()));
+        return Err(Error::Format(
+            "sparse cells of a node that is no program".into(),
+        ));
     };
     let at: Vec<usize> = reads.iter().flat_map(|&(s, e)| s..e.min(n)).collect();
     let mut cols = Vec::with_capacity(inputs.len());

@@ -10,20 +10,21 @@ struct ReadmeExamples;
 
 pub use zform_core::block;
 pub use zform_core::cells;
+pub mod bytes;
 pub mod column;
 pub mod numeric;
-pub mod bytes;
 pub use zform_core::file;
 pub use zform_core::file::{RowSet, Stats};
+pub use zform_core::inspect;
 pub use zform_core::json_tree::JsonDoc;
 pub use zform_core::packs;
 pub use zform_core::payload;
 pub use zform_core::{
     CodecPack, ColumnProfile, CoreDecoder, DecodeBudget, Dictionary, DictionaryBuilder,
-    EntropyBackend, Error, FrameFit,
-    FramingSpec, InspectReport, ModelPlan, PackOptions, PackRegistry, PayloadGraph, Predicate,
-    Profile, ResolvedFraming, Result, StreamEncoder, TrainOptions, build_dictionary,
-    eval_raw_record, inspect_stream, logical, pack_stream, raw_field_values,
+    EntropyBackend, Error, FrameFit, FramingSpec, HdfsRelations, InspectReport, ModelPlan,
+    PackOptions, PackRegistry, PayloadGraph, Predicate, Profile, RelationContext, RelationPack,
+    ResolvedFraming, Result, StreamEncoder, TrainOptions, build_dictionary, eval_raw_record,
+    inspect_stream, logical, pack_stream, raw_field_values,
 };
 
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -501,7 +502,14 @@ mod tests {
         // Most rows repeat the nested stamp at the top level, so the field is coded as a copy.
         let mut raw = Vec::new();
         for i in 0..2000u64 {
-            let at = |s: u64| format!("2026-11-10T{:02}:{:02}:{:02}Z", s / 3600, s / 60 % 60, s % 60);
+            let at = |s: u64| {
+                format!(
+                    "2026-11-10T{:02}:{:02}:{:02}Z",
+                    s / 3600,
+                    s / 60 % 60,
+                    s % 60
+                )
+            };
             let (nested, top) = (at(i * 7), at(i * 7 + if i % 4 == 3 { 3 } else { 0 }));
             raw.extend_from_slice(
                 format!("{{\"n\":{i},\"issue\":{{\"updated_at\":\"{nested}\"}},\"created_at\":\"{top}\"}}\n")
@@ -588,8 +596,15 @@ mod tests {
         let mut n = 0;
         arch.select(&fields, &Predicate::All, |row, path, v| {
             let mut want = Vec::new();
-            raw_field_values(recs[row as usize], fields[path], &mut |v| want.push(v.to_vec()));
-            assert_eq!(v.map(<[u8]>::to_vec), want.pop(), "row {row} {}", fields[path]);
+            raw_field_values(recs[row as usize], fields[path], &mut |v| {
+                want.push(v.to_vec())
+            });
+            assert_eq!(
+                v.map(<[u8]>::to_vec),
+                want.pop(),
+                "row {row} {}",
+                fields[path]
+            );
             n += 1;
             Ok(())
         })
@@ -930,18 +945,35 @@ mod tests {
     #[test]
     fn a_new_key_layout_extends_the_plan_once() {
         let rec = |i: usize, coc: bool| {
-            let coc = if coc { format!(",\"coc\":\"k{}\"", i % 3) } else { String::new() };
+            let coc = if coc {
+                format!(",\"coc\":\"k{}\"", i % 3)
+            } else {
+                String::new()
+            };
             let (name, size, stars) = (i * 7 % 101, i * 13 % 997, i % 50);
-            format!("{{\"id\":{i},\"repo\":{{\"name\":\"r{name}\",\"size\":{size}{coc},\"stars\":{stars}}}}}\n")
+            format!(
+                "{{\"id\":{i},\"repo\":{{\"name\":\"r{name}\",\"size\":{size}{coc},\"stars\":{stars}}}}}\n"
+            )
         };
-        let chunk = |coc: bool, from: usize| (from..from + 200).map(|i| rec(i, coc)).collect::<String>();
+        let chunk =
+            |coc: bool, from: usize| (from..from + 200).map(|i| rec(i, coc)).collect::<String>();
         let shapes = |enc: &StreamEncoder| {
             let jt = enc.active_plan().unwrap().json_tree.as_ref().unwrap();
-            jt.paths.iter().find(|p| p.name == "$.repo").unwrap().shapes.len()
+            jt.paths
+                .iter()
+                .find(|p| p.name == "$.repo")
+                .unwrap()
+                .shapes
+                .len()
         };
         let mut enc = StreamEncoder::new(PackOptions::default());
         let (mut out, mut raw) = (Vec::new(), String::new());
-        for (coc, from, want) in [(true, 0, 1), (false, 200, 2), (true, 400, 2), (false, 600, 2)] {
+        for (coc, from, want) in [
+            (true, 0, 1),
+            (false, 200, 2),
+            (true, 400, 2),
+            (false, 600, 2),
+        ] {
             let c = chunk(coc, from);
             enc.encode_frame(c.as_bytes(), &mut out).unwrap();
             raw.push_str(&c);
@@ -1331,7 +1363,10 @@ mod tests {
         let rows = (0..n)
             .map(|i| {
                 let body = &texts[(i * 7919) % 300];
-                format!("{{\"id\":{i},\"svc\":\"svc{}\",\"body\":\"{body}\"}}", i % 7)
+                format!(
+                    "{{\"id\":{i},\"svc\":\"svc{}\",\"body\":\"{body}\"}}",
+                    i % 7
+                )
             })
             .collect();
         (texts, rows)
@@ -1345,16 +1380,24 @@ mod tests {
         let raw = rows.join("\n") + "\n";
         let recs = lines(raw.as_bytes());
         let profile = train(raw.as_bytes(), &TrainOptions::default(), None).unwrap();
-        let mut opts = PackOptions { block_rows: 50, profile: Some(profile), ..Default::default() };
+        let mut opts = PackOptions {
+            block_rows: 50,
+            profile: Some(profile),
+            ..Default::default()
+        };
         let plain = assert_roundtrip(raw.as_bytes(), &opts);
-        let dict = build_dictionary(raw.as_bytes(), &opts, 1 << 20).unwrap().unwrap();
+        let dict = build_dictionary(raw.as_bytes(), &opts, 1 << 20)
+            .unwrap()
+            .unwrap();
         let mut by_record = DictionaryBuilder::new(&opts, 1 << 20).unwrap();
         recs.iter().for_each(|r| by_record.push(r));
         assert_eq!(dict.id(), by_record.finish().unwrap().id());
         opts.dictionary = Some(std::sync::Arc::new(dict));
         let with = assert_roundtrip(raw.as_bytes(), &opts);
         let rep = inspect_stream(&with[..], &DecodeBudget::default()).unwrap();
-        assert!(rep.passthrough_frames == 0 && rep.column_bytes.iter().any(|c| c.0 == "$dictionary"));
+        assert!(
+            rep.passthrough_frames == 0 && rep.column_bytes.iter().any(|c| c.0 == "$dictionary")
+        );
         assert_grep(&with, &recs, &eq("svc", "svc3"));
 
         // Concatenated after a stream with no dictionary, and before one.
@@ -1385,7 +1428,11 @@ mod tests {
         let mut builder = DictionaryBuilder::new(&opts, 1 << 20).unwrap();
         recs.iter().for_each(|r| builder.push(r));
         let dict = std::sync::Arc::new(builder.finish().unwrap());
-        assert!((300 * 192..=300 * 194).contains(&dict.len()), "{}", dict.len());
+        assert!(
+            (300 * 192..=300 * 194).contains(&dict.len()),
+            "{}",
+            dict.len()
+        );
         opts.dictionary = Some(dict.clone());
         let (data, index) = write(&opts);
         assert!(
@@ -1470,8 +1517,14 @@ mod tests {
         fetched.set((0, u64::MAX));
         let mut cache = RangeCache::default();
         let again = open(&mut cache);
-        assert!(again.set_dictionary(std::sync::Arc::new(Dictionary::new(vec![7; 64]))).is_err());
-        again.set_dictionary(file.dictionary().unwrap().clone()).unwrap();
+        assert!(
+            again
+                .set_dictionary(std::sync::Arc::new(Dictionary::new(vec![7; 64])))
+                .is_err()
+        );
+        again
+            .set_dictionary(file.dictionary().unwrap().clone())
+            .unwrap();
         check(&mut again.session(), &mut cache);
         assert!(fetched.get().1 > low, "{:?}", fetched.get());
 
@@ -1541,7 +1594,12 @@ mod tests {
         let dir = BlockDir::decode(dir_page, &budget).unwrap();
         let (pool_off, _) = dir.pool.expect("a text pool");
         assert!(dir.pages.len() > 8, "{:?}", dir.pages);
-        let over: Vec<u32> = dir.pages.iter().map(|p| p.1).filter(|&r| r > page as u32).collect();
+        let over: Vec<u32> = dir
+            .pages
+            .iter()
+            .map(|p| p.1)
+            .filter(|&r| r > page as u32)
+            .collect();
         assert!(over.len() == 1 && over[0] > 4000 * 4, "{over:?}");
         let page_at: Vec<(u64, u64)> = dir
             .pages
@@ -1562,7 +1620,8 @@ mod tests {
             (0..page_at.len())
                 .filter(|&i| {
                     let (at, n) = page_at[i];
-                    read.iter().any(|r| r.region == Region::Data && r.off < at + n && at < r.end())
+                    read.iter()
+                        .any(|r| r.region == Region::Data && r.off < at + n && at < r.end())
                 })
                 .collect()
         };
@@ -1603,12 +1662,18 @@ mod tests {
             };
             assert_eq!(std::str::from_utf8(&got).unwrap(), want);
             let pages = touched(&std::mem::take(&mut *read.borrow_mut()));
-            assert!(pages.len() <= 2 && pages[0] == 0, "row {row} read pages {pages:?}");
+            assert!(
+                pages.len() <= 2 && pages[0] == 0,
+                "row {row} read pages {pages:?}"
+            );
         }
 
         // A search takes the first page and those whose filters hold the words, here a title's.
         let rec = std::str::from_utf8(recs[250]).unwrap();
-        let word = rec[rec.find("\"title\":\"").unwrap() + 9..].split('"').next().unwrap();
+        let word = rec[rec.find("\"title\":\"").unwrap() + 9..]
+            .split('"')
+            .next()
+            .unwrap();
         let want: Vec<u64> = (0..recs.len() as u64)
             .filter(|&r| {
                 let rec = recs[r as usize];
@@ -1646,7 +1711,10 @@ mod tests {
         };
         let (got, pages) = search(&index, &Predicate::Word(word.into()));
         assert_eq!(got.unwrap(), want);
-        assert!(pages.len() <= 3 && pages[0] == 0, "{word} read pages {pages:?}");
+        assert!(
+            pages.len() <= 3 && pages[0] == 0,
+            "{word} read pages {pages:?}"
+        );
         let (_, every) = search(&index, &Predicate::Contains(b" ".to_vec()));
         assert_eq!(every.len(), page_at.len());
 
