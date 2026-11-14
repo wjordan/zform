@@ -42,8 +42,19 @@ pub fn with_encode_opts<R>(backend: EntropyBackend, level: i32, f: impl FnOnce()
     f()
 }
 
+/// A leaf of an integer stream. It is not compressed against the dictionary, whose values it
+/// would rarely match for more than the search costs.
 #[inline]
 pub(crate) fn pack_leaf(raw: &[u8]) -> Vec<u8> {
+    let (backend, level) = ENC_OPTS.with(|c| c.get());
+    let mut out = Vec::with_capacity(raw.len() + 12);
+    compress_leaf(&mut out, raw, backend, level);
+    out
+}
+
+/// A leaf of bytes, compressed against the dictionary in scope.
+#[inline]
+pub(crate) fn pack_text_leaf(raw: &[u8]) -> Vec<u8> {
     let (backend, level) = ENC_OPTS.with(|c| c.get());
     let mut out = Vec::with_capacity(raw.len() + 12);
     with_current(|dict| compress_leaf_with(&mut out, raw, backend, level, dict));
@@ -1522,7 +1533,7 @@ impl GraphBuilder {
 
     pub fn add_bytes(&mut self, bytes: &[u8]) -> u16 {
         self.push(GraphNode::Bytes {
-            leaf: pack_leaf(bytes),
+            leaf: pack_text_leaf(bytes),
         })
     }
 

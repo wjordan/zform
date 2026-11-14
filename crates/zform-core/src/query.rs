@@ -321,6 +321,36 @@ impl FieldPlan {
         fp
     }
 
+    /// A plan that walks to the values of `paths` and of the paths they derive from.
+    fn of_paths(jt: &JsonTreePlan, paths: &[usize]) -> Self {
+        let n = jt.paths.len();
+        let mut fp = FieldPlan {
+            track: vec![false; n],
+            hooks: vec![Vec::new(); n],
+            rem: vec![None; n],
+            consts: Vec::new(),
+            cols: Vec::new(),
+            leaf_cols: Vec::new(),
+            own_cols: Vec::new(),
+            subtree_cols: Vec::new(),
+            prunable: false,
+            streams: Vec::new(),
+            route: WalkRoute::default(),
+        };
+        paths.iter().for_each(|&pi| fp.add_tracked(jt, pi));
+        fp.cols.sort_unstable();
+        fp.cols.dedup();
+        fp.route = WalkRoute::of(
+            jt,
+            &JsonWalk {
+                track: &fp.track,
+                ..JsonWalk::default()
+            },
+        );
+        fp.streams = fp.route.streams(jt);
+        fp
+    }
+
     /// The column whose cell `i` is the one value the field has in row `i`, in a block where
     /// that holds for every row.
     fn row_col(&self, kinds: u16, dir: &BlockDir) -> Option<u16> {
@@ -420,6 +450,41 @@ impl FieldPlan {
     }
 }
 
+/// Whether `needle` can lie inside the Base64 spelling of the printable ASCII text a Base64
+/// candidate holds: at one of the four offsets into a 4-character group, every byte the needle's
+/// bits touch agrees with some printable byte.
+fn b64_may_hold(needle: &[u8]) -> bool {
+    let six = |c: u8| match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    };
+    // Padding ends a value; such a needle is rare enough to keep without a test.
+    if needle.contains(&b'=') {
+        return needle.iter().all(|&c| c == b'=' || six(c).is_some());
+    }
+    let Some(v) = needle.iter().map(|&c| six(c)).collect::<Option<Vec<u8>>>() else {
+        return false;
+    };
+    (0..4).any(|a| {
+        let (lo, hi) = (6 * a, 6 * (a + v.len()));
+        let last = hi.div_ceil(8) - 1;
+        (lo / 8..=last).all(|b| {
+            let (mut mask, mut val) = (0u8, 0u8);
+            for i in (0..8).filter(|i| (lo..hi).contains(&(8 * b + i))) {
+                let g = 8 * b + i - lo;
+                mask |= 0x80 >> i;
+                val |= ((v[g / 6] >> (5 - g % 6)) & 1) << (7 - i);
+            }
+            // Zero bits that end the needle may be the padding after a value's last byte.
+            (b == last && hi % 8 != 0 && val == 0) || (0x20..0x7fu8).any(|x| x & mask == val)
+        })
+    })
+}
+
 /// What a variant's rows need to answer a substring test.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum VarNeedle {
@@ -446,6 +511,9 @@ pub(crate) struct NeedlePlan {
     word: bool,
     /// The needle can match a `"` or the bare token `null`, which a quoted column adds to cells.
     quote_sensitive: bool,
+    /// When JSON rows are scanned and the needle can lie inside a Base64 value, which is in no
+    /// cell: the walk to the paths that write such values.
+    b64: Option<FieldPlan>,
 }
 
 /// True when a match of `needle` could lie partly in one of `lits` and partly outside it, or two
@@ -502,6 +570,7 @@ impl NeedlePlan {
         };
         let mut vars = Vec::with_capacity(plan.variants.len());
         let mut unknown_kinds = 0u16;
+        let mut b64 = None;
         for (vi, v) in plan.variants.iter().enumerate() {
             let (var, kind) = match v {
                 PlanVariant::Shape(s) => {
@@ -578,6 +647,8 @@ impl NeedlePlan {
                                             .filter(|l| !l.is_empty()),
                                     );
                                 }
+                                // Of a Base64 value, only its quotes are literal text.
+                                JsonCand::MultiConcat { b64: true, .. } => lits.push(b"\""),
                                 JsonCand::MultiConcat { lits: ls, .. } => {
                                     let n = ls.len();
                                     lits.extend(
@@ -595,6 +666,17 @@ impl NeedlePlan {
                     let exact = joined
                         && !lits.iter().any(|l| has(l))
                         && !literals_can_overlap_needle(lits.into_iter(), needle);
+                    let b64_paths: Vec<usize> = (0..jt.paths.len())
+                        .filter(|&pi| {
+                            jt.paths[pi]
+                                .cands
+                                .iter()
+                                .any(|c| matches!(c, JsonCand::MultiConcat { b64: true, .. }))
+                        })
+                        .collect();
+                    if exact && !b64_paths.is_empty() && b64_may_hold(needle) {
+                        b64 = Some(FieldPlan::of_paths(jt, &b64_paths));
+                    }
                     (
                         if exact {
                             VarNeedle::Scan
@@ -635,16 +717,18 @@ impl NeedlePlan {
             }
         }
         let all_true = vars.contains(&VarNeedle::AllTrue);
+        let b64_open = if b64.is_some() { KIND_JSON } else { 0 };
         NeedlePlan {
             vars,
             unknown_kinds,
-            open_kinds: unknown_kinds | if all_true { KIND_SHAPE } else { 0 },
+            open_kinds: unknown_kinds | b64_open | if all_true { KIND_SHAPE } else { 0 },
             scan_cols,
             letters: letters_of(needle),
             finder: finder.into_owned(),
             word,
             quote_sensitive: needle.contains(&b'"')
                 || memchr::memmem::find(b"null", needle).is_some(),
+            b64,
         }
     }
 
@@ -815,6 +899,9 @@ pub(crate) fn needs(pred: &Predicate, m: &BlockMeta<'_>, plans: &mut Plans, need
         Predicate::Contains(needle) | Predicate::Word(needle) => {
             let np = plans.needle(m, needle, matches!(pred, Predicate::Word(_)));
             need.whole |= m.kinds & np.unknown_kinds != 0;
+            if let Some(fp) = &np.b64 {
+                fp.needs(m.kinds, m.dir, need);
+            }
             // A column with a cell for every row needs no structure to place its cells.
             let mut want = vec![false; need.cols.len()];
             for c in np.candidates(m) {
@@ -1126,6 +1213,35 @@ fn eval_contains(
             hits.push((cid, occs));
         }
     }
+    if let (Some(fp), Some(jt), Some(jvi)) = (&np.b64, &plan.json_tree, json_variant(plan)) {
+        let walk = JsonWalk {
+            track: &fp.track,
+            ..JsonWalk::default()
+        };
+        let map = map_json_block_structure(
+            jt,
+            rows.json_streams(),
+            &rows.variant_ids,
+            jvi,
+            &walk,
+            &fp.route,
+        )?;
+        let mut text = Vec::new();
+        for ev in &map.events {
+            let PathVal::Derived { cand, .. } = ev.val else {
+                continue;
+            };
+            let cands = &jt.paths[ev.path as usize].cands;
+            if !matches!(cands.get(cand as usize), Some(JsonCand::MultiConcat { b64: true, .. })) {
+                continue;
+            }
+            text.clear();
+            materialize(&map, ev, rows, &mut text, budget, 0)?;
+            if np.found(&text) {
+                tri[ev.row as usize] = YES;
+            }
+        }
+    }
     if hits.is_empty() {
         return Ok(tri);
     }
@@ -1300,8 +1416,15 @@ fn materialize(
             if depth > 8 {
                 return Err(Error::Format("derived value nests too deep".into()));
             }
+            let own = ev.path as usize;
             let mut stem = |k: usize, out: &mut Vec<u8>, unquote: bool| -> Result<()> {
-                let src = map.events[map.srcs[srcs as usize + k] as usize];
+                let src = map.srcs[srcs as usize + k];
+                if matches!(cand, JsonCand::MultiConcat { refs, .. } if refs[k] as usize == own) {
+                    // The free part: `src` is the occurrence of its cell.
+                    let col = jt.paths[own].value_col as usize;
+                    return rows.col(col, budget)?.write(src as usize, out);
+                }
+                let src = map.events[src as usize];
                 let mut t = Vec::new();
                 materialize(map, &src, rows, &mut t, budget, depth + 1)?;
                 let quoted = unquote && t.len() >= 2 && t[0] == b'"' && t[t.len() - 1] == b'"';
@@ -1316,11 +1439,21 @@ fn materialize(
                     out.extend_from_slice(suffix);
                     Ok(())
                 }
-                JsonCand::MultiConcat { lits, refs } => {
-                    out.extend_from_slice(&lits[0]);
+                JsonCand::MultiConcat { lits, refs, b64 } => {
+                    let mut text = Vec::new();
+                    let dst = if *b64 { &mut text } else { &mut *out };
+                    dst.extend_from_slice(&lits[0]);
                     for k in 0..refs.len() {
-                        stem(k, out, true)?;
-                        out.extend_from_slice(&lits[k + 1]);
+                        stem(k, dst, true)?;
+                        dst.extend_from_slice(&lits[k + 1]);
+                    }
+                    if *b64 {
+                        if !crate::json_tree::b64_text_ok(&text) {
+                            return Err(Error::Format("Base64 candidate text not printable".into()));
+                        }
+                        out.push(b'"');
+                        crate::lex::format_base64(&text, out);
+                        out.push(b'"');
                     }
                     Ok(())
                 }
@@ -1443,6 +1576,25 @@ pub(crate) fn field_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base64_rule_keeps_every_substring_of_printable_text() {
+        for text in [&b"04:User583"[..], b"012:PullRequest99", b" ~{}|", b"a"] {
+            let mut enc = Vec::new();
+            crate::lex::format_base64(text, &mut enc);
+            let body = enc.split(|&c| c == b'=').next().unwrap();
+            for s in 0..body.len() {
+                for e in s + 1..=body.len() {
+                    assert!(b64_may_hold(&body[s..e]), "{:?}", &body[s..e]);
+                }
+            }
+            assert!(b64_may_hold(&enc));
+        }
+        for n in ["clickhouse", "terminating", "kgDOexc", "2024", "main"] {
+            assert!(!b64_may_hold(n.as_bytes()), "{n}");
+        }
+        assert!(!b64_may_hold(b"a.b"));
+    }
 
     #[test]
     fn raw_field_values_follow_paths_through_arrays() {

@@ -10,6 +10,7 @@ use zstd_safe::{CCtx, CParameter, DCtx, DictAttachPref, ResetDirective};
 
 use crate::container::PackOptions;
 use crate::grammar::{ModelPlan, split_records_with_plan};
+use crate::packs::HexFixedPack;
 use crate::wire::{
     Cursor, DecodeBudget, EntropyBackend, Error, Result, decompress_leaf, put_leaf, window_log,
     xxh64,
@@ -58,13 +59,13 @@ impl Dictionary {
         self.id
     }
 
-    /// The content as a leaf.
-    pub(crate) fn store(&self) -> Vec<u8> {
+    /// The content as a leaf, at `level` or [`STORE_LEVEL`], whichever is higher.
+    pub(crate) fn store(&self, level: i32) -> Vec<u8> {
         let mut out = Vec::new();
         let len = self.len();
         let mut tmp = vec![0u8; zstd_safe::compress_bound(len)];
         let mut ctx = CCtx::create();
-        let _ = ctx.set_parameter(CParameter::CompressionLevel(STORE_LEVEL));
+        let _ = ctx.set_parameter(CParameter::CompressionLevel(level.max(STORE_LEVEL)));
         let _ = ctx.set_parameter(CParameter::WindowLog(window_log(len)));
         let _ = ctx.set_parameter(CParameter::EnableLongDistanceMatching(true));
         match ctx.compress2(&mut tmp[..], &self.bytes) {
@@ -93,11 +94,13 @@ impl Dictionary {
             let mut ctx = CCtx::try_create()?;
             // The tables hold a position per byte of content, so a value is found wherever it
             // sits. Attached, they are searched in place: a leaf pays for its own bytes only.
-            let log = self.len().max(2).ilog2().clamp(20, 30);
+            // The binary tree of levels 13 and up holds half the positions its chain log
+            // spans, hence one more.
+            let log = self.len().max(2).ilog2().clamp(20, 29);
             ctx.set_parameter(CParameter::CompressionLevel(level)).ok()?;
             ctx.set_parameter(CParameter::ChecksumFlag(false)).ok()?;
             ctx.set_parameter(CParameter::HashLog(log)).ok()?;
-            ctx.set_parameter(CParameter::ChainLog(log)).ok()?;
+            ctx.set_parameter(CParameter::ChainLog(log + 1)).ok()?;
             ctx.set_parameter(CParameter::ForceAttachDict(DictAttachPref::ForceAttach)).ok()?;
             ctx.load_dictionary(&self.bytes).ok()?;
             *enc = Some((level, ctx));
@@ -154,6 +157,12 @@ const MIN_VALUE: usize = 16;
 /// Values are kept while they come to under this many times the dictionary's budget.
 const KEEP_FACTOR: usize = 4;
 
+/// The most content a dictionary used at `level` is searched over: zstd loads only the last
+/// 16 MiB at levels 4 and below.
+fn max_content(level: i32) -> usize {
+    if level <= 4 { (1 << 24) - 2 } else { usize::MAX }
+}
+
 /// Chooses a file's dictionary in a pass over its records before they are written: the values
 /// that two or more blocks hold, those in the most blocks first, up to a byte budget. Its memory
 /// is the open block, 4 bytes per distinct value up to 64 MiB, and four budgets of values.
@@ -187,6 +196,15 @@ struct Found {
     last: u32,
 }
 
+/// A value the hex pack codes as the bytes it spells, as those bytes: its leaves hold them so.
+fn hex_bytes(v: &[u8]) -> Option<Vec<u8>> {
+    let inner = v.strip_prefix(b"\"").and_then(|v| v.strip_suffix(b"\"")).unwrap_or(v);
+    if !matches!(inner.len(), 16 | 32 | 40 | 64) {
+        return None;
+    }
+    HexFixedPack::parse_hex_row(inner, inner.len()).map(|(bytes, _)| bytes)
+}
+
 impl Tally {
     fn note(&mut self, v: &[u8]) {
         let h = xxh64(v, 0);
@@ -196,8 +214,12 @@ impl Tally {
         } else if !self.seen.has(h) {
             self.fresh.push(h);
         } else if self.arena.len() + v.len() <= self.max_bytes.saturating_mul(KEEP_FACTOR) {
-            let (off, len) = (self.arena.len(), v.len());
-            self.arena.extend_from_slice(v);
+            let off = self.arena.len();
+            match hex_bytes(v) {
+                Some(bytes) => self.arena.extend_from_slice(&bytes),
+                None => self.arena.extend_from_slice(v),
+            }
+            let len = self.arena.len() - off;
             self.found.insert(h, Found { off, len, blocks: 2, last: self.block });
         }
     }
@@ -249,7 +271,7 @@ impl Seen {
 
 impl DictionaryBuilder {
     /// For a file written with `opts`, which must name a profile: the values are those of its
-    /// model's columns. The dictionary holds at most `max_bytes`.
+    /// model's columns. The dictionary holds at most `max_bytes`, and 16 MiB at levels 1 to 4.
     pub fn new(opts: &PackOptions, max_bytes: usize) -> Option<Self> {
         Some(Self {
             plan: opts.profile.as_ref()?.plan.clone(),
@@ -257,7 +279,7 @@ impl DictionaryBuilder {
             block_bytes: opts.block_bytes.max(1),
             buf: Vec::new(),
             ends: Vec::new(),
-            tally: Tally { max_bytes, ..Tally::default() },
+            tally: Tally { max_bytes: max_bytes.min(max_content(opts.level)), ..Tally::default() },
         })
     }
 
@@ -367,6 +389,39 @@ mod tests {
     }
 
     #[test]
+    fn builder_holds_hex_as_its_bytes() {
+        let sha = "0123456789abcdef".repeat(3)[..40].to_string();
+        let other = "x".repeat(24);
+        let dict = build(&[&[&sha, &other], &[&sha, &other]], 1 << 20).unwrap();
+        let bytes: Vec<u8> =
+            (0..20).map(|i| u8::from_str_radix(&sha[2 * i..2 * i + 2], 16).unwrap()).collect();
+        assert!(dict.bytes.windows(20).any(|w| w == bytes), "{:?}", dict.bytes);
+        assert_eq!(dict.len(), 20 + other.len() + 2);
+    }
+
+    #[test]
+    fn deep_levels_reach_the_start_of_the_content() {
+        // Values alike but for a random tail, sorted as the builder writes them.
+        let mut state = 7u64;
+        let mut vals: Vec<String> = (0..24 << 10)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                format!("https://example.com/users/{state:016x}")
+            })
+            .collect();
+        vals.sort();
+        let dict = Dictionary::new(vals.concat().into_bytes());
+        // Values from the first quarter, which a tree spanning half the content misses.
+        let src: String = vals[..8192].iter().rev().step_by(4).map(String::as_str).collect();
+        let mut leaf = Vec::new();
+        let src = src.as_bytes();
+        crate::wire::compress_leaf_with(&mut leaf, src, EntropyBackend::Zstd, 19, Some(&dict));
+        assert!(leaf.len() < 2048 * 3, "{}", leaf.len());
+    }
+
+    #[test]
     fn leaf_reaches_its_dictionary_past_the_default_window() {
         let mut state = 7u64;
         let mut noise = |n: usize| -> Vec<u8> {
@@ -394,10 +449,10 @@ mod tests {
         assert!(read(None).is_err());
 
         // A dictionary read back from its stored leaf is the same one.
-        let stored = Dictionary::read(&dict.store(), dict.id(), &budget).unwrap();
+        let stored = Dictionary::read(&dict.store(3), dict.id(), &budget).unwrap();
         assert_eq!((stored.len(), stored.id()), (dict.len(), dict.id()));
         assert_eq!(read(Some(&stored)).unwrap(), raw);
-        assert!(Dictionary::read(&dict.store(), dict.id() ^ 1, &budget).is_err());
+        assert!(Dictionary::read(&dict.store(3), dict.id() ^ 1, &budget).is_err());
         let mut again = Vec::new();
         crate::wire::compress_leaf_with(&mut again, &raw, EntropyBackend::Zstd, 3, Some(&stored));
         assert_eq!(again, leaf);

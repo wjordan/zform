@@ -77,12 +77,15 @@ block gives every column more context and a selective read more to fetch and dec
 default is 65,536 rows or 8 MiB.
 
 **A dictionary gives small blocks the context of the file.** It is the column values that two
-or more blocks hold, each once, stored ahead of the blocks, and every part is compressed
-against it. Columns, queries and decode speed are as without one. The price is fixed per file
-instead of per block: whoever reads any block reads the whole dictionary first, in the round
-trip that fetches the block's parts, and holds it expanded. The writer is handed the dictionary.
-`DictionaryBuilder` needs a profile and chooses values within a byte budget in a pass before
-writing; it skips numbers, which are coded as such. The CLI builds one for a file of over a block under `--best` or `--dict-bytes`.
+or more blocks hold, each once, stored ahead of the blocks; every byte leaf of a part is
+compressed against it. Columns, queries and decode speed are as without one. The price is fixed
+per file: whoever reads any block reads the whole dictionary first, in the round trip that
+fetches the block's parts, and holds it expanded. The writer is handed the dictionary.
+`DictionaryBuilder` needs a profile and, in a pass before writing, keeps the values in the most
+blocks within a byte budget, at most 16 MiB at levels 1 to 4, which is all zstd searches there.
+It skips numbers and holds a hex id as the bytes it spells, as their columns code them. The CLI
+builds one for a file of over a block under `--best` (1/32 of the file, 8 to 32 MiB) or
+`--dict-bytes`.
 
 **The index region is derived data.** Scanning the data region rebuilds it.
 
@@ -163,7 +166,7 @@ returns the index region. Data region bytes are emitted in order as blocks compl
 revisited.
 
 - **Memory** is a multiple of the block size and does not grow with the file. A dictionary
-  adds its content and match tables, about four times its size; choosing one holds a block, a
+  adds its content and match tables, 7 to 13 times its size; choosing one holds a block, a
   filter of up to 64 MiB and four budgets of candidate values. Training adds sample and
   model-building memory. `TrainOptions` controls sampling, with defaults of 16,384 rows and 16 MiB.
 - **Models** come from a `Profile` or from training on the first records, and are stored in the

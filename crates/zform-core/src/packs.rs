@@ -14,7 +14,7 @@ use crate::codecs::{ColSummary, align_cells, int_bounds, time_bounds};
 use crate::grammar::{ModelPlan, PlanVariant};
 use crate::payload::graph::{
     FastMap, FastSet, GraphBuilder, GraphNode, IntStream, PayloadGraph, fast_map_with_capacity,
-    mtf_split, pack_leaf, with_encode_opts,
+    mtf_split, pack_text_leaf, with_encode_opts,
 };
 use crate::payload::ir::{Builder, Len, Op, Program, V};
 use crate::payload::recur::RecurrenceSpec;
@@ -3271,7 +3271,7 @@ impl CodecPack for Ipv4Pack {
 pub struct HexFixedPack;
 
 impl HexFixedPack {
-    fn parse_hex_row(s: &[u8], expected_chars: usize) -> Option<(Vec<u8>, bool)> {
+    pub(crate) fn parse_hex_row(s: &[u8], expected_chars: usize) -> Option<(Vec<u8>, bool)> {
         if s.len() != expected_chars || !expected_chars.is_multiple_of(2) {
             return None;
         }
@@ -5026,7 +5026,7 @@ impl PackRegistry {
                     let s_node = gb.add_slice_buf(p_node, base, &lens);
                     member_specs.push((cid, gb.finish(s_node).encode()));
                 }
-                let p_leaf = pack_leaf(&pool_raw);
+                let p_leaf = pack_text_leaf(&pool_raw);
                 let new_sum =
                     p_leaf.len() + 3 + member_specs.iter().map(|(_, b)| b.len()).sum::<usize>();
                 if new_sum + 16 < cur_sum {

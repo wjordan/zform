@@ -181,7 +181,7 @@ impl StreamEncoder {
 
     /// Writes the dictionary as a frame of its own.
     fn write_dictionary<W: Write>(&mut self, dict: &Dictionary, mut out: W) -> Result<()> {
-        let payload = dict.store();
+        let payload = dict.store(self.opts.level);
         let hdr = frame_header(
             FLAG_DICTIONARY | FLAG_HAS_CHECKSUM,
             EntropyBackend::Zstd,

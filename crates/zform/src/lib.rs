@@ -456,6 +456,79 @@ mod tests {
     }
 
     #[test]
+    fn base64_and_free_part_values_answer_queries() {
+        // A Base64 node id over the sibling id, an avatar with a varying digit, a url whose
+        // number comes later; some rows fit none of these.
+        let mut raw = Vec::new();
+        for i in 0..300u64 {
+            let id = 1000 + i * 7919 % 90_000;
+            let kind = if i % 5 == 0 { "Bot" } else { "User" };
+            let mut node = Vec::new();
+            let text = format!("0{}:{kind}{id}", kind.len());
+            zform_core::lex::format_base64(text.as_bytes(), &mut node);
+            let node = match i % 17 {
+                3 => format!("kgDOexc{i:05}"),
+                _ => String::from_utf8(node).unwrap(),
+            };
+            let avatar = match i % 19 {
+                7 => format!("https://cdn.test/x/{i}.png"),
+                _ => format!("https://img{}.cdn.test/u/{id}?v=4", i % 4),
+            };
+            let n = 1 + i * 31 % 5000;
+            let url = match i % 13 {
+                2 => format!("https://api.test/misc/{i}"),
+                _ => format!("https://api.test/repos/dev{}/issues/{n}", i % 23),
+            };
+            raw.extend_from_slice(
+                format!(
+                    "{{\"login\":\"dev{}\",\"id\":{id},\"node_id\":\"{node}\",\"avatar_url\":\"{avatar}\",\"url\":\"{url}\",\"number\":{n}}}\n",
+                    i % 23
+                )
+                .as_bytes(),
+            );
+        }
+        let comp = assert_roundtrip(&raw, &PackOptions::default());
+        let recs = lines(&raw);
+        let field = |r: &[u8], f: &str| {
+            let mut v = Vec::new();
+            raw_field_values(r, f, &mut |x| v = x[1..x.len() - 1].to_vec());
+            String::from_utf8(v).unwrap()
+        };
+        let b64_node = field(recs[41], "node_id");
+        let url = field(recs[41], "url");
+        let mid = &b64_node[5..13];
+        for pred in [
+            // Inside Base64-derived values.
+            contains(mid),
+            contains("VXNlcj"),
+            word(&b64_node),
+            // Ruled out of every Base64 value, so found only in the stored exceptions.
+            contains("kgDOexc00020"),
+            contains("kgDOexc"),
+            contains("img3.cdn"),
+            contains("issues/1"),
+            contains("/misc/"),
+            eq("node_id", &b64_node),
+            eq("url", &url),
+        ] {
+            let (rows, _) = assert_grep(&comp, &recs, &pred);
+            assert!(!rows.is_empty(), "{pred:?}");
+        }
+        let fields = ["node_id", "avatar_url", "url"];
+        let mut arch = Archive::open(IoCursor::new(&comp), DecodeBudget::default()).unwrap();
+        let mut n = 0;
+        arch.select(&fields, &Predicate::All, |row, path, v| {
+            let mut want = Vec::new();
+            raw_field_values(recs[row as usize], fields[path], &mut |v| want.push(v.to_vec()));
+            assert_eq!(v.map(<[u8]>::to_vec), want.pop(), "row {row} {}", fields[path]);
+            n += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(n, recs.len() * fields.len());
+    }
+
+    #[test]
     fn blocks_embed_in_a_foreign_container() {
         use crate::block::{BlockOptions, decode_block, encode_block, train};
         let rows: Vec<String> = (0..2000)

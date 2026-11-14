@@ -37,7 +37,8 @@ OPTIONS:
   --block-bytes <BYTES>     Raw bytes per block, the unit a query reads (default: 8388608 = 8 MiB)
   --block-rows <N>          Max records per block (default: 65536)
   --dict-bytes <BYTES>      File dictionary budget, for a file input of over one block whose text
-                            values recur across blocks (default: 0 = none; 8 MiB with --best)
+                            values recur across blocks (default: 0 = none; with --best, 1/32 of
+                            the file, 8 to 32 MiB). Levels 1-4 use at most 16 MiB
   --framing <MODE>          Record framing: auto (default), lf, crlf, nul, u32le, json, stride:<N>[:<HDR>]
   --no-checksum             Omit per-frame XXH64 content checksum
   --no-index                Omit the trailing index region (`grep` / `select` need it)
@@ -306,7 +307,11 @@ fn cmd_pack(args: &[String]) -> Result<(), String> {
 
     check_not_same_file(input, output)?;
     if let Some(p) = input.filter(|p| *p != "-") {
-        let budget = dict_bytes.unwrap_or(if best { 8 << 20 } else { 0 });
+        // Values that recur across blocks come to 2-3% of a large log, and at level 19 all of
+        // them pay.
+        let auto = |len: u64| (len as usize / 32).clamp(8 << 20, 32 << 20);
+        let len = std::fs::metadata(p).map_or(0, |m| m.len());
+        let budget = dict_bytes.unwrap_or(if best { auto(len) } else { 0 });
         file_profile(p, &mut opts, budget)?;
     }
     let rdr = open_input(input)?;

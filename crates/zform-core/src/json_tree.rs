@@ -4,7 +4,8 @@
 //!   e.g. `$.payload.commits[]`), varying scalars (`SlotKind::Scalar`), and wide/drifted JSON
 //!   subtrees (`SlotKind::Text`), while keeping constant fields inline in shape literals (`0` bytes)
 //! - Plan-level cross-path derivations (`JsonCand`: `Copy`, `Affix`, `MultiConcat`) across ancestor
-//!   and array-element scopes (`0` value bytes when `sel > 0`)
+//!   and array-element scopes; a `MultiConcat` may hold one free part stored in the path's own
+//!   column, or spell its value as Base64 of the concatenation
 //! - Native `u32` structural streams (`shape`, `count`, `sel`) and compressed-domain query mapping.
 
 use crate::codecs::{BlockDecodeCtx, decode_u32_seq, encode_u32_seq};
@@ -32,10 +33,15 @@ const TRAIN_SHAPE_COVER: f64 = 0.99;
 
 const DERIV_MIN_OCC: usize = 8;
 const DERIV_MAX_OCC: usize = 512;
-const DERIV_COVER: f64 = 0.50;
 const DERIV_MAX_AFFIX: usize = 128;
 const DERIV_MIN_REF: usize = 3;
 const DERIV_MAX_REFS: usize = 4;
+/// A candidate is kept if it fits at least this many sampled values, and one in this many.
+const DERIV_MIN_HITS: usize = 4;
+const DERIV_MIN_SHARE: usize = 10;
+/// Proposals scored per path, and decompositions per ref list paired to find free parts.
+const DERIV_PROPOSALS: usize = 12;
+const DERIV_PAIR_SAMPLE: usize = 16;
 const MAX_CANDS_PER_PATH: usize = 4;
 
 // ============================================================================
@@ -464,7 +470,7 @@ pub struct JsonSlotPart {
     pub sep: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum JsonCand {
     /// Exact copy of `paths[ref_path]` (`sel > 0` emits 0 value bytes!).
     Copy { ref_path: u16 },
@@ -474,8 +480,21 @@ pub enum JsonCand {
         ref_path: u16,
         suffix: Vec<u8>,
     },
-    /// Multi-ref template `lits[0] + unquote(paths[refs[0]]) + lits[1] + ... + lits[k]`.
-    MultiConcat { lits: Vec<Vec<u8>>, refs: Vec<u16> },
+    /// Multi-ref template `lits[0] + unquote(paths[refs[0]]) + lits[1] + ... + lits[k]`. A ref to
+    /// the path itself is its free part: the path's next stored cell, as the record has it. With
+    /// `b64`, the value is `"` + Base64 of the template (which has no free part) + `"`.
+    MultiConcat {
+        lits: Vec<Vec<u8>>,
+        refs: Vec<u16>,
+        b64: bool,
+    },
+}
+
+impl JsonCand {
+    /// Whether the candidate stores a cell of `own`, the path it belongs to.
+    pub fn has_free(&self, own: usize) -> bool {
+        matches!(self, JsonCand::MultiConcat { refs, .. } if refs.iter().any(|&r| r as usize == own))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -572,8 +591,8 @@ impl JsonTreePlan {
                         put_uvarint(out, *ref_path as u64);
                         put_bytes(out, suffix);
                     }
-                    JsonCand::MultiConcat { lits, refs } => {
-                        out.push(2);
+                    JsonCand::MultiConcat { lits, refs, b64 } => {
+                        out.push(if *b64 { 3 } else { 2 });
                         put_uvarint(out, refs.len() as u64);
                         for l in lits {
                             put_bytes(out, l);
@@ -675,7 +694,7 @@ impl JsonTreePlan {
                             suffix,
                         });
                     }
-                    2 => {
+                    tag @ (2 | 3) => {
                         let k = cur.uvar()? as usize;
                         if k == 0 || k > 8 {
                             return Err(Error::Format("invalid MultiConcat arity".into()));
@@ -686,13 +705,22 @@ impl JsonTreePlan {
                         }
                         let mut refs = Vec::with_capacity(k);
                         for _ in 0..k {
-                            let r = cur.uvar()? as u16;
-                            if (r as usize) >= np {
+                            let r = cur.uvar()?;
+                            if r >= np as u64 {
                                 return Err(Error::Format("JsonCand ref out of bounds".into()));
                             }
-                            refs.push(r);
+                            refs.push(r as u16);
                         }
-                        cands.push(JsonCand::MultiConcat { lits, refs });
+                        let b64 = tag == 3;
+                        let own = paths.len();
+                        let free = refs.iter().filter(|&&r| r as usize == own).count();
+                        if b64 && !lits.iter().all(|l| b64_text_ok(l)) {
+                            return Err(Error::Format("Base64 candidate text not printable".into()));
+                        }
+                        if free > usize::from(!b64) {
+                            return Err(Error::Format("invalid MultiConcat free part".into()));
+                        }
+                        cands.push(JsonCand::MultiConcat { lits, refs, b64 });
                     }
                     t => return Err(Error::Format(format!("unknown JsonCand tag {t}"))),
                 }
@@ -863,62 +891,97 @@ fn unquote_json_lexeme(b: &[u8]) -> &[u8] {
     }
 }
 
+/// Whether `target`, a value of path `own`, is what `cand` builds from the values `val` gives
+/// for its refs: `None` if not, else the span of the free part in `target`, if it has one.
+/// `tmp` holds the bytes under a Base64 value.
 #[inline]
-fn eval_cand_matches(
+fn cand_fit<'v>(
     cand: &JsonCand,
+    own: usize,
     target: &[u8],
-    scope: &[Option<(usize, usize)>],
-    line: &[u8],
-) -> bool {
+    val: impl Fn(u16) -> Option<&'v [u8]>,
+    tmp: &mut Vec<u8>,
+) -> Option<Option<(usize, usize)>> {
     match cand {
-        JsonCand::Copy { ref_path } => {
-            let Some((rs, re)) = scope[*ref_path as usize] else {
-                return false;
-            };
-            &line[rs..re] == target
-        }
+        JsonCand::Copy { ref_path } => (val(*ref_path)? == target).then_some(None),
         JsonCand::Affix {
             prefix,
             ref_path,
             suffix,
         } => {
-            let Some((rs, re)) = scope[*ref_path as usize] else {
-                return false;
-            };
-            let rv = unquote_json_lexeme(&line[rs..re]);
-            target.len() == prefix.len() + rv.len() + suffix.len()
+            let rv = unquote_json_lexeme(val(*ref_path)?);
+            (target.len() == prefix.len() + rv.len() + suffix.len()
                 && target.starts_with(prefix)
                 && target[prefix.len()..].starts_with(rv)
-                && target.ends_with(suffix)
+                && target.ends_with(suffix))
+            .then_some(None)
         }
-        JsonCand::MultiConcat { lits, refs } => {
-            let mut expected_len = lits.iter().map(|l| l.len()).sum::<usize>();
-            for &r in refs {
-                let Some((rs, re)) = scope[r as usize] else {
-                    return false;
-                };
-                expected_len += unquote_json_lexeme(&line[rs..re]).len();
+        JsonCand::MultiConcat { lits, refs, b64 } => {
+            if !b64 {
+                return concat_fit(lits, refs, own, target, val);
             }
-            if target.len() != expected_len || !target.starts_with(&lits[0]) {
-                return false;
+            let inner = target.strip_prefix(b"\"")?.strip_suffix(b"\"")?;
+            tmp.clear();
+            crate::lex::parse_base64(inner, tmp)?;
+            if !b64_text_ok(tmp) {
+                return None;
             }
-            let mut pos = lits[0].len();
-            for (i, &r) in refs.iter().enumerate() {
-                let (rs, re) = scope[r as usize].unwrap();
-                let rv = unquote_json_lexeme(&line[rs..re]);
-                if !target[pos..].starts_with(rv) {
-                    return false;
-                }
-                pos += rv.len();
-                let lit = &lits[i + 1];
-                if !target[pos..].starts_with(lit) {
-                    return false;
-                }
-                pos += lit.len();
-            }
-            pos == target.len()
+            concat_fit(lits, refs, usize::MAX, tmp, val).map(|_| None)
         }
     }
+}
+
+/// Whether `text` may be spelled in Base64 by a candidate. Holding it to printable ASCII lets a
+/// search rule out most needles for every Base64 value at once.
+pub(crate) fn b64_text_ok(text: &[u8]) -> bool {
+    text.iter().all(|c| (0x20..0x7f).contains(c))
+}
+
+/// `cand_fit` for a plain template. Every part but the free one has a known length, so the free
+/// part is what is left.
+#[inline]
+fn concat_fit<'v>(
+    lits: &[Vec<u8>],
+    refs: &[u16],
+    own: usize,
+    t: &[u8],
+    val: impl Fn(u16) -> Option<&'v [u8]>,
+) -> Option<Option<(usize, usize)>> {
+    let mut fixed = lits.iter().map(|l| l.len()).sum::<usize>();
+    let mut has_free = false;
+    for &r in refs {
+        if r as usize == own {
+            has_free = true;
+        } else {
+            fixed += unquote_json_lexeme(val(r)?).len();
+        }
+    }
+    if t.len() < fixed || (!has_free && t.len() != fixed) {
+        return None;
+    }
+    let mut free = None;
+    let mut pos = 0;
+    let take = |piece: &[u8], pos: &mut usize| {
+        let ok = t[*pos..].starts_with(piece);
+        *pos += piece.len();
+        ok
+    };
+    if !take(&lits[0], &mut pos) {
+        return None;
+    }
+    for (i, &r) in refs.iter().enumerate() {
+        if r as usize == own {
+            let end = pos + t.len() - fixed;
+            free = Some((pos, end));
+            pos = end;
+        } else if !take(unquote_json_lexeme(val(r)?), &mut pos) {
+            return None;
+        }
+        if !take(&lits[i + 1], &mut pos) {
+            return None;
+        }
+    }
+    Some(free)
 }
 
 /// Reusable encoder state for `JsonTreePlan` within a block.
@@ -930,6 +993,7 @@ pub struct JsonTreeBlockSplitter {
     scope: Vec<Option<(usize, usize)>>,
     /// Bytes of objects whose key layout no kept shape matched, stored whole.
     pub unshaped_bytes: usize,
+    tmp: Vec<u8>,
 }
 
 impl JsonTreeBlockSplitter {
@@ -941,6 +1005,7 @@ impl JsonTreeBlockSplitter {
             child_slots: Vec::with_capacity(64),
             scope: vec![None; jt.paths.len()],
             unshaped_bytes: 0,
+            tmp: Vec::new(),
         }
     }
 
@@ -982,23 +1047,23 @@ impl JsonTreeBlockSplitter {
         if pdef.shapes.is_empty() {
             let val_slice = &line[v.start as usize..v.end as usize];
             let mut sel = 0u32;
+            let mut stored = Some(val_slice);
             if !pdef.cands.is_empty() {
+                let scope = &self.scope;
+                let val = |r: u16| scope[r as usize].map(|(s, e)| &line[s..e]);
                 for (ci, cand) in pdef.cands.iter().enumerate() {
-                    if eval_cand_matches(cand, val_slice, &self.scope, line) {
+                    if let Some(free) = cand_fit(cand, path_idx, val_slice, val, &mut self.tmp) {
                         sel = (ci + 1) as u32;
+                        stored = free.map(|(s, e)| &val_slice[s..e]);
                         break;
                     }
                 }
                 self.struct_streams[pdef.sel_stream as usize].push(sel);
             }
-            if sel == 0 && pdef.value_col != u16::MAX {
-                push_json_val_occ(
-                    pdef.value_col as usize,
-                    val_slice,
-                    has_nested,
-                    col_occs,
-                    scratch,
-                );
+            if let Some(cell) = stored
+                && pdef.value_col != u16::MAX
+            {
+                push_json_val_occ(pdef.value_col as usize, cell, has_nested, col_occs, scratch);
             }
             self.scope[path_idx] = Some((v.start as usize, v.end as usize));
             return;
@@ -1268,6 +1333,7 @@ pub struct JsonTreeBlockReconstructor {
     pub struct_streams: Vec<Vec<u32>>,
     pub struct_pos: Vec<usize>,
     scope_ranges: Vec<Option<(usize, usize)>>,
+    tmp: Vec<u8>,
 }
 
 impl JsonTreeBlockReconstructor {
@@ -1277,6 +1343,7 @@ impl JsonTreeBlockReconstructor {
             struct_streams,
             struct_pos: vec![0usize; ns],
             scope_ranges: vec![None; n_paths],
+            tmp: Vec::new(),
         }
     }
 
@@ -1310,6 +1377,17 @@ impl JsonTreeBlockReconstructor {
             return Err(Error::BudgetExceeded("json reconstructed row size"));
         }
         Ok(())
+    }
+
+    /// Where in `out` the value of `r` on this row stands, without its quotes.
+    #[inline]
+    fn unquoted_ref(&self, r: u16, out: &[u8]) -> Result<(usize, usize)> {
+        let (rs, re) = self.scope_ranges[r as usize]
+            .ok_or_else(|| Error::Format("JsonTree candidate missing scope ref".into()))?;
+        if re >= rs + 2 && out[rs] == b'"' && out[re - 1] == b'"' {
+            return Ok((rs + 1, re - 1));
+        }
+        Ok((rs, re))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1355,32 +1433,44 @@ impl JsonTreeBlockReconstructor {
                         ref_path,
                         suffix,
                     } => {
-                        let (mut rs, mut re) =
-                            self.scope_ranges[*ref_path as usize].ok_or_else(|| {
-                                Error::Format("JsonTree Affix missing scope ref".into())
-                            })?;
-                        if re >= rs + 2 && out[rs] == b'"' && out[re - 1] == b'"' {
-                            rs += 1;
-                            re -= 1;
-                        }
+                        let (rs, re) = self.unquoted_ref(*ref_path, out)?;
                         out.extend_from_slice(prefix);
                         out.extend_from_within(rs..re);
                         out.extend_from_slice(suffix);
                     }
-                    JsonCand::MultiConcat { lits, refs } => {
+                    JsonCand::MultiConcat {
+                        lits,
+                        refs,
+                        b64: false,
+                    } => {
                         out.extend_from_slice(&lits[0]);
                         for (i, &r) in refs.iter().enumerate() {
-                            let (mut rs, mut re) =
-                                self.scope_ranges[r as usize].ok_or_else(|| {
-                                    Error::Format("JsonTree MultiConcat missing scope ref".into())
-                                })?;
-                            if re >= rs + 2 && out[rs] == b'"' && out[re - 1] == b'"' {
-                                rs += 1;
-                                re -= 1;
+                            if r as usize == path_idx {
+                                let cid = pdef.value_col as usize;
+                                emit_json_stored_cell(cid, plan, ctx, col_pos, out, budget)?;
+                            } else {
+                                let (rs, re) = self.unquoted_ref(r, out)?;
+                                out.extend_from_within(rs..re);
                             }
-                            out.extend_from_within(rs..re);
                             out.extend_from_slice(&lits[i + 1]);
                         }
+                    }
+                    JsonCand::MultiConcat { lits, refs, .. } => {
+                        let mut text = std::mem::take(&mut self.tmp);
+                        text.clear();
+                        text.extend_from_slice(&lits[0]);
+                        for (i, &r) in refs.iter().enumerate() {
+                            let (rs, re) = self.unquoted_ref(r, out)?;
+                            text.extend_from_slice(&out[rs..re]);
+                            text.extend_from_slice(&lits[i + 1]);
+                        }
+                        if !b64_text_ok(&text) {
+                            return Err(Error::Format("Base64 candidate text not printable".into()));
+                        }
+                        out.push(b'"');
+                        crate::lex::format_base64(&text, out);
+                        out.push(b'"');
+                        self.tmp = text;
                     }
                 }
             }
@@ -1462,8 +1552,16 @@ impl JsonTreeBlockReconstructor {
             } else {
                 0
             };
-            if sel == 0 && pdef.value_col != u16::MAX {
-                col_pos[pdef.value_col as usize] += 1;
+            let stores = match sel {
+                0 => true,
+                _ => pdef
+                    .cands
+                    .get(sel - 1)
+                    .ok_or_else(|| Error::Format("JsonTree sel out of range".into()))?
+                    .has_free(path_idx),
+            };
+            if stores && let Some(p) = col_pos.get_mut(pdef.value_col as usize) {
+                *p += 1;
             }
             return Ok(());
         }
@@ -1768,20 +1866,22 @@ impl StructWalk<'_> {
         if col == u16::MAX {
             return;
         }
-        let occ = self.occ[path_idx];
-        self.occ[path_idx] += 1;
-        if self
-            .walk
-            .want_cols
-            .get(col as usize)
-            .copied()
-            .unwrap_or(false)
-        {
-            self.map.col_occ_rows[col as usize].push(row);
-        }
+        let occ = self.count_cell(path_idx, row);
         if self.tracked(path_idx) {
             self.event(path_idx, row, PathVal::Occ { col, occ });
         }
+    }
+
+    /// Counts a cell of `path_idx`'s column on `row`; returns its occurrence.
+    #[inline]
+    fn count_cell(&mut self, path_idx: usize, row: u32) -> u32 {
+        let col = self.jt.paths[path_idx].value_col as usize;
+        let occ = self.occ[path_idx];
+        self.occ[path_idx] += 1;
+        if self.walk.want_cols.get(col).copied().unwrap_or(false) {
+            self.map.col_occ_rows[col].push(row);
+        }
+        occ
     }
 
     fn row(&mut self, path_idx: usize, row: u32) -> Result<()> {
@@ -1795,11 +1895,14 @@ impl StructWalk<'_> {
             };
             if sel == 0 {
                 self.stored(path_idx, row);
-            } else if self.tracked(path_idx) {
-                let cand = pdef
-                    .cands
-                    .get(sel - 1)
-                    .ok_or_else(|| Error::Format("JsonTree sel out of range".into()))?;
+                return Ok(());
+            }
+            let cand = pdef
+                .cands
+                .get(sel - 1)
+                .ok_or_else(|| Error::Format("JsonTree sel out of range".into()))?;
+            let free = cand.has_free(path_idx).then(|| self.count_cell(path_idx, row));
+            if self.tracked(path_idx) {
                 let srcs = self.map.srcs.len() as u32;
                 let one;
                 let refs: &[u16] = match cand {
@@ -1810,6 +1913,11 @@ impl StructWalk<'_> {
                     JsonCand::MultiConcat { refs, .. } => refs,
                 };
                 for &r in refs {
+                    // The free part's source is its cell, given by occurrence.
+                    if let (true, Some(occ)) = (r as usize == path_idx, free) {
+                        self.map.srcs.push(occ);
+                        continue;
+                    }
                     let (at, ev) = self.scope[r as usize];
                     if at != row {
                         return Err(Error::Format("derived value without its source".into()));
@@ -2600,7 +2708,15 @@ fn demote_widest_subtrees(tr: &mut TreeTrainer, order: &[usize], limit: usize) -
 
 struct ScopeOcc<'a> {
     target: &'a [u8],
+    /// The values in scope, by path, ascending.
     refs: Vec<(u16, &'a [u8])>,
+}
+
+impl<'a> ScopeOcc<'a> {
+    fn val(&self, r: u16) -> Option<&'a [u8]> {
+        let i = self.refs.binary_search_by_key(&r, |&(p, _)| p).ok()?;
+        Some(self.refs[i].1)
+    }
 }
 
 fn discover_json_derivations(json_rows: &[&[u8]], jt: &mut JsonTreePlan) {
@@ -2618,6 +2734,7 @@ fn discover_json_derivations(json_rows: &[&[u8]], jt: &mut JsonTreePlan) {
         collect_deriv_walk(0, 0, 0, row, &doc, jt, &mut scope, &mut occs);
     }
 
+    let mut tmp = Vec::new();
     for p in 1..n_paths {
         if !jt.paths[p].shapes.is_empty() || jt.paths[p].is_text {
             continue;
@@ -2626,76 +2743,8 @@ fn discover_json_derivations(json_rows: &[&[u8]], jt: &mut JsonTreePlan) {
         if list.len() < DERIV_MIN_OCC {
             continue;
         }
-        let mut cands = Vec::<JsonCand>::new();
-
-        // 1. Exact Copy (`target == ref_val`)
-        let mut copy_hits: HashMap<u16, usize> = HashMap::new();
-        for oc in list {
-            for &(rp, rv) in &oc.refs {
-                if rv == oc.target {
-                    *copy_hits.entry(rp).or_insert(0) += 1;
-                }
-            }
-        }
-        let mut ranked_copies: Vec<(u16, usize)> = copy_hits
-            .into_iter()
-            .filter(|&(_, cnt)| (cnt as f64) >= DERIV_COVER * (list.len() as f64))
-            .collect();
-        ranked_copies.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        if let Some(&(best_rp, _)) = ranked_copies.first() {
-            cands.push(JsonCand::Copy { ref_path: best_rp });
-        }
-
-        // 2. MultiConcat & Affix on quoted string targets (`"https://api.github.com/repos/<repo>/commits/<sha>"`!)
-        let uncov: Vec<&ScopeOcc<'_>> = list
-            .iter()
-            .filter(|oc| {
-                !cands.iter().any(|c| match c {
-                    JsonCand::Copy { ref_path } => oc
-                        .refs
-                        .iter()
-                        .any(|&(rp, rv)| rp == *ref_path && rv == oc.target),
-                    _ => false,
-                })
-            })
-            .collect();
-
-        if uncov.len() >= DERIV_MIN_OCC {
-            // Discover templates replacing longest non-overlapping `unquote(rv)` (`len >= 3`) in `oc.target`!
-            let mut tpl_counts: HashMap<(Vec<Vec<u8>>, Vec<u16>), (usize, usize)> = HashMap::new();
-            for &oc in &uncov {
-                if oc.target.len() < 6 || oc.target[0] != b'"' {
-                    continue;
-                }
-                if let Some((lits, refs, saved_per_hit)) = decompose_target_with_scope(oc) {
-                    let e = tpl_counts.entry((lits, refs)).or_insert((0, 0));
-                    e.0 += 1;
-                    e.1 += saved_per_hit;
-                }
-            }
-            let mut ranked_tpls: Vec<_> = tpl_counts
-                .into_iter()
-                .filter(|(_, (cnt, total_saved))| {
-                    (*cnt as f64) >= 0.20 * (uncov.len() as f64) && *cnt >= 4 && *total_saved >= 32
-                })
-                .collect();
-            ranked_tpls.sort_by(|a, b| (b.1).1.cmp(&(a.1).1).then_with(|| a.0.cmp(&b.0)));
-            for ((lits, refs), _) in ranked_tpls {
-                if cands.len() >= MAX_CANDS_PER_PATH {
-                    break;
-                }
-                if refs.len() == 1 {
-                    cands.push(JsonCand::Affix {
-                        prefix: lits[0].clone(),
-                        ref_path: refs[0],
-                        suffix: lits[1].clone(),
-                    });
-                } else {
-                    cands.push(JsonCand::MultiConcat { lits, refs });
-                }
-            }
-        }
-
+        let props = propose_cands(list, p, &mut tmp);
+        let cands = pick_cands(list, p, props, &mut tmp);
         if !cands.is_empty() {
             let sel_s = jt.n_struct_streams as u16;
             jt.n_struct_streams += 1;
@@ -2705,31 +2754,213 @@ fn discover_json_derivations(json_rows: &[&[u8]], jt: &mut JsonTreePlan) {
     }
 }
 
-fn decompose_target_with_scope(oc: &ScopeOcc<'_>) -> Option<(Vec<Vec<u8>>, Vec<u16>, usize)> {
-    let t = oc.target;
+/// Candidates for path `own` read off its sampled values, most frequent first: copies of a value
+/// in scope, templates over values in scope (also under Base64), and templates that differ
+/// between two values in one literal only, with the part that differs left free.
+fn propose_cands(list: &[ScopeOcc<'_>], own: usize, tmp: &mut Vec<u8>) -> Vec<JsonCand> {
+    let mut counts: HashMap<JsonCand, usize> = HashMap::new();
+    let mut by_refs: HashMap<Vec<u16>, Vec<Vec<Vec<u8>>>> = HashMap::new();
+    let mut add = |c: JsonCand| *counts.entry(c).or_insert(0) += 1;
+    for oc in list {
+        // A `null`, `true` or `false` costs its column next to nothing.
+        let literal = matches!(oc.target.first(), Some(b'n' | b't' | b'f'));
+        for &(rp, rv) in oc.refs.iter().filter(|_| !literal) {
+            if rv == oc.target {
+                add(JsonCand::Copy { ref_path: rp });
+            }
+        }
+        let t = oc.target;
+        if t.len() < 6 || t[0] != b'"' || t[t.len() - 1] != b'"' {
+            continue;
+        }
+        if let Some((lits, refs)) = decompose_target(t, &oc.refs) {
+            let seen = by_refs.entry(refs.clone()).or_default();
+            if seen.len() < DERIV_PAIR_SAMPLE {
+                seen.push(lits.clone());
+            }
+            add(JsonCand::MultiConcat {
+                lits,
+                refs,
+                b64: false,
+            });
+        }
+        tmp.clear();
+        if crate::lex::parse_base64(&t[1..t.len() - 1], tmp).is_some()
+            && b64_text_ok(tmp)
+            && let Some((lits, refs)) = decompose_target(tmp, &oc.refs)
+        {
+            add(JsonCand::MultiConcat {
+                lits,
+                refs,
+                b64: true,
+            });
+        }
+    }
+    for (refs, seen) in &by_refs {
+        for (i, a) in seen.iter().enumerate() {
+            for b in &seen[i + 1..] {
+                if let Some(c) = free_template(a, b, refs, own) {
+                    add(c);
+                }
+            }
+        }
+    }
+    let mut ranked: Vec<(JsonCand, usize)> = counts.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked
+        .into_iter()
+        .take(DERIV_PROPOSALS)
+        .map(|(c, _)| c)
+        .collect()
+}
+
+/// The template two decompositions over the same refs share when they differ in one literal:
+/// that literal becomes its common prefix, a free part, and its common suffix.
+fn free_template(a: &[Vec<u8>], b: &[Vec<u8>], refs: &[u16], own: usize) -> Option<JsonCand> {
+    let mut diff = (0..a.len()).filter(|&j| a[j] != b[j]);
+    let j = diff.next()?;
+    if diff.next().is_some() || refs.len() >= DERIV_MAX_REFS + 1 {
+        return None;
+    }
+    let (x, y) = (&a[j], &b[j]);
+    // The free part holds whole runs of letters or digits: `/issues/1` + `234` would make the
+    // literal fit only numbers that start with 1.
+    let class = |c: u8| (c.is_ascii_alphabetic() as u8) | ((c.is_ascii_digit() as u8) << 1);
+    let cuts = |s: &[u8], i: usize| i == 0 || i == s.len() || class(s[i - 1]) & class(s[i]) == 0;
+    let mut pre = x.iter().zip(y).take_while(|(p, q)| p == q).count();
+    while !(cuts(x, pre) && cuts(y, pre)) {
+        pre -= 1;
+    }
+    let mut suf = x[pre..]
+        .iter()
+        .rev()
+        .zip(y[pre..].iter().rev())
+        .take_while(|(p, q)| p == q)
+        .count();
+    while !(cuts(x, x.len() - suf) && cuts(y, y.len() - suf)) {
+        suf -= 1;
+    }
+    // A free part right against a ref would leave no text to tell where one ends.
+    if (pre == 0 && j > 0) || (suf == 0 && j < refs.len()) {
+        return None;
+    }
+    let mut lits = a.to_vec();
+    lits[j] = x[..pre].to_vec();
+    lits.insert(j + 1, x[x.len() - suf..].to_vec());
+    let mut refs = refs.to_vec();
+    refs.insert(j, own as u16);
+    Some(JsonCand::MultiConcat {
+        lits,
+        refs,
+        b64: false,
+    })
+}
+
+/// Greedily keeps the proposal that saves the most bytes on the values no kept one fits, while it
+/// fits enough of them. Order is precedence: the encoder takes the first that fits.
+fn pick_cands(
+    list: &[ScopeOcc<'_>],
+    own: usize,
+    props: Vec<JsonCand>,
+    tmp: &mut Vec<u8>,
+) -> Vec<JsonCand> {
+    // Bytes each proposal saves on each value: the value less its free part, or 0 if it misfits.
+    let gains: Vec<Vec<usize>> = props
+        .iter()
+        .map(|c| {
+            list.iter()
+                .map(|oc| match cand_fit(c, own, oc.target, |r| oc.val(r), tmp) {
+                    Some(free) => oc.target.len() - free.map_or(0, |(s, e)| e - s),
+                    None => 0,
+                })
+                .collect()
+        })
+        .collect();
+    // Bytes saved on each value by the best candidate kept so far.
+    let mut best = vec![0usize; list.len()];
+    let mut kept = Vec::new();
+    while kept.len() < MAX_CANDS_PER_PATH {
+        let score = |g: &Vec<usize>| {
+            let more = g.iter().zip(&best).filter(|&(&x, &b)| x > b);
+            more.fold((0usize, 0usize), |(n, s), (&x, &b)| (n + 1, s + x - b))
+        };
+        let top = (0..props.len())
+            .filter(|i| !kept.contains(i))
+            .map(|i| (score(&gains[i]), i))
+            .max_by(|a, b| (a.0).1.cmp(&(b.0).1).then_with(|| b.1.cmp(&a.1)));
+        let Some(((hits, saved), i)) = top else {
+            break;
+        };
+        if hits < DERIV_MIN_HITS || hits * DERIV_MIN_SHARE < list.len() || saved < 32 {
+            break;
+        }
+        kept.push(i);
+        for (b, &g) in best.iter_mut().zip(&gains[i]) {
+            *b = (*b).max(g);
+        }
+    }
+    // The encoder takes the first that fits, so a candidate with no free part goes before one
+    // with, and a free part with more literal text around it before one with less.
+    let free_rank = |c: &JsonCand| match c {
+        JsonCand::MultiConcat { lits, .. } if c.has_free(own) => {
+            usize::MAX - lits.iter().map(Vec::len).sum::<usize>()
+        }
+        _ => 0,
+    };
+    kept.sort_by_key(|&i| free_rank(&props[i]));
+    let mut out = Vec::new();
+    for i in kept {
+        out.push(match &props[i] {
+            // One ref and no free part is an affix, which the plan writes shorter.
+            JsonCand::MultiConcat { lits, refs, b64 } if !b64 && refs.len() == 1 && refs[0] as usize != own => {
+                JsonCand::Affix {
+                    prefix: lits[0].clone(),
+                    ref_path: refs[0],
+                    suffix: lits[1].clone(),
+                }
+            }
+            c => c.clone(),
+        });
+    }
+    out
+}
+
+/// Splits `t` into literals and the in-scope values it contains: longest first, the latest path on
+/// a tie, at most `DERIV_MAX_REFS`.
+fn decompose_target(t: &[u8], scope: &[(u16, &[u8])]) -> Option<(Vec<Vec<u8>>, Vec<u16>)> {
     if t.len() > 384 {
         return None;
     }
-    // Find all occurrences `(start, end, ref_path)` of `unquote(rv)` (`len >= DERIV_MIN_REF`) inside `t`
     let mut spans: Vec<(usize, usize, u16)> = Vec::new();
-    for &(rp, raw_rv) in &oc.refs {
+    for &(rp, raw_rv) in scope {
         let rv = unquote_json_lexeme(raw_rv);
         if rv.len() < DERIV_MIN_REF || rv.len() >= t.len() {
             continue;
         }
-        let mut search_from = 0usize;
-        while let Some(rel) = memchr::memmem::find(&t[search_from..], rv) {
-            let s = search_from + rel;
-            let e = s + rv.len();
-            spans.push((s, e, rp));
-            search_from = e;
+        // Both sides are short: a byte scan beats building a searcher per pair.
+        let mut s = 0usize;
+        while let Some(rel) = memchr::memchr(rv[0], &t[s..=t.len() - rv.len()]) {
+            s += rel;
+            if t[s..].starts_with(rv) {
+                spans.push((s, s + rv.len(), rp));
+                s += rv.len();
+            } else {
+                s += 1;
+            }
+            if s + rv.len() > t.len() {
+                break;
+            }
         }
     }
     if spans.is_empty() {
         return None;
     }
-    // Greedy longest-first, left-to-right non-overlapping selection (up to `DERIV_MAX_REFS`)
-    spans.sort_by(|a, b| (b.1 - b.0).cmp(&(a.1 - a.0)).then_with(|| a.0.cmp(&b.0)));
+    spans.sort_by(|a, b| {
+        (b.1 - b.0)
+            .cmp(&(a.1 - a.0))
+            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| b.2.cmp(&a.2))
+    });
     let mut chosen: Vec<(usize, usize, u16)> = Vec::new();
     for sp in spans {
         if chosen.len() >= DERIV_MAX_REFS {
@@ -2760,7 +2991,7 @@ fn decompose_target_with_scope(oc: &ScopeOcc<'_>) -> Option<(Vec<Vec<u8>>, Vec<u
         return None;
     }
     lits.push(tail.to_vec());
-    Some((lits, refs, ref_bytes))
+    Some((lits, refs))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2932,5 +3163,93 @@ fn collect_nested_string_samples(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Records with a Base64 id of a type and the sibling `id`, an avatar with one varying digit,
+    /// and a url whose tail no earlier field holds. Some rows fit none of these.
+    fn derivable_rows() -> Vec<String> {
+        (0..120u64)
+            .map(|i| {
+                let id = 1000 + i * 7919 % 90_000;
+                let login = format!("dev{}", i % 23);
+                let kind = if i % 5 == 0 { "Bot" } else { "User" };
+                let mut node = Vec::new();
+                let text = format!("0{}:{kind}{id}", kind.len());
+                crate::lex::format_base64(text.as_bytes(), &mut node);
+                let node = match i % 17 {
+                    3 => format!("U_kgDO{i:06}"),
+                    _ => String::from_utf8(node).unwrap(),
+                };
+                let avatar = match i % 19 {
+                    7 => format!("https://cdn.test/x/{i}.png"),
+                    _ => format!("https://img{}.cdn.test/u/{id}?v=4", i % 4),
+                };
+                let n = 1 + i * 31 % 5000;
+                let url = match i % 13 {
+                    2 => format!("https://api.test/misc/{i}"),
+                    _ => format!("https://api.test/repos/{login}/issues/{n}"),
+                };
+                format!(
+                    "{{\"login\":\"{login}\",\"id\":{id},\"node_id\":\"{node}\",\"avatar_url\":\"{avatar}\",\"url\":\"{url}\",\"number\":{n}}}"
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn trains_base64_and_free_part_candidates() {
+        let rows = derivable_rows();
+        let refs: Vec<&[u8]> = rows.iter().map(|r| r.as_bytes()).collect();
+        let mut model = crate::grammar::ModelPlan::residual_only();
+        let opts = crate::plan::TrainOptions::default();
+        let jt = train_json_tree(&refs, &opts, &mut model).unwrap();
+        let path = |name: &str| jt.paths.iter().position(|p| p.name == name).unwrap();
+        let b64 = |c: &&JsonCand| matches!(c, JsonCand::MultiConcat { b64: true, .. });
+        let node = &jt.paths[path("$.node_id")].cands;
+        assert_eq!(node.iter().filter(b64).count(), 2, "{node:?}");
+        for name in ["$.avatar_url", "$.url"] {
+            let p = path(name);
+            assert!(jt.paths[p].cands.iter().any(|c| c.has_free(p)), "{name}");
+        }
+        let mut buf = Vec::new();
+        jt.encode(&mut buf);
+        let back = JsonTreePlan::decode(&mut Cursor::new(&buf)).unwrap();
+        assert!(back.paths.iter().zip(&jt.paths).all(|(a, b)| a.cands == b.cands));
+    }
+
+    #[test]
+    fn refuses_a_free_part_it_cannot_place() {
+        // A plan of one path, `$`, with one candidate: `tag` over `refs`.
+        let plan = |tag: u8, refs: &[u64], lit: &[u8]| {
+            let mut b = Vec::new();
+            put_uvarint(&mut b, 1);
+            put_uvarint(&mut b, 1);
+            put_bytes(&mut b, b"$");
+            b.push(0);
+            put_bytes(&mut b, b"");
+            for v in [0, u16::MAX as u64, 0, 0, u16::MAX as u64] {
+                put_uvarint(&mut b, v);
+            }
+            put_uvarint(&mut b, 0);
+            put_uvarint(&mut b, 1);
+            b.push(tag);
+            put_uvarint(&mut b, refs.len() as u64);
+            for _ in 0..=refs.len() {
+                put_bytes(&mut b, lit);
+            }
+            refs.iter().for_each(|&r| put_uvarint(&mut b, r));
+            JsonTreePlan::decode(&mut Cursor::new(&b))
+        };
+        assert!(plan(2, &[0], b"x").is_ok());
+        assert!(plan(2, &[0, 0], b"x").is_err(), "two free parts");
+        assert!(plan(3, &[0], b"x").is_err(), "a free part under Base64");
+        assert!(plan(3, &[1], b"x").is_err(), "a ref past the paths");
+        let err = plan(3, &[0], b"\xff").err().map(|e| e.to_string());
+        assert!(err.is_some_and(|e| e.contains("printable")), "Base64 of text not printable");
     }
 }
