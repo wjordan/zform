@@ -550,6 +550,8 @@ pub enum BlockKind {
     Structured { model: u32, kinds: u16 },
     /// One compressed leaf holding the records as they were framed.
     Verbatim { framing: ResolvedFraming },
+    /// Columns under `models[model]` whose rows the reader sorts back into order; read whole.
+    Sorted { model: u32 },
 }
 
 #[derive(Debug, Clone)]
@@ -666,6 +668,10 @@ impl IndexBuilder {
                     raw.push(1);
                     framing.encode(&mut raw);
                 }
+                BlockKind::Sorted { model } => {
+                    raw.push(3);
+                    put_uvarint(&mut raw, *model as u64);
+                }
             }
             put_uvarint(&mut raw, b.off - end);
             put_uvarint(&mut raw, b.len);
@@ -764,6 +770,13 @@ impl Root {
                 1 => BlockKind::Verbatim {
                     framing: ResolvedFraming::decode(&mut cur)?,
                 },
+                3 => {
+                    let model = cur.uvar()? as u32;
+                    if model as usize >= models.len() {
+                        return Err(Error::Format("index root model reference".into()));
+                    }
+                    BlockKind::Sorted { model }
+                }
                 k => return Err(Error::Format(format!("unknown index block kind {k}"))),
             };
             let off = end.checked_add(cur.uvar()?);

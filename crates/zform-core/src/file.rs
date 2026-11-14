@@ -5,7 +5,10 @@
 //! are numbered from 0 across the file.
 
 use crate::dictionary::{Dictionary, Scope};
-use crate::container::{BlockParts, BlockRows, FrameFit, PackOptions, StreamEncoder, Structure};
+use crate::container::{
+    BlockParts, BlockRows, FrameFit, PackOptions, StreamEncoder, Structure,
+    decode_single_block_records, sort_records,
+};
 use crate::framing::{FramingSpec, split_passthrough};
 use crate::grammar::{ModelPlan, PlanVariant};
 use crate::index::{
@@ -806,14 +809,28 @@ fn row_pages(
     Ok(Some((0..on.len()).filter(|&p| on[p]).collect()))
 }
 
-/// The records of a verbatim block.
+/// The records of a block read whole: a verbatim block, or a sorted one.
 fn verbatim_records(
     bytes: &[u8],
     e: &BlockEntry,
+    plans: &[ModelPlan],
     budget: &DecodeBudget,
 ) -> Result<(Vec<u8>, Vec<(u32, u32)>)> {
-    let BlockKind::Verbatim { framing } = e.kind else {
-        unreachable!()
+    let framing = match e.kind {
+        BlockKind::Verbatim { framing } => framing,
+        BlockKind::Sorted { model } => {
+            let plan = &plans[model as usize];
+            let mut recs = decode_single_block_records(bytes, e.rows as usize, plan, budget)?;
+            sort_records(&mut recs);
+            let (mut raw, mut spans) = (Vec::new(), Vec::with_capacity(recs.len()));
+            for r in recs {
+                let s = raw.len() as u32;
+                raw.extend_from_slice(&r);
+                spans.push((s, raw.len() as u32));
+            }
+            return Ok((raw, spans));
+        }
+        BlockKind::Structured { .. } => unreachable!(),
     };
     let raw = decompress_leaf(&mut Cursor::new(bytes), budget)?;
     let fc = split_passthrough(&raw, framing);
@@ -878,7 +895,7 @@ impl<'f> Session<'f> {
                     Some(page) => BlockDir::decode(page, &self.file.budget)?,
                     None => return Ok(None),
                 },
-                BlockKind::Verbatim { .. } => BlockDir::default(),
+                BlockKind::Verbatim { .. } | BlockKind::Sorted { .. } => BlockDir::default(),
             };
             self.dirs[b] = Some(Rc::new(dir));
         }
@@ -952,7 +969,7 @@ impl<'f> Session<'f> {
             let filter = held.unwrap_or(Filter::NONE);
             let ranges = match (&e.kind, dir) {
                 (_, None) => None,
-                (BlockKind::Verbatim { .. }, _) => {
+                (BlockKind::Verbatim { .. } | BlockKind::Sorted { .. }, _) => {
                     filter_may_match(pred, filter).then(|| vec![whole(e)])
                 }
                 (&BlockKind::Structured { model, kinds }, Some(dir)) => {
@@ -1055,11 +1072,11 @@ impl<'f> Session<'f> {
         };
         let (model, kinds) = match e.kind {
             BlockKind::Structured { model, kinds } => (model, kinds),
-            BlockKind::Verbatim { .. } => {
+            BlockKind::Verbatim { .. } | BlockKind::Sorted { .. } => {
                 let Some(bytes) = src.get(whole(e)) else {
                     return Ok(None);
                 };
-                let (raw, spans) = verbatim_records(bytes, e, budget)?;
+                let (raw, spans) = verbatim_records(bytes, e, &self.file.plans, budget)?;
                 self.stats.blocks_whole += 1;
                 self.stats.blocks_verbatim += 1;
                 self.stats.rebuilt += spans.len();
@@ -1172,8 +1189,9 @@ impl<'f> Session<'f> {
             let sel = rows.within(first, first + e.rows).flat_map(|(s, t)| s..t);
             let model = match e.kind {
                 BlockKind::Structured { model, .. } => model,
-                BlockKind::Verbatim { .. } => {
-                    let (raw, spans) = verbatim_records(src.get(whole(e)).unwrap(), e, budget)?;
+                BlockKind::Verbatim { .. } | BlockKind::Sorted { .. } => {
+                    let (raw, spans) =
+                        verbatim_records(src.get(whole(e)).unwrap(), e, &file.plans, budget)?;
                     for r in sel {
                         let (s, t) = spans[r as usize];
                         f(first + r as u64, &raw[s as usize..t as usize])?;
@@ -1322,11 +1340,11 @@ impl<'f> Session<'f> {
         };
         let (model, kinds) = match e.kind {
             BlockKind::Structured { model, kinds } => (model, kinds),
-            BlockKind::Verbatim { .. } => {
+            BlockKind::Verbatim { .. } | BlockKind::Sorted { .. } => {
                 let Some(bytes) = src.get(whole(e)) else {
                     return Ok(None);
                 };
-                let (raw, spans) = verbatim_records(bytes, e, budget)?;
+                let (raw, spans) = verbatim_records(bytes, e, &self.file.plans, budget)?;
                 for (r, &(s, t)) in spans.iter().enumerate().filter(|(r, _)| sel[*r]) {
                     self.stats.rebuilt += 1;
                     for (p, path) in paths.iter().enumerate() {

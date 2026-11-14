@@ -71,6 +71,7 @@ A `.zfm` file is one or more `ZFM1` frames, optionally followed by a `ZFIX` inde
 | `0x0004` | `FLAG_REUSE_PREV_MODEL` | The frame uses the `ModelPlan` of the preceding structured frame of the stream. |
 | `0x0008` | `FLAG_SYNC_POINT` | The frame decodes without any frame before it: it carries its `ModelPlan` or is passthrough. |
 | `0x0010` | `FLAG_DICTIONARY` | The frame is the stream's dictionary and holds no records. |
+| `0x0020` | `FLAG_SORTED_ROWS` | Each block stores its rows in any order. The reader restores a block by sorting its records on their collation key: the ASCII letters and digits, letters lowercased, compared bytewise. The writer sets it only when that sort gives the input back, so records with equal keys are equal. |
 
 A dictionary frame comes first in its stream. Its payload is one entropy leaf holding the dictionary's content, `raw_len` is the content's length, and `content_xxh64`, which is required, is the dictionary's id. The `ZstdDict` leaves of the frames after it, up to the next index region, decode against that content. Content that begins with Zstandard's dictionary magic `37 A4 30 EC` is not valid; a writer puts a zero byte before it.
 
@@ -394,7 +395,7 @@ Derived from the data region and rebuilt by scanning it. `pack` appends it at EO
 All fields below are `uvarint` unless typed.
 
 - **Root**: `data_len`; `n_models`, then each model as a length and its `ModelPlan` bytes, each stored once; `n_blocks`, then per block:
-  - `kind: u8`. `0` is a structured block, followed by its model id and `kinds`, a mask of what its rows are: `0x01` variant 0, `0x02` `JsonTree`, `0x04` another `Shape`, `0x08` `ShapeCell`. `1` is a verbatim block, followed by its `ResolvedFraming`. `2` is a structured block as `0` with a page filter page.
+  - `kind: u8`. `0` is a structured block, followed by its model id and `kinds`, a mask of what its rows are: `0x01` variant 0, `0x02` `JsonTree`, `0x04` another `Shape`, `0x08` `ShapeCell`. `1` is a verbatim block, followed by its `ResolvedFraming`. `2` is a structured block as `0` with a page filter page. `3` is a block of a `FLAG_SORTED_ROWS` frame, followed by its model id; it has no directory or page filter page and is read whole.
   - the gap between the previous block's end and this block's offset in the data region, its length, its row count, its directory page length, its filter page length and, for kind `2`, its page filter page length. Page offsets follow from the lengths.
 
   After the blocks comes the length of the dictionary's leaf in the data region, `0` when there is none, else followed by the leaf's offset and `id: u64 LE`.

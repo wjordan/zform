@@ -1038,6 +1038,42 @@ mod tests {
     }
 
     #[test]
+    fn sorted_rows_come_back_in_file_order() {
+        // A collation-sorted log, as HDFS.log is: the writer may store each block's rows in any
+        // order, and every reader sorts them back.
+        let mut log = Vec::new();
+        let mut id = 0x5DEECE66Du64;
+        for b in 0..300u64 {
+            id = id.wrapping_mul(0x5DEECE66D).wrapping_add(11);
+            let (blk, t, s) = (id as i64 >> 3, 100 + b * 3 % 97, 10 + b % 50);
+            let ip = format!("10.250.{}.{}", b % 17, b % 29);
+            log.push(format!("081109 2035{s} {t} INFO dfs.DataNode$DataXceiver: Receiving block blk_{blk} src: /{ip}:{} dest: /{ip}:50010", 40000 + b));
+            log.push(format!("081109 2035{s} {} INFO dfs.DataNode$PacketResponder: PacketResponder 0 for block blk_{blk} terminating", t + 1));
+            log.push(format!("081109 2035{s} 19 INFO dfs.FSNamesystem: BLOCK* NameSystem.addStoredBlock: blockMap updated: {ip}:50010 is added to blk_{blk} size 67108864"));
+            log.push(format!(
+                "081109 2036{s} 7 INFO dfs.DataBlockScanner: Verification succeeded for blk_{blk}"
+            ));
+        }
+        let key = |l: &String| zform_core::container::collation_key(l.as_bytes());
+        log.sort_by_cached_key(key);
+        let raw: Vec<u8> = log
+            .iter()
+            .flat_map(|l| [l.as_bytes(), b"\n"].concat())
+            .collect();
+        let opts = PackOptions {
+            packs: PackRegistry::new().with_hdfs_predictors(),
+            ..PackOptions::default()
+        };
+        let comp = assert_roundtrip(&raw, &opts);
+        let flags = u16::from_le_bytes([comp[4], comp[5]]);
+        assert_ne!(flags & zform_core::container::FLAG_SORTED_ROWS, 0);
+        let recs = lines(&raw);
+        let (rows, _) = assert_grep(&comp, &recs, &contains("PacketResponder 0"));
+        assert_eq!(rows.len(), 300);
+        assert_grep(&comp, &recs, &word("terminating"));
+    }
+
+    #[test]
     fn file_queries_answer_as_raw_records_do() {
         let rows: Vec<String> = (0..4200).map(mixed_record).collect();
         let recs: Vec<&[u8]> = rows.iter().map(|r| r.as_bytes()).collect();

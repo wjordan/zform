@@ -62,6 +62,64 @@ impl RelationPack for HdfsRelations {
         }
         None
     }
+
+    fn row_order(&self, recs: &[&[u8]]) -> Option<Vec<u32>> {
+        // A block's write pipeline rows sit together by thread id, so its relations look one row
+        // back; the other rows follow in file order.
+        const WRITE: [&[u8]; 4] = [
+            b"Receiving block",
+            b"PacketResponder",
+            b"addStoredBlock: blockMap",
+            b"allocateBlock",
+        ];
+        let mut groups = std::collections::HashMap::new();
+        let mut members: Vec<Vec<u32>> = Vec::new();
+        let mut rest = Vec::new();
+        for (i, r) in recs.iter().enumerate() {
+            let blk = WRITE
+                .iter()
+                .any(|w| memchr::memmem::find(r, w).is_some())
+                .then(|| block_token(r))
+                .flatten();
+            match blk {
+                Some(b) => {
+                    let g = *groups.entry(b).or_insert_with(|| {
+                        members.push(Vec::new());
+                        members.len() - 1
+                    });
+                    members[g].push(i as u32);
+                }
+                None => rest.push(i as u32),
+            }
+        }
+        if members.is_empty() {
+            return None;
+        }
+        let mut order = Vec::with_capacity(recs.len());
+        for mut m in members {
+            m.sort_by_key(|&i| thread_id(recs[i as usize]));
+            order.extend(m);
+        }
+        order.extend(rest);
+        Some(order)
+    }
+}
+
+/// The first `blk_<id>` token of a record.
+fn block_token(r: &[u8]) -> Option<&[u8]> {
+    let s = memchr::memmem::find(r, b"blk_")?;
+    let tail = &r[s + 4..];
+    let n = usize::from(tail.first() == Some(&b'-'));
+    let d = tail[n..].iter().take_while(|b| b.is_ascii_digit()).count();
+    (d > 0).then(|| &r[s..s + 4 + n + d])
+}
+
+/// The third space-separated field of a record as a number: the logging thread in HDFS lines.
+fn thread_id(r: &[u8]) -> u64 {
+    r.split(|&b| b == b' ')
+        .nth(2)
+        .and_then(unsigned)
+        .map_or(0, |v| v as u64)
 }
 
 fn unsigned(v: &[u8]) -> Option<i64> {

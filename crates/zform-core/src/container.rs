@@ -38,6 +38,39 @@ pub const FLAG_PASSTHROUGH: u16 = 1 << 1;
 pub const FLAG_REUSE_PREV_MODEL: u16 = 1 << 2;
 pub const FLAG_SYNC_POINT: u16 = 1 << 3;
 pub const FLAG_DICTIONARY: u16 = 1 << 4;
+/// Each block stores its rows in any order; the reader restores them by sorting on
+/// [`collation_key`].
+pub const FLAG_SORTED_ROWS: u16 = 1 << 5;
+
+/// The key a sorted-rows block's records ascend by: ASCII letters and digits only, letters folded
+/// to lowercase.
+pub fn collation_key(rec: &[u8]) -> Vec<u8> {
+    rec.iter()
+        .filter(|b| b.is_ascii_alphanumeric())
+        .map(|b| b.to_ascii_lowercase())
+        .collect()
+}
+
+/// Whether sorting `recs` by [`collation_key`] gives them back: keys never fall, and records with
+/// equal keys are equal.
+fn collation_sorted(recs: &[&[u8]]) -> bool {
+    let mut prev: Option<(Vec<u8>, &[u8])> = None;
+    for &r in recs {
+        let k = collation_key(r);
+        if let Some((pk, pr)) = &prev
+            && (pk > &k || (pk == &k && *pr != r))
+        {
+            return false;
+        }
+        prev = Some((k, r));
+    }
+    true
+}
+
+/// Restores a sorted-rows block's record order.
+pub(crate) fn sort_records(recs: &mut [Vec<u8>]) {
+    recs.sort_by_cached_key(|r| collation_key(r));
+}
 
 pub const DEFAULT_BLOCK_ROWS: usize = 65_536;
 pub const DEFAULT_BLOCK_BYTES: usize = 8 << 20;
@@ -314,6 +347,7 @@ impl StreamEncoder {
 
         let mut payload = Vec::new();
         let mut blocks = Vec::new();
+        let mut sorted = false;
         if use_passthrough {
             compress_leaf(&mut payload, raw, self.opts.backend, self.opts.level);
         } else {
@@ -332,6 +366,7 @@ impl StreamEncoder {
             };
             let mut body = Vec::new();
             let plan = self.active_plan.as_ref().unwrap();
+            sorted = self.opts.packs.orders_rows() && collation_sorted(&all_recs);
             let (frame_blocks, library) = {
                 let _dict = Scope::enter(self.opts.dictionary.clone());
                 with_seeds(&mut self.seeds, || {
@@ -351,6 +386,7 @@ impl StreamEncoder {
                             0
                         },
                         code,
+                        sorted,
                         &mut body,
                     )
                 })
@@ -423,6 +459,9 @@ impl StreamEncoder {
         if actual_sync {
             flags |= FLAG_SYNC_POINT;
         }
+        if sorted && !final_passthrough {
+            flags |= FLAG_SORTED_ROWS;
+        }
 
         let hdr = frame_header(
             flags,
@@ -450,9 +489,22 @@ impl StreamEncoder {
                 let Some((dir, filter, pages, kinds)) = &b.index else {
                     continue;
                 };
-                let kind = BlockKind::Structured {
-                    model: self.model_idx,
-                    kinds: *kinds,
+                // A sorted block is read whole, so it needs no directory or pages.
+                let (kind, dir, pages): (_, &[u8], &[u8]) = match sorted {
+                    true => (
+                        BlockKind::Sorted {
+                            model: self.model_idx,
+                        },
+                        &[],
+                        &[],
+                    ),
+                    false => {
+                        let kind = BlockKind::Structured {
+                            model: self.model_idx,
+                            kinds: *kinds,
+                        };
+                        (kind, dir, pages)
+                    }
                 };
                 self.index.block(
                     kind,
@@ -546,6 +598,7 @@ fn encode_structural_blocks(
     filter_bits: Option<usize>,
     page_bytes: usize,
     code: CodeSharing,
+    sorted: bool,
     out: &mut Vec<u8>,
 ) -> (Vec<FrameBlock>, Arc<Library>) {
     let mut bounds = Vec::new();
@@ -576,6 +629,15 @@ fn encode_structural_blocks(
                 .iter()
                 .map(|&(s, e)| {
                     let recs = &all_recs[s..e];
+                    let order = sorted.then(|| packs.row_order(recs)).flatten();
+                    let permuted: Vec<&[u8]>;
+                    let recs = match order {
+                        Some(o) => {
+                            permuted = o.iter().map(|&i| recs[i as usize]).collect();
+                            &permuted[..]
+                        }
+                        None => recs,
+                    };
                     encode_block_columns(recs, plan, packs, backend, level, filter_bits, page_bytes)
                 })
                 .collect()
@@ -1630,18 +1692,18 @@ pub fn decode_frame_payload<W: Write>(
 
     frame_out.extend_from_slice(&bdir.prefix);
     let mut emitted_recs = 0usize;
-    let mut rec_scratch = Vec::with_capacity(512);
     for (nrows, bslice) in &bdir.blocks {
-        let mut rows = BlockRows::open(bslice, *nrows, plan, budget)?;
-        for _ in 0..*nrows {
-            rec_scratch.clear();
-            rows.emit(&mut rec_scratch, budget)?;
+        let mut recs = decode_single_block_records(bslice, *nrows, plan, budget)?;
+        if (hdr.flags & FLAG_SORTED_ROWS) != 0 {
+            sort_records(&mut recs);
+        }
+        for rec in &recs {
             if emitted_recs > 0 {
                 frame_out.extend_from_slice(&bdir.sep);
             }
             emitted_recs += 1;
             let is_last = emitted_recs == hdr.record_count;
-            emit_framed_record(&mut frame_out, &rec_scratch, hdr.framing, is_last);
+            emit_framed_record(&mut frame_out, rec, hdr.framing, is_last);
         }
     }
     frame_out.extend_from_slice(&bdir.suffix);

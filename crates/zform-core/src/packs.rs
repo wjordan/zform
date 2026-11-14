@@ -204,6 +204,11 @@ pub trait RelationPack: Send + Sync {
         context: &RelationContext<'_, '_>,
         packs: &PackRegistry,
     ) -> Option<PayloadGraph>;
+
+    /// The order to store a block's records in, when the reader restores theirs by sorting.
+    fn row_order(&self, _recs: &[&[u8]]) -> Option<Vec<u32>> {
+        None
+    }
 }
 
 /// Runtime registry of writer-side [`CodecPack`]s and [`RelationPack`]s.
@@ -283,6 +288,15 @@ impl PackRegistry {
     pub fn with_hdfs_predictors(mut self) -> Self {
         self.register_relation(HdfsRelations);
         self
+    }
+
+    /// Whether some relation pack may store rows out of order.
+    pub(crate) fn orders_rows(&self) -> bool {
+        !self.relations.is_empty()
+    }
+
+    pub(crate) fn row_order(&self, recs: &[&[u8]]) -> Option<Vec<u32>> {
+        self.relations.iter().find_map(|r| r.row_order(recs))
     }
 
     pub fn register_relation<P: RelationPack + 'static>(&mut self, pack: P) {
