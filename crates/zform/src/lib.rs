@@ -497,6 +497,34 @@ mod tests {
     }
 
     #[test]
+    fn a_time_range_prunes_blocks_of_a_field_copied_from_another() {
+        // Most rows repeat the nested stamp at the top level, so the field is coded as a copy.
+        let mut raw = Vec::new();
+        for i in 0..2000u64 {
+            let at = |s: u64| format!("2026-11-10T{:02}:{:02}:{:02}Z", s / 3600, s / 60 % 60, s % 60);
+            let (nested, top) = (at(i * 7), at(i * 7 + if i % 4 == 3 { 3 } else { 0 }));
+            raw.extend_from_slice(
+                format!("{{\"n\":{i},\"issue\":{{\"updated_at\":\"{nested}\"}},\"created_at\":\"{top}\"}}\n")
+                    .as_bytes(),
+            );
+        }
+        let opts = PackOptions {
+            block_rows: 250,
+            ..PackOptions::default()
+        };
+        let comp = assert_roundtrip(&raw, &opts);
+        let ns = |t: &str| zform_core::lex::parse_timestamp(t.as_bytes()).unwrap().0;
+        let pred = Predicate::FieldTimeRange {
+            field: "created_at".into(),
+            min_ns: Some(ns("2026-11-10T01:00:00Z")),
+            max_ns: Some(ns("2026-11-10T01:05:00Z")),
+        };
+        let (rows, stats) = assert_grep(&comp, &lines(&raw), &pred);
+        assert!(!rows.is_empty());
+        assert!(stats.blocks_pruned >= 6, "{stats:?}");
+    }
+
+    #[test]
     fn base64_and_free_part_values_answer_queries() {
         // A Base64 node id over the sibling id, an avatar with a varying digit, a url whose
         // number comes later; some rows fit none of these.

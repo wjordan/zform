@@ -239,7 +239,10 @@ pub(crate) struct FieldPlan {
     /// Columns that may hold a raw subtree with the field inside, each with the letters of the
     /// keys that lead to the field from there.
     subtree_cols: Vec<(u16, u32)>,
-    /// Every value comes from `leaf_cols` or `subtree_cols`.
+    /// Columns of the paths a leaf copies values from: a leaf value with no cell in `leaf_cols`
+    /// is one of theirs.
+    copy_cols: Vec<u16>,
+    /// Every value comes from `leaf_cols`, `copy_cols` or `subtree_cols`.
     prunable: bool,
     /// By structure stream: a walk reads it.
     streams: Vec<bool>,
@@ -258,6 +261,7 @@ impl FieldPlan {
             leaf_cols: Vec::new(),
             own_cols: Vec::new(),
             subtree_cols: Vec::new(),
+            copy_cols: Vec::new(),
             prunable: true,
             streams: Vec::new(),
             route: WalkRoute::default(),
@@ -285,7 +289,7 @@ impl FieldPlan {
             let p = &jt.paths[pi];
             fp.add_tracked(jt, pi);
             if p.shapes.is_empty() && rem.is_empty() {
-                fp.prunable &= p.cands.is_empty();
+                fp.prunable &= fp.add_copy_cols(jt, pi, &mut vec![false; n]);
                 fp.leaf_cols
                     .extend((p.value_col != u16::MAX).then_some(p.value_col));
             } else {
@@ -334,6 +338,7 @@ impl FieldPlan {
             leaf_cols: Vec::new(),
             own_cols: Vec::new(),
             subtree_cols: Vec::new(),
+            copy_cols: Vec::new(),
             prunable: false,
             streams: Vec::new(),
             route: WalkRoute::default(),
@@ -353,11 +358,35 @@ impl FieldPlan {
         fp
     }
 
+    /// Adds to `copy_cols` the columns path `pi` copies its values from, and theirs in turn.
+    /// False when it derives values any other way.
+    fn add_copy_cols(&mut self, jt: &JsonTreePlan, pi: usize, seen: &mut [bool]) -> bool {
+        if std::mem::replace(&mut seen[pi], true) {
+            return true;
+        }
+        jt.paths[pi].cands.iter().all(|c| {
+            let &JsonCand::Copy { ref_path } = c else {
+                return false;
+            };
+            let r = &jt.paths[ref_path as usize];
+            self.copy_cols
+                .extend((r.value_col != u16::MAX).then_some(r.value_col));
+            r.shapes.is_empty() && self.add_copy_cols(jt, ref_path as usize, seen)
+        })
+    }
+
+    /// Whether a block's leaf values may come from other columns than `leaf_cols`. A copy takes a
+    /// value of its source, so with no source cell there is none.
+    fn borrows(&self, dir: &BlockDir) -> bool {
+        let live = |c: u16| !dir.col(c as usize).summary.all_null;
+        self.subtree_cols.iter().any(|&(c, _)| live(c)) || self.copy_cols.iter().any(|&c| live(c))
+    }
+
     /// The column whose cell `i` is the one value the field has in row `i`, in a block where
     /// that holds for every row.
     fn row_col(&self, kinds: u16, dir: &BlockDir) -> Option<u16> {
         let live = |c: u16| !dir.col(c as usize).summary.all_null;
-        if !self.prunable || kinds != KIND_JSON || self.subtree_cols.iter().any(|&(c, _)| live(c)) {
+        if !self.prunable || kinds != KIND_JSON || self.borrows(dir) {
             return None;
         }
         let mut cols = self.leaf_cols.iter().copied().filter(|&c| live(c));
@@ -1080,6 +1109,7 @@ pub(crate) fn may_match(pred: &Predicate, m: &BlockMeta<'_>, plans: &mut Plans) 
             }
             fp.leaf_cols
                 .iter()
+                .chain(&fp.copy_cols)
                 .filter(|c| live(c))
                 .any(|&c| test.may_hold(&m.dir.col(c as usize).summary, m.filter))
         }
@@ -1376,7 +1406,8 @@ fn eval_leaf_cells(
         return Ok(None);
     }
     let mut passing: Vec<(u16, Vec<bool>)> = Vec::with_capacity(fp.leaf_cols.len());
-    for &c in fp.leaf_cols.iter().filter(|&&c| !summary(c).all_null) {
+    let cols = fp.leaf_cols.iter().chain(&fp.copy_cols);
+    for &c in cols.filter(|&&c| !summary(c).all_null) {
         if plan.columns[c as usize].nested_plan.is_some() {
             return Ok(None);
         }
@@ -1420,7 +1451,15 @@ fn eval_leaf_cells(
         let Some(rem) = &fp.rem[ev.path as usize] else {
             continue;
         };
-        let PathVal::Occ { col, occ } = ev.val else {
+        // A copied value is its source's.
+        let mut src = *ev;
+        while let PathVal::Derived { cand, srcs } = src.val {
+            let JsonCand::Copy { .. } = jt.paths[src.path as usize].cands[cand as usize] else {
+                return Ok(None);
+            };
+            src = map.events[map.srcs[srcs as usize] as usize];
+        }
+        let PathVal::Occ { col, occ } = src.val else {
             return Ok(None);
         };
         let Some((_, cells)) = passing
