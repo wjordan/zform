@@ -2741,6 +2741,22 @@ impl<'a> ScopeOcc<'a> {
     }
 }
 
+/// `0..n` stepped by a stride near `n / φ` that is coprime to `n`: every prefix is spread evenly
+/// over the range, without the power-of-two aliasing of a bit-reversed order.
+fn spread_order(n: usize) -> impl Iterator<Item = usize> {
+    let gcd = |mut a: usize, mut b: usize| {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a
+    };
+    let mut step = (n as f64 * 0.618) as usize;
+    while gcd(step, n) != 1 && step < n {
+        step += 1;
+    }
+    (0..n).map(move |k| k * step % n)
+}
+
 fn discover_json_derivations(json_rows: &[&[u8]], jt: &mut JsonTreePlan) {
     let n_paths = jt.paths.len();
     let mut occs: Vec<Vec<ScopeOcc<'_>>> = (0..n_paths).map(|_| Vec::new()).collect();
@@ -2748,8 +2764,14 @@ fn discover_json_derivations(json_rows: &[&[u8]], jt: &mut JsonTreePlan) {
     let mut scope: Vec<Option<&[u8]>> = vec![None; n_paths];
 
     // Collect up to `DERIV_MAX_OCC` occurrences with active in-scope predecessors!
-    // Strided, not the head: rows sorted by kind would show one kind's paths only.
-    for &row in json_rows.iter().step_by(json_rows.len().div_ceil(2048).max(1)) {
+    // Strided, not the head: rows sorted by kind would show one kind's paths only. Visited in
+    // bit-reversed order, so a path that fills its cap early still saw rows from the whole span.
+    let strided: Vec<&[u8]> = json_rows
+        .iter()
+        .step_by(json_rows.len().div_ceil(2048).max(1))
+        .copied()
+        .collect();
+    for row in spread_order(strided.len()).map(|i| strided[i]) {
         if !doc.parse_root_object(row) {
             continue;
         }
@@ -3243,6 +3265,24 @@ mod tests {
         jt.encode(&mut buf);
         let back = JsonTreePlan::decode(&mut Cursor::new(&buf)).unwrap();
         assert!(back.paths.iter().zip(&jt.paths).all(|(a, b)| a.cands == b.cands));
+    }
+
+    #[test]
+    fn derivations_judge_rows_from_the_whole_sample() {
+        // `b` copies `a` in the first 8% of rows only: under the 1-in-10 bar overall, though
+        // over it among the head's occurrences.
+        let rows: Vec<String> = (0..3000u64)
+            .map(|i| {
+                let b = if i < 240 { 5000 + i } else { 90_000 + i * 7 };
+                format!("{{\"a\":{},\"b\":{b}}}", 5000 + i)
+            })
+            .collect();
+        let refs: Vec<&[u8]> = rows.iter().map(|r| r.as_bytes()).collect();
+        let mut model = crate::grammar::ModelPlan::residual_only();
+        let jt = train_json_tree(&refs, &crate::plan::TrainOptions::default(), &mut model).unwrap();
+        let b = jt.paths.iter().find(|p| p.name == "$.b").unwrap();
+        assert!(b.cands.is_empty(), "{:?}", b.cands);
+        assert_eq!(spread_order(10).collect::<Vec<_>>(), [0, 7, 4, 1, 8, 5, 2, 9, 6, 3]);
     }
 
     #[test]

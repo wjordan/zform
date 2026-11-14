@@ -93,6 +93,7 @@ pub fn train_seekable<R: Read + Seek>(
     let max_off = total_len.saturating_sub(WIN_BYTES as u64);
     let mut collected = Vec::<Vec<u8>>::new();
     let mut win_buf = vec![0u8; WIN_BYTES];
+    let mut credit = 0i64;
 
     for w in 0..n_wins {
         let off = (w as u64 * max_off) / (n_wins.saturating_sub(1).max(1) as u64);
@@ -112,16 +113,20 @@ pub fn train_seekable<R: Read + Seek>(
             Some(p) => start + p,
             None => continue,
         };
-        let (mut rows, mut bytes) = (0, 0);
+        // A window adds its share of the byte budget and a record spends its length, debt
+        // carried over: a run of long records gives one per few windows, as in a file of mixed
+        // order, not one per window.
+        let mut rows = 0;
+        credit = credit.min(0) + byte_quota as i64;
         for line in slice[start..end].split(|&b| b == b'\n') {
             let clean = line.strip_suffix(b"\r").unwrap_or(line);
             if !clean.is_empty() {
-                collected.push(clean.to_vec());
-                rows += 1;
-                bytes += clean.len();
-                if rows >= row_quota || bytes >= byte_quota {
+                if rows >= row_quota || credit <= 0 {
                     break;
                 }
+                collected.push(clean.to_vec());
+                rows += 1;
+                credit -= clean.len() as i64;
             }
         }
     }
