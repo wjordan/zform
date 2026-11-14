@@ -2,7 +2,7 @@
 //! previous frame's, and self-contained blocks. The encoder collects the index region as it goes.
 
 use crate::cells::{Cells, Col};
-use crate::dictionary::{Dictionary, Scope};
+use crate::dictionary::{Dictionary, DictionaryBuilder, Scope};
 use crate::codecs::{
     ANY_LETTERS, BlockDecodeCtx, ColSummary, Seeds, column_deps, decode_present_slice,
     decode_u32_seq, encode_dense_block_columns, encode_present_slice, encode_u32_seq,
@@ -13,8 +13,8 @@ use crate::framing::{
 };
 use crate::grammar::{BlockReconstructor, ModelPlan, OccRef, PlanVariant, split_records_with_plan};
 use crate::index::{
-    BlockDir, BlockKind, ColEntry, FilterBuilder, INDEX_MAGIC, IndexBuilder, KIND_BINARY, KIND_CSV,
-    KIND_ENVELOPE, KIND_JSON, KIND_LOGFMT, KIND_RESIDUAL, KIND_TEMPLATE, tokens,
+    BlockDir, BlockKind, ColEntry, FilterBuilder, INDEX_MAGIC, IndexBuilder, KIND_JSON, KIND_RESIDUAL,
+    KIND_SHAPE, KIND_SHAPE_CELL, tokens,
 };
 use crate::json_tree::{decode_json_struct_streams, encode_json_struct_streams};
 use crate::lex::parse_base64;
@@ -606,15 +606,12 @@ fn row_kinds(plan: &ModelPlan, variant_ids: &[u32]) -> u16 {
         seen[v as usize] = true;
     }
     let mut kinds = 0u16;
-    for (_, v) in plan.variants.iter().enumerate().filter(|(vi, _)| seen[*vi]) {
+    for (vi, v) in plan.variants.iter().enumerate().filter(|(vi, _)| seen[*vi]) {
         kinds |= match v {
-            PlanVariant::Residual { .. } => KIND_RESIDUAL,
+            PlanVariant::Shape(_) if vi == 0 => KIND_RESIDUAL,
+            PlanVariant::Shape(_) => KIND_SHAPE,
             PlanVariant::JsonTree => KIND_JSON,
-            PlanVariant::Envelope(_) => KIND_ENVELOPE,
-            PlanVariant::Logfmt => KIND_LOGFMT,
-            PlanVariant::Template(_) => KIND_TEMPLATE,
-            PlanVariant::Csv(_) => KIND_CSV,
-            PlanVariant::BinaryStride(_) => KIND_BINARY,
+            PlanVariant::ShapeCell { .. } => KIND_SHAPE_CELL,
         };
     }
     kinds
@@ -837,6 +834,7 @@ fn encode_block_columns(
         &horiz_cands,
         &mut preencoded_nested,
         &standalone,
+        Some((plan, &split.variant_ids)),
         packs,
         backend,
         level,
@@ -1321,7 +1319,7 @@ impl<'a> BlockParts<'a> {
 /// An open block: its row structure, lazily decoded columns, and a cursor over its rows.
 pub(crate) struct BlockRows<'a> {
     pub plan: &'a ModelPlan,
-    pub variant_ids: Vec<u32>,
+    pub variant_ids: Arc<[u32]>,
     pub ctx: BlockDecodeCtx<'a>,
     recon: BlockReconstructor,
     next: usize,
@@ -1396,10 +1394,12 @@ impl<'a> BlockRows<'a> {
         {
             return Err(Error::Format("block variant id out of range".into()));
         }
+        let variant_ids: Arc<[u32]> = variant_ids.into();
         Ok(Self {
             plan,
+            ctx: BlockDecodeCtx::new(parts.cols, parts.dicts, parts.pool, plan.library.clone())
+                .with_layout(plan, Arc::clone(&variant_ids)),
             variant_ids,
-            ctx: BlockDecodeCtx::new(parts.cols, parts.dicts, parts.pool, plan.library.clone()),
             recon: BlockReconstructor::new(plan, json_streams),
             next: 0,
         })
@@ -1533,13 +1533,37 @@ pub fn decode_frame_payload<W: Write>(
 // 3. High-Level Stream Pack / Unpack / Inspect / O(1) Seek Table Reader
 // ============================================================================
 
-pub fn pack_stream<R: Read, W: Write>(
-    mut reader: R,
-    mut writer: W,
+pub fn pack_stream<R: Read, W: Write>(reader: R, mut writer: W, opts: &PackOptions) -> Result<()> {
+    let mut enc = StreamEncoder::new(opts.clone());
+    for_each_chunk(reader, opts, |fc| enc.encode_framed(fc, &mut writer).map(drop))?;
+    enc.finish(&mut writer)
+}
+
+/// The dictionary of what `pack_stream` would write from `reader`, within `max_bytes`: `None` when
+/// `opts` names no profile or no value recurs across blocks.
+pub fn build_dictionary<R: Read>(
+    reader: R,
     opts: &PackOptions,
+    max_bytes: usize,
+) -> Result<Option<Dictionary>> {
+    let Some(mut b) = DictionaryBuilder::new(opts, max_bytes) else {
+        return Ok(None);
+    };
+    for_each_chunk(reader, opts, |fc| {
+        (0..fc.len()).for_each(|i| b.push(fc.record(i)));
+        Ok(())
+    })?;
+    Ok(b.finish())
+}
+
+/// Cuts `reader` into the framed chunks `pack_stream` encodes, in order.
+fn for_each_chunk<R: Read>(
+    mut reader: R,
+    opts: &PackOptions,
+    mut f: impl FnMut(&FramedChunk<'_>) -> Result<()>,
 ) -> Result<()> {
     let chunk_cap = opts.chunk_bytes.max(64 << 10);
-    let mut enc = StreamEncoder::new(opts.clone());
+    let mut first = true;
     let mut carry = Vec::<u8>::new();
     let mut io_buf = vec![0u8; 256 << 10];
     // JSON document state: `Some(continued)` while the input may be, or is inside, a document's array.
@@ -1563,7 +1587,8 @@ pub fn pack_stream<R: Read, W: Write>(
                 let more = !js.closed && carry.len() >= chunk_cap;
                 let end = if more { js.cut() } else { carry.len() };
                 json = more.then_some(true);
-                enc.encode_framed(&js.chunk(&carry, end), &mut writer)?;
+                f(&js.chunk(&carry, end))?;
+                first = false;
                 carry.drain(..end);
                 continue;
             }
@@ -1576,7 +1601,7 @@ pub fn pack_stream<R: Read, W: Write>(
                     stride,
                     header_bytes,
                 } => {
-                    let h = if enc.frames() == 0 {
+                    let h = if first {
                         header_bytes as usize
                     } else {
                         0
@@ -1616,10 +1641,10 @@ pub fn pack_stream<R: Read, W: Write>(
             carry.len()
         };
 
-        enc.encode_frame(&carry[..split_at], &mut writer)?;
+        f(&split_chunk(&carry[..split_at], opts.framing))?;
+        first = false;
         carry.drain(..split_at);
     }
-    enc.finish(&mut writer)?;
     Ok(())
 }
 

@@ -372,7 +372,7 @@ impl IntStream {
             Self::ZigZagBytes {
                 len,
                 head_leaf: pack_leaf(&head),
-                tail: Box::new(Self::auto_encode(&tail)),
+                tail: Box::new(Self::auto_encode_inner(&tail, false)),
             }
         } else {
             let raw = bitpack_u64(
@@ -508,8 +508,8 @@ impl IntStream {
     }
 
     pub fn decode_wire(cur: &mut Cursor<'_>, budget: &DecodeBudget, depth: usize) -> Result<Self> {
-        if depth > 4 {
-            return Err(Error::Format("IntStream nesting too deep".into()));
+        if depth > 1 {
+            return Err(Error::Format("nested IntStream tail".into()));
         }
         let kind = cur.u8()?;
         let len_u64 = cur.uvar()?;
@@ -800,11 +800,6 @@ pub enum GraphNode {
         fallback_buf: u16,
         width: u8,
     },
-    DictCells {
-        codes: u16,
-        dict_ends: IntStream,
-        dict_bytes: u16,
-    },
     RecurBuf {
         spec: RecurrenceSpec,
         seed: u16,
@@ -827,17 +822,9 @@ pub enum GraphNode {
         indices: u16,
         values: u16,
     },
-    ConcatCells {
-        parts: Vec<u16>,
-    },
-    ByteUnshuffle {
-        buf: u16,
-        width: u8,
-    },
     MtfInts {
         codes: u16,
         misses: u16,
-        window: u16,
     },
     SliceBuf {
         buf: u16,
@@ -870,6 +857,20 @@ pub enum GraphNode {
     ExtPeer {
         slot: u16,
     },
+    /// For each cell of `at` (`0`: this column, `s + 1`: peer slot `s`), the id of the value of
+    /// the first cell of peer slot `key` in the same record: the rank of that value's first
+    /// occurrence among the key column's distinct values.
+    ExtAlign {
+        key: u16,
+        at: u16,
+    },
+    /// For each needle, the position in `hay` of the `codes`-th entry equal to it; code `0`
+    /// gives `0`.
+    MatchIndex {
+        needles: u16,
+        hay: u16,
+        codes: u16,
+    },
 }
 
 impl GraphNode {
@@ -881,8 +882,18 @@ impl GraphNode {
             | Self::ConstCells { .. }
             | Self::ExtPool
             | Self::ExtDict { .. }
-            | Self::ExtPeer { .. } => {}
-            Self::ByteChunks { buf, .. } | Self::ByteUnshuffle { buf, .. } => f(*buf),
+            | Self::ExtPeer { .. }
+            | Self::ExtAlign { .. } => {}
+            Self::ByteChunks { buf, .. } => f(*buf),
+            Self::MatchIndex {
+                needles,
+                hay,
+                codes,
+            } => {
+                f(*needles);
+                f(*hay);
+                f(*codes);
+            }
             Self::MtfFixed {
                 codes,
                 fallback_buf,
@@ -890,12 +901,6 @@ impl GraphNode {
             } => {
                 f(*codes);
                 f(*fallback_buf);
-            }
-            Self::DictCells {
-                codes, dict_bytes, ..
-            } => {
-                f(*codes);
-                f(*dict_bytes);
             }
             Self::RecurBuf { seed, cols, .. } => {
                 f(*seed);
@@ -919,11 +924,6 @@ impl GraphNode {
                 f(*base);
                 f(*indices);
                 f(*values);
-            }
-            Self::ConcatCells { parts } => {
-                for &p in parts {
-                    f(p);
-                }
             }
             Self::MtfInts { codes, misses, .. } => {
                 f(*codes);
@@ -970,15 +970,6 @@ impl GraphNode {
                 fallback_buf: f(*fallback_buf),
                 width: *width,
             },
-            Self::DictCells {
-                codes,
-                dict_ends,
-                dict_bytes,
-            } => Self::DictCells {
-                codes: f(*codes),
-                dict_ends: dict_ends.clone(),
-                dict_bytes: f(*dict_bytes),
-            },
             Self::RecurBuf {
                 spec,
                 seed,
@@ -1011,21 +1002,9 @@ impl GraphNode {
                 indices: f(*indices),
                 values: f(*values),
             },
-            Self::ConcatCells { parts } => Self::ConcatCells {
-                parts: parts.iter().map(|&p| f(p)).collect(),
-            },
-            Self::ByteUnshuffle { buf, width } => Self::ByteUnshuffle {
-                buf: f(*buf),
-                width: *width,
-            },
-            Self::MtfInts {
-                codes,
-                misses,
-                window,
-            } => Self::MtfInts {
+            Self::MtfInts { codes, misses } => Self::MtfInts {
                 codes: f(*codes),
                 misses: f(*misses),
-                window: *window,
             },
             Self::SliceBuf { buf, base, lens } => Self::SliceBuf {
                 buf: f(*buf),
@@ -1052,6 +1031,16 @@ impl GraphNode {
             Self::ExtPool => Self::ExtPool,
             Self::ExtDict { dict_id } => Self::ExtDict { dict_id: *dict_id },
             Self::ExtPeer { slot } => Self::ExtPeer { slot: *slot },
+            Self::ExtAlign { key, at } => Self::ExtAlign { key: *key, at: *at },
+            Self::MatchIndex {
+                needles,
+                hay,
+                codes,
+            } => Self::MatchIndex {
+                needles: f(*needles),
+                hay: f(*hay),
+                codes: f(*codes),
+            },
         }
     }
 }
@@ -1128,7 +1117,9 @@ impl PayloadGraph {
             };
             for ins in &prog.ops {
                 let mut ins = *ins;
-                ins.a = map(ins.a);
+                if ins.op.arity() >= 1 {
+                    ins.a = map(ins.a);
+                }
                 if ins.op.arity() >= 2 {
                     ins.b = map(ins.b);
                 }
@@ -1342,6 +1333,11 @@ impl PayloadGraph {
                 GraphNode::ExtPeer { slot } if (*slot as usize) >= ext_peers.len() => {
                     return Err(Error::Format("undeclared ExtPeer dependency".into()));
                 }
+                GraphNode::ExtAlign { key, at }
+                    if (*key as usize) >= ext_peers.len() || (*at as usize) > ext_peers.len() =>
+                {
+                    return Err(Error::Format("undeclared ExtAlign dependency".into()));
+                }
                 _ => {}
             }
             nodes.push(node);
@@ -1425,10 +1421,13 @@ impl Recency {
     }
 }
 
-/// Move-to-front codes of `vals` over the last `win` distinct values: `0` takes the next of the
-/// returned misses, `k` the value `k - 1` places back.
-pub(crate) fn mtf_split(vals: &[i64], win: usize) -> (Vec<i64>, Vec<i64>) {
-    let mut ring = Recency::new(win, vals.len());
+/// Distinct values an `MtfInts` node remembers.
+pub(crate) const MTF_WINDOW: usize = 4096;
+
+/// Move-to-front codes of `vals` over the last [`MTF_WINDOW`] distinct values: `0` takes the
+/// next of the returned misses, `k` the value `k - 1` places back.
+pub(crate) fn mtf_split(vals: &[i64]) -> (Vec<i64>, Vec<i64>) {
+    let mut ring = Recency::new(MTF_WINDOW, vals.len());
     let mut codes = Vec::with_capacity(vals.len());
     let mut misses = Vec::new();
     // A value seen for the first time is a miss without a search of the window.
@@ -1475,15 +1474,35 @@ impl GraphBuilder {
         self.push(GraphNode::ExtDict { dict_id })
     }
 
-    pub fn add_ext_peer(&mut self, peer_col_id: u32) -> u16 {
-        let slot = if let Some(pos) = self.ext_peers.iter().position(|&p| p == peer_col_id) {
+    fn peer_slot(&mut self, peer_col_id: u32) -> u16 {
+        if let Some(pos) = self.ext_peers.iter().position(|&p| p == peer_col_id) {
             pos as u16
         } else {
             let s = self.ext_peers.len() as u16;
             self.ext_peers.push(peer_col_id);
             s
-        };
+        }
+    }
+
+    pub fn add_ext_peer(&mut self, peer_col_id: u32) -> u16 {
+        let slot = self.peer_slot(peer_col_id);
         self.push(GraphNode::ExtPeer { slot })
+    }
+
+    /// Indices into column `key` of its first cell in the record of each cell of column `at`
+    /// (`None`: this column).
+    pub fn add_ext_align(&mut self, key: u32, at: Option<u32>) -> u16 {
+        let key = self.peer_slot(key);
+        let at = at.map_or(0, |c| self.peer_slot(c) + 1);
+        self.push(GraphNode::ExtAlign { key, at })
+    }
+
+    pub fn add_match_index(&mut self, needles: u16, hay: u16, codes: u16) -> u16 {
+        self.push(GraphNode::MatchIndex {
+            needles,
+            hay,
+            codes,
+        })
     }
 
     pub fn add_const_cells(&mut self, val: &[u8], count: usize) -> u16 {
@@ -1505,6 +1524,24 @@ impl GraphBuilder {
         self.push(GraphNode::Bytes {
             leaf: pack_leaf(bytes),
         })
+    }
+
+    /// Unsigned little-endian lanes from `width` byte planes: all low bytes, then all second bytes.
+    pub fn add_planes(&mut self, planes: &[u8], width: u8) -> u16 {
+        assert!(matches!(width, 1 | 2 | 4 | 8) && planes.len().is_multiple_of(width as usize));
+        self.push(GraphNode::IntStream(IntStream::ForPlanes {
+            len: (planes.len() / width as usize) as u32,
+            min: 0,
+            width,
+            leaf: pack_leaf(planes),
+        }))
+    }
+
+    /// Cells of the low `width` bytes of each lane of `ints`, little-endian.
+    pub fn add_fixed_cells(&mut self, ints: u16, width: u8) -> u16 {
+        let b = Builder::new(1);
+        let x = b.input(0);
+        self.add_prog_cells(b.finish(&[(x, width)]), vec![ints], vec![])
     }
 
     pub fn add_raw_bytes(&mut self, bytes: &[u8]) -> u16 {
@@ -1536,6 +1573,14 @@ impl GraphBuilder {
             let mapped = match n {
                 GraphNode::ExtPeer { slot } => GraphNode::ExtPeer {
                     slot: peer_slot_map[slot as usize],
+                },
+                GraphNode::ExtAlign { key, at } => GraphNode::ExtAlign {
+                    key: peer_slot_map[key as usize],
+                    at: if at == 0 {
+                        0
+                    } else {
+                        peer_slot_map[at as usize - 1] + 1
+                    },
                 },
                 other => other.remap(|old| old + base),
             };
@@ -1756,11 +1801,6 @@ impl GraphBuilder {
         })
     }
 
-    pub fn add_byte_unshuffle(&mut self, buf: u16, width: u8) -> u16 {
-        assert!((1..=64).contains(&width));
-        self.push(GraphNode::ByteUnshuffle { buf, width })
-    }
-
     pub fn add_slice_buf(&mut self, buf: u16, base: u32, lens: &[i64]) -> u16 {
         let lens_id = self.add_ints(lens);
         self.push(GraphNode::SliceBuf {
@@ -1778,12 +1818,11 @@ impl GraphBuilder {
         self.push(GraphNode::TemplateCells { template, slots })
     }
 
-    pub fn add_mtf_ints(&mut self, vals: &[i64], window: u16) -> u16 {
-        let win = window as usize;
-        if vals.len() < 64 || win == 0 || win > 4096 {
+    pub fn add_mtf_ints(&mut self, vals: &[i64]) -> u16 {
+        if vals.len() < 64 {
             return self.add_ints(vals);
         }
-        let lookback = win.min(512);
+        let lookback = 512;
         let head = &vals[..vals.len().min(2048)];
         let near_hits = (1..head.len())
             .filter(|&i| head[i.saturating_sub(lookback)..i].contains(&head[i]))
@@ -1792,7 +1831,7 @@ impl GraphBuilder {
             return self.add_ints(vals);
         }
 
-        let (codes, misses) = mtf_split(vals, win);
+        let (codes, misses) = mtf_split(vals);
         if misses.len() * 8 >= vals.len() * 7 {
             return self.add_ints(vals);
         }
@@ -1805,7 +1844,6 @@ impl GraphBuilder {
         let r_mtf = tmp_mtf.push(GraphNode::MtfInts {
             codes: c_id,
             misses: m_id,
-            window,
         });
         let dir_wire_len = tmp_dir.nodes.iter().fold(0usize, |acc, n| {
             let mut b = Vec::new();
@@ -1895,16 +1933,13 @@ impl GraphBuilder {
         let codes: Vec<i64> = rows.iter().map(|r| remap[r]).collect();
 
         let codes_id = if lens.len() >= 16 && rows.len() >= 64 {
-            self.add_mtf_ints(&codes, 4096)
+            self.add_mtf_ints(&codes)
         } else {
             self.add_ints(&codes)
         };
         let bytes_id = self.add_bytes(&dict_raw);
-        self.push(GraphNode::DictCells {
-            codes: codes_id,
-            dict_ends: IntStream::auto_encode(&lens),
-            dict_bytes: bytes_id,
-        })
+        let dict = self.add_slice_buf(bytes_id, 0, &lens);
+        self.add_index_cells(dict, codes_id)
     }
 
     pub fn add_recur_node(
@@ -1974,8 +2009,29 @@ impl GraphBuilder {
         })
     }
 
-    pub fn add_concat(&mut self, parts: Vec<u16>) -> u16 {
-        self.push(GraphNode::ConcatCells { parts })
+    /// `count` cells of `literals[0]`, slot 0's cell, `literals[1]`, ..., `literals[n]`.
+    pub fn add_template(&mut self, literals: &[&[u8]], slots: Vec<u16>, count: usize) -> u16 {
+        assert!(literals.len() == slots.len() + 1 && slots.len() <= 64);
+        if slots.is_empty() {
+            return self.add_const_cells(literals[0], count);
+        }
+        if slots.len() == 1 && literals.iter().all(|l| l.is_empty()) {
+            return slots[0];
+        }
+        let mut template = Vec::new();
+        for (i, lit) in literals.iter().enumerate() {
+            for &b in *lit {
+                template.push(b);
+                if b == 0x1f {
+                    template.push(0xff);
+                }
+            }
+            if i < slots.len() {
+                template.extend([0x1f, (i as u8) << 1]);
+            }
+        }
+        let template = self.add_const_cells(&template, count);
+        self.add_template_cells(template, slots)
     }
 
     pub fn finish(self, root: u16) -> PayloadGraph {
@@ -2042,16 +2098,6 @@ fn encode_node_linked(n: &GraphNode, lib: Option<&Library>, out: &mut Vec<u8>) {
             put_uvarint(out, *fallback_buf as u64);
             out.push(*width);
         }
-        GraphNode::DictCells {
-            codes,
-            dict_ends,
-            dict_bytes,
-        } => {
-            out.push(4);
-            put_uvarint(out, *codes as u64);
-            dict_ends.encode(out);
-            put_uvarint(out, *dict_bytes as u64);
-        }
         GraphNode::RecurBuf {
             spec,
             seed,
@@ -2091,24 +2137,10 @@ fn encode_node_linked(n: &GraphNode, lib: Option<&Library>, out: &mut Vec<u8>) {
             put_uvarint(out, *indices as u64);
             put_uvarint(out, *values as u64);
         }
-        GraphNode::ConcatCells { parts } => {
-            out.push(9);
-            put_u16_list(out, parts);
-        }
-        GraphNode::ByteUnshuffle { buf, width } => {
-            out.push(10);
-            put_uvarint(out, *buf as u64);
-            out.push(*width);
-        }
-        GraphNode::MtfInts {
-            codes,
-            misses,
-            window,
-        } => {
+        GraphNode::MtfInts { codes, misses } => {
             out.push(11);
             put_uvarint(out, *codes as u64);
             put_uvarint(out, *misses as u64);
-            put_uvarint(out, *window as u64);
         }
         GraphNode::SliceBuf { buf, base, lens } => {
             out.push(12);
@@ -2153,6 +2185,21 @@ fn encode_node_linked(n: &GraphNode, lib: Option<&Library>, out: &mut Vec<u8>) {
         GraphNode::ExtPeer { slot } => {
             out.push(20);
             put_uvarint(out, *slot as u64);
+        }
+        GraphNode::ExtAlign { key, at } => {
+            out.push(22);
+            put_uvarint(out, *key as u64);
+            put_uvarint(out, *at as u64);
+        }
+        GraphNode::MatchIndex {
+            needles,
+            hay,
+            codes,
+        } => {
+            out.push(23);
+            put_uvarint(out, *needles as u64);
+            put_uvarint(out, *hay as u64);
+            put_uvarint(out, *codes as u64);
         }
     }
 }
@@ -2220,16 +2267,6 @@ fn decode_node(
                 width,
             })
         }
-        4 => {
-            let codes = check_ref(cur.uvar()?)?;
-            let dict_ends = IntStream::decode_wire(cur, budget, 0)?;
-            let dict_bytes = check_ref(cur.uvar()?)?;
-            Ok(GraphNode::DictCells {
-                codes,
-                dict_ends,
-                dict_bytes,
-            })
-        }
         5 => {
             let spec = match code_ref(cur)? {
                 Ok(sbytes) => RecurrenceSpec::decode(sbytes)?,
@@ -2290,33 +2327,10 @@ fn decode_node(
                 values,
             })
         }
-        9 => {
-            let parts = get_u16_list(cur, idx)?;
-            if parts.is_empty() || parts.len() > 32 {
-                return Err(Error::Format("invalid ConcatCells part count".into()));
-            }
-            Ok(GraphNode::ConcatCells { parts })
-        }
-        10 => {
-            let buf = check_ref(cur.uvar()?)?;
-            let width = cur.u8()?;
-            if !(1..=64).contains(&width) {
-                return Err(Error::Format("ByteUnshuffle width out of range".into()));
-            }
-            Ok(GraphNode::ByteUnshuffle { buf, width })
-        }
         11 => {
             let codes = check_ref(cur.uvar()?)?;
             let misses = check_ref(cur.uvar()?)?;
-            let win = cur.uvar()?;
-            if !(1..=4096).contains(&win) {
-                return Err(Error::Format("MtfInts window out of range".into()));
-            }
-            Ok(GraphNode::MtfInts {
-                codes,
-                misses,
-                window: win as u16,
-            })
+            Ok(GraphNode::MtfInts { codes, misses })
         }
         12 => {
             let buf = check_ref(cur.uvar()?)?;
@@ -2384,6 +2398,21 @@ fn decode_node(
             }
             Ok(GraphNode::ExtPeer { slot: s as u16 })
         }
+        22 => {
+            let (key, at) = (cur.uvar()?, cur.uvar()?);
+            if key >= 64 || at > 64 {
+                return Err(Error::Format("ExtAlign slot out of bounds".into()));
+            }
+            Ok(GraphNode::ExtAlign {
+                key: key as u16,
+                at: at as u16,
+            })
+        }
+        23 => Ok(GraphNode::MatchIndex {
+            needles: check_ref(cur.uvar()?)?,
+            hay: check_ref(cur.uvar()?)?,
+            codes: check_ref(cur.uvar()?)?,
+        }),
         21 => {
             if flag {
                 return Err(Error::Format("invalid flag on LibraryBytes node".into()));
@@ -2403,6 +2432,8 @@ pub struct ExtInputs<'a> {
     pub pool: Option<&'a Arc<Vec<u8>>>,
     pub dict: Option<(u16, &'a Arc<Cells>)>,
     pub peers: &'a [Arc<Cells>],
+    /// The value of each `ExtAlign` node, in node order, which the block layout determines.
+    pub aligned: &'a [Vec<i64>],
 }
 
 impl<'a> ExtInputs<'a> {
@@ -2556,7 +2587,6 @@ impl CoreDecoder {
             matches!(
                 n,
                 GraphNode::ConstCells { .. }
-                    | GraphNode::DictCells { .. }
                     | GraphNode::IndexCells { .. }
                     | GraphNode::SliceBuf { .. }
             )
@@ -2614,44 +2644,6 @@ impl CoreDecoder {
                 val: val.clone(),
                 n: *count as usize,
             }),
-            GraphNode::DictCells {
-                codes,
-                dict_ends,
-                dict_bytes,
-            } => {
-                if *codes == *dict_bytes {
-                    return Err(Error::Format("DictCells codes == dict_bytes".into()));
-                }
-                let lens_i64 = dict_ends.unpack(budget)?;
-                let raw = take_or_clone_buf(&mut vals[*dict_bytes as usize])?;
-                let codes_col = as_ints(&vals[*codes as usize])?;
-                let mut ends = Vec::with_capacity(lens_i64.len());
-                let mut acc = 0usize;
-                for &l in &lens_i64 {
-                    if l < 0 {
-                        return Err(Error::Format("negative dict entry length".into()));
-                    }
-                    acc = acc
-                        .checked_add(l as usize)
-                        .ok_or_else(|| Error::Format("dict length overflow".into()))?;
-                    ends.push(acc as u32);
-                }
-                if acc != raw.len() {
-                    return Err(Error::Format(
-                        "dict entry lengths do not cover dict_bytes".into(),
-                    ));
-                }
-                let dict = Arc::new(Cells::from_parts(raw, ends)?);
-                let dict_len = dict.len();
-                let mut ords = Vec::with_capacity(codes_col.len());
-                for &c in codes_col {
-                    if c < 0 || (c as usize) >= dict_len {
-                        return Err(Error::Format("dict code out of bounds".into()));
-                    }
-                    ords.push(c as u32);
-                }
-                Ok(Col::Dict { dict, ords })
-            }
             GraphNode::IndexCells { source, indices } => {
                 if *source == *indices {
                     return Err(Error::Format("IndexCells source == indices".into()));
@@ -2752,9 +2744,20 @@ impl CoreDecoder {
         rem_uses: &mut [u32],
     ) -> Result<Vec<Val>> {
         let mut vals: Vec<Val> = Vec::with_capacity(nodes.len());
+        // Constant cells used only as `TemplateCells` templates are read from the node itself.
+        let mut template_uses = vec![0u32; nodes.len()];
+        for node in nodes {
+            if let GraphNode::TemplateCells { template, .. } = node {
+                template_uses[*template as usize] += 1;
+            }
+        }
 
+        let mut n_aligned = 0;
         for (idx, node) in nodes.iter().enumerate() {
-            if skip[idx] {
+            let template_only = matches!(node, GraphNode::ConstCells { .. })
+                && template_uses[idx] > 0
+                && template_uses[idx] == rem_uses[idx];
+            if skip[idx] || template_only {
                 vals.push(Val::Empty);
                 continue;
             }
@@ -2835,45 +2838,6 @@ impl CoreDecoder {
                     }
                     Val::Buf(out)
                 }
-                GraphNode::DictCells {
-                    codes,
-                    dict_ends,
-                    dict_bytes,
-                } => {
-                    let codes_col = as_ints(&vals[*codes as usize])?;
-                    let lens = dict_ends.unpack(budget)?;
-                    let raw = as_buf(&vals[*dict_bytes as usize])?;
-                    let mut offsets = Vec::with_capacity(lens.len() + 1);
-                    offsets.push(0usize);
-                    let mut acc = 0usize;
-                    for &l in &lens {
-                        if l < 0 {
-                            return Err(Error::Format("negative dict entry length".into()));
-                        }
-                        acc = acc
-                            .checked_add(l as usize)
-                            .ok_or_else(|| Error::Format("dict overflow".into()))?;
-                        if acc > raw.len() {
-                            return Err(Error::Format("dict entry exceeds buffer".into()));
-                        }
-                        offsets.push(acc);
-                    }
-                    let mut data = Vec::with_capacity(codes_col.len() * 8);
-                    let mut ends = Vec::with_capacity(codes_col.len());
-                    for &c in codes_col {
-                        if c < 0 || (c as usize) >= lens.len() {
-                            return Err(Error::Format("dict code out of bounds".into()));
-                        }
-                        let k = c as usize;
-                        let sl = &raw[offsets[k]..offsets[k + 1]];
-                        if data.len().saturating_add(sl.len()) > budget.max_single_alloc_bytes {
-                            return Err(Error::BudgetExceeded("DictCells expanded bytes"));
-                        }
-                        data.extend_from_slice(sl);
-                        ends.push(data.len() as u32);
-                    }
-                    Val::Cells(Cells::from_parts(data, ends)?)
-                }
                 GraphNode::RecurBuf {
                     spec,
                     seed,
@@ -2892,8 +2856,8 @@ impl CoreDecoder {
                                 .chunks_exact(4)
                                 .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
                                 .collect();
-                            if seed.len() < spec.max_lag() {
-                                return Err(Error::Format("seed shorter than max_lag".into()));
+                            if seed.len() != spec.max_lag() * spec.n_state as usize {
+                                return Err(Error::Format("recurrence seed size mismatch".into()));
                             }
                             let mut col_u32: Vec<Vec<u32>> = Vec::with_capacity(cols.len());
                             for &cid in cols {
@@ -2931,8 +2895,8 @@ impl CoreDecoder {
                                 .chunks_exact(8)
                                 .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
                                 .collect();
-                            if seed.len() < spec.max_lag() {
-                                return Err(Error::Format("seed shorter than max_lag".into()));
+                            if seed.len() != spec.max_lag() * spec.n_state as usize {
+                                return Err(Error::Format("recurrence seed size mismatch".into()));
                             }
                             let mut col_refs = Vec::with_capacity(cols.len());
                             for &cid in cols {
@@ -3009,7 +2973,23 @@ impl CoreDecoder {
                         .checked_mul(rb)
                         .ok_or(Error::BudgetExceeded("ProgramCells"))?;
                     budget.check_alloc(cap + 8, "ProgramCells")?;
-                    if !prog.varlen() {
+                    // Fixed-width cells of a lane's low bytes skip the program engine.
+                    if let (Some(&x), [(0, Len::Fixed(w))], true) =
+                        (in_refs.first(), &prog.sinks[..], prog.ops.is_empty())
+                    {
+                        let mut data = vec![0u8; cap];
+                        match *w {
+                            8 => fill_low_bytes::<8>(x, &mut data),
+                            4 => fill_low_bytes::<4>(x, &mut data),
+                            2 => fill_low_bytes::<2>(x, &mut data),
+                            w => {
+                                for (d, v) in data.chunks_exact_mut(w as usize).zip(x) {
+                                    d.copy_from_slice(&v.to_le_bytes()[..w as usize]);
+                                }
+                            }
+                        }
+                        Val::Cells(Cells::from_fixed(n_rows, rb, data)?)
+                    } else if !prog.varlen() {
                         let mut data = vec![0u8; cap];
                         CompiledProgram::with(prog, |cp| {
                             cp.eval_fixed(&in_refs, &tbufs, n_rows, &mut data)
@@ -3072,99 +3052,11 @@ impl CoreDecoder {
                     }
                     Val::Cells(Cells::from_parts(data, ends)?)
                 }
-                GraphNode::ConcatCells { parts } => {
-                    let cols: Vec<&Cells> = parts
-                        .iter()
-                        .map(|&pid| as_cells(&vals[pid as usize]))
-                        .collect::<Result<_>>()?;
-                    let n = cols[0].len();
-                    if cols.iter().any(|c| c.len() != n) {
-                        return Err(Error::Format("ConcatCells row count mismatch".into()));
-                    }
-                    let total_bytes: usize = cols.iter().map(|c| c.bytes().len()).sum();
-                    budget.check_alloc(total_bytes, "ConcatCells")?;
-                    let mut data = Vec::with_capacity(total_bytes);
-                    let mut ends = Vec::with_capacity(n);
-                    for r in 0..n {
-                        for c in &cols {
-                            data.extend_from_slice(c.get(r).unwrap());
-                        }
-                        ends.push(data.len() as u32);
-                    }
-                    Val::Cells(Cells::from_parts(data, ends)?)
-                }
-                GraphNode::ByteUnshuffle { buf, width } => {
-                    let bytes = as_buf(&vals[*buf as usize])?;
-                    let w = *width as usize;
-                    if !bytes.len().is_multiple_of(w) {
-                        return Err(Error::Format(
-                            "ByteUnshuffle buffer not aligned to width".into(),
-                        ));
-                    }
-                    budget.check_alloc(bytes.len(), "ByteUnshuffle")?;
-                    let n = bytes.len() / w;
-                    let mut out = vec![0u8; bytes.len()];
-                    match w {
-                        1 => out.copy_from_slice(bytes),
-                        2 => {
-                            let (p0, p1) = bytes.split_at(n);
-                            for (i, ch) in out.chunks_exact_mut(2).enumerate() {
-                                ch[0] = p0[i];
-                                ch[1] = p1[i];
-                            }
-                        }
-                        4 => {
-                            let p0 = &bytes[0..n];
-                            let p1 = &bytes[n..2 * n];
-                            let p2 = &bytes[2 * n..3 * n];
-                            let p3 = &bytes[3 * n..4 * n];
-                            for (i, ch) in out.chunks_exact_mut(4).enumerate() {
-                                ch[0] = p0[i];
-                                ch[1] = p1[i];
-                                ch[2] = p2[i];
-                                ch[3] = p3[i];
-                            }
-                        }
-                        8 => {
-                            let p0 = &bytes[0..n];
-                            let p1 = &bytes[n..2 * n];
-                            let p2 = &bytes[2 * n..3 * n];
-                            let p3 = &bytes[3 * n..4 * n];
-                            let p4 = &bytes[4 * n..5 * n];
-                            let p5 = &bytes[5 * n..6 * n];
-                            let p6 = &bytes[6 * n..7 * n];
-                            let p7 = &bytes[7 * n..8 * n];
-                            for (i, ch) in out.chunks_exact_mut(8).enumerate() {
-                                ch[0] = p0[i];
-                                ch[1] = p1[i];
-                                ch[2] = p2[i];
-                                ch[3] = p3[i];
-                                ch[4] = p4[i];
-                                ch[5] = p5[i];
-                                ch[6] = p6[i];
-                                ch[7] = p7[i];
-                            }
-                        }
-                        _ => {
-                            for (i, ch) in out.chunks_exact_mut(w).enumerate() {
-                                for (k, slot) in ch.iter_mut().enumerate() {
-                                    *slot = bytes[k * n + i];
-                                }
-                            }
-                        }
-                    }
-                    Val::Buf(out)
-                }
-                GraphNode::MtfInts {
-                    codes,
-                    misses,
-                    window,
-                } => {
+                GraphNode::MtfInts { codes, misses } => {
                     let codes_col = as_ints(&vals[*codes as usize])?;
                     let misses_col = as_ints(&vals[*misses as usize])?;
-                    let win = *window as usize;
                     budget.check_alloc(codes_col.len().saturating_mul(8), "MtfInts")?;
-                    let mut ring = Recency::new(win, codes_col.len());
+                    let mut ring = Recency::new(MTF_WINDOW, codes_col.len());
                     let mut misses_it = misses_col.iter();
                     let mut out = Vec::with_capacity(codes_col.len());
                     for &c in codes_col {
@@ -3249,53 +3141,47 @@ impl CoreDecoder {
                     Val::Cells(Cells::from_parts(data, ends)?)
                 }
                 GraphNode::TemplateCells { template, slots } => {
-                    let tmpl = as_cells(&vals[*template as usize])?;
                     let slot_cols: Vec<&Cells> = slots
                         .iter()
                         .map(|&sid| as_cells(&vals[sid as usize]))
                         .collect::<Result<_>>()?;
-                    let n = tmpl.len();
+                    let slot_bytes: usize = slot_cols.iter().map(|c| c.bytes().len()).sum();
+                    // A constant template is split once rather than per row.
+                    let (n, fixed, per_row, cap) = match &nodes[*template as usize] {
+                        GraphNode::ConstCells { val, count } => {
+                            let mut pieces = Vec::new();
+                            walk_template(val, slot_cols.len(), |pc| pieces.push(pc))?;
+                            let n = *count as usize;
+                            (n, pieces, None, slot_bytes + val.len().saturating_mul(n))
+                        }
+                        _ => {
+                            let tmpl = as_cells(&vals[*template as usize])?;
+                            let cap = slot_bytes + tmpl.bytes().len();
+                            (tmpl.len(), Vec::new(), Some(tmpl), cap)
+                        }
+                    };
                     if slot_cols.iter().any(|c| c.len() != n) {
                         return Err(Error::Format("TemplateCells row count mismatch".into()));
                     }
-                    let mut data = Vec::with_capacity(tmpl.bytes().len() * 2);
+                    let mut data = Vec::with_capacity(cap.min(budget.max_single_alloc_bytes));
                     let mut ends = Vec::with_capacity(n);
-                    for r in 0..n {
-                        let tb = tmpl.get(r).unwrap();
-                        let mut p = 0usize;
-                        while p < tb.len() {
-                            if let Some(hit) = tb[p..].iter().position(|&b| b == 0x1f) {
-                                data.extend_from_slice(&tb[p..p + hit]);
-                                let esc = p + hit + 1;
-                                if esc >= tb.len() {
-                                    return Err(Error::Format(
-                                        "truncated TemplateCells escape".into(),
-                                    ));
-                                }
-                                let code = tb[esc];
-                                if code == 0xff {
-                                    data.push(0x1f);
-                                } else {
-                                    let slot_i = (code >> 1) as usize;
-                                    let strip = (code & 1) != 0;
-                                    if slot_i >= slot_cols.len() {
-                                        return Err(Error::Format(
-                                            "TemplateCells slot out of bounds".into(),
-                                        ));
-                                    }
-                                    let sv = slot_cols[slot_i].get(r).unwrap();
-                                    let ins = if strip && sv.len() >= 2 {
-                                        &sv[1..sv.len() - 1]
-                                    } else {
-                                        sv
-                                    };
-                                    data.extend_from_slice(ins);
-                                }
-                                p = esc + 1;
+                    let emit = |data: &mut Vec<u8>, piece: &Piece, r: usize| match *piece {
+                        Piece::Lit(b) => data.extend_from_slice(b),
+                        Piece::Slot(i, strip) => {
+                            let sv = slot_cols[i].get(r).unwrap();
+                            data.extend_from_slice(if strip && sv.len() >= 2 {
+                                &sv[1..sv.len() - 1]
                             } else {
-                                data.extend_from_slice(&tb[p..]);
-                                break;
-                            }
+                                sv
+                            });
+                        }
+                    };
+                    for r in 0..n {
+                        match per_row {
+                            None => fixed.iter().for_each(|pc| emit(&mut data, pc, r)),
+                            Some(t) => walk_template(t.get(r).unwrap(), slot_cols.len(), |pc| {
+                                emit(&mut data, &pc, r)
+                            })?,
                         }
                         if data.len() > budget.max_single_alloc_bytes {
                             return Err(Error::BudgetExceeded("TemplateCells expanded bytes"));
@@ -3378,6 +3264,21 @@ impl CoreDecoder {
                     let peer = ext.peers.get(*slot as usize).ok_or(Error::NotLoaded)?;
                     Val::SharedCells(Arc::clone(peer))
                 }
+                GraphNode::ExtAlign { .. } => {
+                    let v = ext.aligned.get(n_aligned).ok_or(Error::NotLoaded)?;
+                    n_aligned += 1;
+                    Val::Ints(v.clone())
+                }
+                GraphNode::MatchIndex {
+                    needles,
+                    hay,
+                    codes,
+                } => Val::Ints(match_index(
+                    as_ints(&vals[*needles as usize])?,
+                    as_ints(&vals[*hay as usize])?,
+                    as_ints(&vals[*codes as usize])?,
+                    budget,
+                )?),
             };
             node.for_each_dep(|dep| {
                 let d = dep as usize;
@@ -3391,6 +3292,91 @@ impl CoreDecoder {
 
         Ok(vals)
     }
+}
+
+enum Piece<'a> {
+    Lit(&'a [u8]),
+    Slot(usize, bool),
+}
+
+/// `MatchIndex`: hay positions grouped by key in a counting sort, so each lookup is O(1). Keys
+/// index dense tables, so hay keys must be small nonnegative integers.
+fn match_index(
+    needles: &[i64],
+    hay: &[i64],
+    codes: &[i64],
+    budget: &DecodeBudget,
+) -> Result<Vec<i64>> {
+    if codes.len() != needles.len() {
+        return Err(Error::Format("MatchIndex code count mismatch".into()));
+    }
+    let max = hay.iter().copied().max().unwrap_or(-1);
+    if hay.iter().any(|&h| h < 0) || max >= u32::MAX as i64 {
+        return Err(Error::Format("MatchIndex key out of range".into()));
+    }
+    let groups = (max + 1) as usize;
+    budget.check_alloc(
+        groups.saturating_add(hay.len()).saturating_mul(8) + codes.len().saturating_mul(8),
+        "MatchIndex",
+    )?;
+    // Counts per key become exclusive starts, then each key's hay positions fill in order.
+    let mut starts = vec![0u32; groups + 1];
+    for &h in hay {
+        starts[h as usize + 1] += 1;
+    }
+    for g in 0..groups {
+        starts[g + 1] += starts[g];
+    }
+    let mut fill = starts.clone();
+    let mut by_key = vec![0u32; hay.len()];
+    for (j, &h) in hay.iter().enumerate() {
+        by_key[fill[h as usize] as usize] = j as u32;
+        fill[h as usize] += 1;
+    }
+    let mut out = Vec::with_capacity(codes.len());
+    for (&n, &code) in needles.iter().zip(codes) {
+        if code == 0 {
+            out.push(0);
+            continue;
+        }
+        let pos = usize::try_from(n).ok().filter(|&n| n < groups).and_then(|n| {
+            let (lo, hi) = (starts[n] as i64, starts[n + 1] as i64);
+            (code > 0 && code <= hi - lo).then(|| by_key[(lo + code - 1) as usize])
+        });
+        out.push(pos.ok_or_else(|| Error::Format("MatchIndex code out of bounds".into()))? as i64);
+    }
+    Ok(out)
+}
+
+fn fill_low_bytes<const W: usize>(lanes: &[i64], out: &mut [u8]) {
+    for (d, v) in out.chunks_exact_mut(W).zip(lanes) {
+        d.copy_from_slice(&v.to_le_bytes()[..W]);
+    }
+}
+
+/// Splits one `TemplateCells` template into literal runs and slot references.
+fn walk_template<'a>(tb: &'a [u8], n_slots: usize, mut f: impl FnMut(Piece<'a>)) -> Result<()> {
+    let mut p = 0;
+    while let Some(hit) = tb[p..].iter().position(|&b| b == 0x1f) {
+        if hit > 0 {
+            f(Piece::Lit(&tb[p..p + hit]));
+        }
+        let code = *tb
+            .get(p + hit + 1)
+            .ok_or_else(|| Error::Format("truncated TemplateCells escape".into()))?;
+        if code == 0xff {
+            f(Piece::Lit(&[0x1f]));
+        } else if (code >> 1) as usize >= n_slots {
+            return Err(Error::Format("TemplateCells slot out of bounds".into()));
+        } else {
+            f(Piece::Slot((code >> 1) as usize, code & 1 != 0));
+        }
+        p += hit + 2;
+    }
+    if p < tb.len() {
+        f(Piece::Lit(&tb[p..]));
+    }
+    Ok(())
 }
 
 #[inline]
@@ -3441,14 +3427,6 @@ fn as_buf(v: &Val) -> Result<&[u8]> {
     match v {
         Val::Buf(b) => Ok(b),
         Val::SharedBuf(b) => Ok(b),
-        _ => Err(Error::Format("expected Buf node".into())),
-    }
-}
-
-fn take_or_clone_buf(v: &mut Val) -> Result<Vec<u8>> {
-    match std::mem::replace(v, Val::Empty) {
-        Val::Buf(b) => Ok(b),
-        Val::SharedBuf(b) => Ok((*b).clone()),
         _ => Err(Error::Format("expected Buf node".into())),
     }
 }

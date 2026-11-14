@@ -1,146 +1,119 @@
-//! Lagged self-referential recurrences (`s[i] = f(s[i - lag_0], .., col[i])`).
-//!
-//! [`RecurrenceSpec`] is the portable wire representation carried inside a column payload: a list
-//! of constant positive lags, a [`Program`] computing the next state word, and an optional
-//! [`Program`] transforming each state word into an emitted output word (such as MT19937's temper).
+//! Recurrences: `n_state` sequences of state words advancing together, each next word computed
+//! from taps `state[lane][i - lag]` and optional integer columns (PROGRAMS.md "recurrences").
 //!
 //! [`CompiledRecurrence`] runs a spec through the program executor: with every lag at least `n`,
-//! the next `n` state words depend only on words already made, so one chunk of `state_prog` makes
-//! them all from windows of the history. Lags under 3 go word by word through the scalar
-//! evaluator, which measured faster there.
+//! the next `n` steps depend only on steps already made, so one chunk of the program makes them
+//! all from windows of the history. Lags under 3 go step by step through the scalar evaluator,
+//! which measured faster there.
 
 use super::engine::{CHUNK, CompiledProgram, Lane, Runner};
 use super::ir::{Invalid, Len, Op, Program, Width, get_uv, put_uv};
 
-/// Wire-serializable specification of a lagged recurrence.
+const MAX_STATE: u32 = 8;
+const MAX_TAPS: usize = 16;
+const MAX_LAG: u32 = 1 << 20;
+
+/// Wire-serializable specification of a recurrence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecurrenceSpec {
-    pub lags: Vec<u32>,
-    pub state_prog: Program,
-    pub out_prog: Option<Program>,
+    pub n_state: u32,
+    /// `(lane, lag)`: input `k` of `prog` is `state[lane][i - lag]`.
+    pub taps: Vec<(u32, u32)>,
+    /// Sinks: the next word of each state lane, then optionally the output.
+    pub prog: Program,
 }
 
 impl RecurrenceSpec {
     pub fn max_lag(&self) -> usize {
-        self.lags.iter().copied().max().unwrap_or(0) as usize
+        self.taps.iter().map(|t| t.1).max().unwrap_or(0) as usize
     }
 
     pub fn min_lag(&self) -> usize {
-        self.lags.iter().copied().min().unwrap_or(0) as usize
+        self.taps.iter().map(|t| t.1).min().unwrap_or(0) as usize
     }
 
     pub fn n_cols(&self) -> usize {
-        self.state_prog.n_in as usize - self.lags.len()
+        self.prog.n_in as usize - self.taps.len()
     }
 
     pub fn width(&self) -> Width {
-        self.state_prog.width
+        self.prog.width
+    }
+
+    /// The sink each step's output word comes from.
+    fn out_sink(&self) -> usize {
+        if self.prog.sinks.len() > self.n_state as usize {
+            self.n_state as usize
+        } else {
+            0
+        }
     }
 
     pub fn validate(&self) -> Result<(), Invalid> {
-        if self.lags.is_empty() || self.lags.len() > 16 {
-            return Err(Invalid("recurrence must have 1..=16 lags"));
+        if !(1..=MAX_STATE).contains(&self.n_state) {
+            return Err(Invalid("recurrence must have 1..=8 state lanes"));
         }
-        for &l in &self.lags {
-            if l == 0 || l > (1 << 20) {
-                return Err(Invalid("recurrence lag out of range"));
+        if self.taps.is_empty() || self.taps.len() > MAX_TAPS {
+            return Err(Invalid("recurrence must have 1..=16 taps"));
+        }
+        for &(lane, lag) in &self.taps {
+            if lane >= self.n_state || lag == 0 || lag > MAX_LAG {
+                return Err(Invalid("recurrence tap out of range"));
             }
         }
-        if (self.state_prog.n_in as usize) < self.lags.len() {
-            return Err(Invalid("state_prog has fewer inputs than lags"));
+        let p = &self.prog;
+        if (p.n_in as usize) < self.taps.len() {
+            return Err(Invalid("recurrence program has fewer inputs than taps"));
         }
-        if self.state_prog.has_scans() || self.state_prog.has_gathers() {
-            return Err(Invalid(
-                "recurrence state_prog cannot contain scans or gathers",
-            ));
+        if p.has_scans() || p.has_gathers() {
+            return Err(Invalid("recurrence program cannot contain scans or gathers"));
         }
-        let expected_sink = match self.state_prog.width {
-            Width::W32 => Len::Fixed(4),
-            Width::W64 => Len::Fixed(8),
-        };
-        if self.state_prog.sinks.len() != 1 || self.state_prog.sinks[0].1 != expected_sink {
-            return Err(Invalid("state_prog must emit one full-lane word"));
-        }
-        if let Some(out_p) = &self.out_prog {
-            if out_p.width != self.state_prog.width || out_p.n_in != 1 {
-                return Err(Invalid("out_prog must have matching width and 1 input"));
-            }
-            if out_p.has_scans() || out_p.has_gathers() {
-                return Err(Invalid(
-                    "recurrence out_prog cannot contain scans or gathers",
-                ));
-            }
-            if out_p.sinks.len() != 1 || out_p.sinks[0].1 != expected_sink {
-                return Err(Invalid("out_prog must emit one full-lane word"));
-            }
+        let full = Len::Fixed(p.width.bits() as u8 / 8);
+        let n = self.n_state as usize;
+        if !(n..=n + 1).contains(&p.sinks.len()) || p.sinks.iter().any(|s| s.1 != full) {
+            return Err(Invalid("recurrence program must emit full words per state lane"));
         }
         Ok(())
     }
 
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        put_uv(&mut out, self.lags.len() as u64);
-        for &l in &self.lags {
-            put_uv(&mut out, l as u64);
+        put_uv(&mut out, u64::from(self.n_state));
+        put_uv(&mut out, self.taps.len() as u64);
+        for &(lane, lag) in &self.taps {
+            put_uv(&mut out, u64::from(lane));
+            put_uv(&mut out, u64::from(lag));
         }
-        let sb = self.state_prog.encode();
-        put_uv(&mut out, sb.len() as u64);
-        out.extend_from_slice(&sb);
-        match &self.out_prog {
-            None => out.push(0),
-            Some(op) => {
-                out.push(1);
-                let ob = op.encode();
-                put_uv(&mut out, ob.len() as u64);
-                out.extend_from_slice(&ob);
-            }
-        }
+        let pb = self.prog.encode();
+        put_uv(&mut out, pb.len() as u64);
+        out.extend_from_slice(&pb);
         out
     }
 
     pub fn decode(mut b: &[u8]) -> Result<Self, Invalid> {
         let b = &mut b;
-        let n_lags = get_uv(b)?;
-        if n_lags == 0 || n_lags > 16 {
-            return Err(Invalid("invalid lag count"));
+        let n_state = get_uv(b)?;
+        let n_taps = get_uv(b)?;
+        if n_state == 0 || n_state > u64::from(MAX_STATE) || n_taps == 0 || n_taps > MAX_TAPS as u64
+        {
+            return Err(Invalid("invalid recurrence lane or tap count"));
         }
-        let mut lags = Vec::with_capacity(n_lags as usize);
-        for _ in 0..n_lags {
-            let l = get_uv(b)?;
-            if l == 0 || l > (1 << 20) {
-                return Err(Invalid("lag out of range"));
+        let mut taps = Vec::with_capacity(n_taps as usize);
+        for _ in 0..n_taps {
+            let (lane, lag) = (get_uv(b)?, get_uv(b)?);
+            if lane >= n_state || lag == 0 || lag > u64::from(MAX_LAG) {
+                return Err(Invalid("recurrence tap out of range"));
             }
-            lags.push(l as u32);
+            taps.push((lane as u32, lag as u32));
         }
-        let slen = get_uv(b)? as usize;
-        if b.len() < slen {
-            return Err(Invalid("truncated state_prog"));
-        }
-        let (sbytes, rest) = b.split_at(slen);
-        *b = rest;
-        let state_prog = Program::decode(sbytes)?;
-        let (&has_out, rest) = b.split_first().ok_or(Invalid("truncated out_prog flag"))?;
-        *b = rest;
-        let out_prog = match has_out {
-            0 => None,
-            1 => {
-                let olen = get_uv(b)? as usize;
-                if b.len() < olen {
-                    return Err(Invalid("truncated out_prog"));
-                }
-                let (obytes, rest) = b.split_at(olen);
-                *b = rest;
-                Some(Program::decode(obytes)?)
-            }
-            _ => return Err(Invalid("invalid out_prog flag")),
-        };
-        if !b.is_empty() {
-            return Err(Invalid("trailing bytes in recurrence"));
+        let len = get_uv(b)? as usize;
+        if b.len() != len {
+            return Err(Invalid("recurrence program length mismatch"));
         }
         let spec = Self {
-            lags,
-            state_prog,
-            out_prog,
+            n_state: n_state as u32,
+            taps,
+            prog: Program::decode(b)?,
         };
         spec.validate()?;
         Ok(spec)
@@ -157,7 +130,7 @@ impl CompiledRecurrence {
         Ok(Self { spec: spec.clone() })
     }
 
-    /// Generate `out.len()` 32-bit words following `seed` (`seed.len() >= spec.max_lag()`).
+    /// Generate `out.len()` 32-bit outputs following `seed`: `max_lag` steps of `n_state` words.
     pub fn eval_u32(&self, seed: &[u32], cols: &[&[u32]], out: &mut [u32]) {
         if self.spec.min_lag() < 3 {
             return eval_scalar_u32(&self.spec, seed, cols, out);
@@ -165,7 +138,7 @@ impl CompiledRecurrence {
         self.generate::<u32, _>(seed, cols, out, |x| x, |x| x);
     }
 
-    /// Generate `out.len()` 64-bit words following `seed` (`seed.len() >= spec.max_lag()`).
+    /// Generate `out.len()` 64-bit outputs following `seed`: `max_lag` steps of `n_state` words.
     pub fn eval_i64(&self, seed: &[i64], cols: &[&[i64]], out: &mut [i64]) {
         if self.spec.min_lag() < 3 {
             return eval_scalar_i64(&self.spec, seed, cols, out);
@@ -182,38 +155,37 @@ impl CompiledRecurrence {
         from: impl Fn(T) -> I,
     ) {
         let (spec, len) = (&self.spec, out.len());
-        let (lags, max) = (&spec.lags, spec.max_lag());
-        assert!(seed.len() >= max && cols.len() == spec.n_cols());
+        let (ns, max) = (spec.n_state as usize, spec.max_lag());
+        assert!(seed.len() == max * ns && cols.len() == spec.n_cols());
         cols.iter().for_each(|c| assert!(c.len() >= len));
         let step = spec.min_lag().min(CHUNK);
-        let state = CompiledProgram::compile(&spec.state_prog);
-        let map = spec.out_prog.as_ref().map(CompiledProgram::compile);
-        let mut rs = Runner::new(&state, step);
-        let mut ro = map.as_ref().map(|p| Runner::new(p, step));
-        // Every state word: the seed's last `max`, then those made.
-        let mut st: Vec<T> = seed[seed.len() - max..].iter().map(|&x| to(x)).collect();
-        st.reserve(len);
+        let prog = CompiledProgram::compile(&spec.prog);
+        let mut run = Runner::new(&prog, step);
+        // Each lane's words: the seed's `max`, then those made.
+        let mut st: Vec<Vec<T>> = (0..ns)
+            .map(|s| {
+                let mut v = Vec::with_capacity(max + len);
+                v.extend(seed[s..].iter().step_by(ns).map(|&x| to(x)));
+                v
+            })
+            .collect();
+        let taps = &spec.taps;
         let mut j = 0;
         while j < len {
             let (n, i) = (step.min(len - j), max + j);
-            rs.chunk(n, &[], |k, d| match lags.get(k) {
-                Some(&lag) => d.copy_from_slice(&st[i - lag as usize..][..n]),
+            run.chunk(n, &[], |k, d| match taps.get(k) {
+                Some(&(lane, lag)) => d.copy_from_slice(&st[lane as usize][i - lag as usize..][..n]),
                 None => d
                     .iter_mut()
-                    .zip(&cols[k - lags.len()][j..])
+                    .zip(&cols[k - taps.len()][j..])
                     .for_each(|(d, &x)| *d = to(x)),
             });
-            st.extend_from_slice(&rs.sink()[..n]);
-            let made = match &mut ro {
-                Some(ro) => {
-                    ro.chunk(n, &[], |_, d| d.copy_from_slice(&st[i..][..n]));
-                    &ro.sink()[..n]
-                }
-                None => &st[i..][..n],
-            };
+            for (s, lane) in st.iter_mut().enumerate() {
+                lane.extend_from_slice(&run.sink(s)[..n]);
+            }
             out[j..j + n]
                 .iter_mut()
-                .zip(made)
+                .zip(&run.sink(spec.out_sink())[..n])
                 .for_each(|(o, &x)| *o = from(x));
             j += n;
         }
@@ -224,9 +196,9 @@ impl CompiledRecurrence {
 // Scalar Reference / Fallback Evaluators
 // ============================================================================
 
-fn eval_one_u32(p: &Program, v: &mut Vec<u32>) -> u32 {
+fn eval_one_u32(p: &Program, v: &mut Vec<u32>) {
     for ins in &p.ops {
-        let au = v[ins.a as usize];
+        let au = v.get(ins.a as usize).copied().unwrap_or(0);
         let bu = v.get(ins.b as usize).copied().unwrap_or(0);
         let cu = v.get(ins.c as usize).copied().unwrap_or(0);
         let iu = ins.imm as u32;
@@ -246,6 +218,7 @@ fn eval_one_u32(p: &Program, v: &mut Vec<u32>) -> u32 {
                     bu
                 }
             }
+            Op::Const => iu,
             Op::AddI => au.wrapping_add(iu),
             Op::MulI => au.wrapping_mul(iu),
             Op::AndI => au & iu,
@@ -278,12 +251,11 @@ fn eval_one_u32(p: &Program, v: &mut Vec<u32>) -> u32 {
         };
         v.push(r);
     }
-    v[p.sinks[0].0 as usize]
 }
 
-fn eval_one_i64(p: &Program, v: &mut Vec<i64>) -> i64 {
+fn eval_one_i64(p: &Program, v: &mut Vec<i64>) {
     for ins in &p.ops {
-        let a = v[ins.a as usize];
+        let a = v.get(ins.a as usize).copied().unwrap_or(0);
         let b = v.get(ins.b as usize).copied().unwrap_or(0);
         let c = v.get(ins.c as usize).copied().unwrap_or(0);
         let r = match ins.op {
@@ -305,6 +277,7 @@ fn eval_one_i64(p: &Program, v: &mut Vec<i64>) -> i64 {
                     b
                 }
             }
+            Op::Const => ins.imm,
             Op::AddI => a.wrapping_add(ins.imm),
             Op::MulI => a.wrapping_mul(ins.imm),
             Op::AndI => a & ins.imm,
@@ -349,67 +322,47 @@ fn eval_one_i64(p: &Program, v: &mut Vec<i64>) -> i64 {
         };
         v.push(r);
     }
-    v[p.sinks[0].0 as usize]
 }
 
+/// Runs `spec` one step at a time; `eval` appends the program's values to its inputs.
+fn scalar<T: Copy + Default>(
+    spec: &RecurrenceSpec,
+    seed: &[T],
+    cols: &[&[T]],
+    out: &mut [T],
+    eval: impl Fn(&Program, &mut Vec<T>),
+) {
+    let (ns, max) = (spec.n_state as usize, spec.max_lag());
+    assert!(seed.len() == max * ns);
+    let mask = (max + 1).next_power_of_two() - 1;
+    // Steps by position modulo the ring, `n_state` words each.
+    let mut ring = vec![T::default(); (mask + 1) * ns];
+    ring[..seed.len()].copy_from_slice(seed);
+    let sinks: Vec<usize> = spec.prog.sinks.iter().map(|s| s.0 as usize).collect();
+    let out_at = sinks[spec.out_sink()];
+    let mut v = Vec::with_capacity(spec.prog.n_in as usize + spec.prog.ops.len());
+    for (j, dst) in out.iter_mut().enumerate() {
+        let pos = max + j;
+        v.clear();
+        for &(lane, lag) in &spec.taps {
+            v.push(ring[((pos - lag as usize) & mask) * ns + lane as usize]);
+        }
+        v.extend(cols.iter().map(|c| c[j]));
+        eval(&spec.prog, &mut v);
+        let at = (pos & mask) * ns;
+        for (s, &k) in sinks[..ns].iter().enumerate() {
+            ring[at + s] = v[k];
+        }
+        *dst = v[out_at];
+    }
+}
+
+/// Generate `out.len()` 32-bit outputs one step at a time.
 pub fn eval_scalar_u32(spec: &RecurrenceSpec, seed: &[u32], cols: &[&[u32]], out: &mut [u32]) {
-    let max_lag = spec.max_lag();
-    let ring_len = (max_lag + 1).next_power_of_two();
-    let mask = ring_len - 1;
-    let mut ring = vec![0u32; ring_len];
-    for (i, &w) in seed[seed.len() - max_lag..].iter().enumerate() {
-        ring[i] = w;
-    }
-    let mut v = Vec::with_capacity(spec.state_prog.n_in as usize + spec.state_prog.ops.len());
-    let mut ov = Vec::new();
-    for (row, dst) in out.iter_mut().enumerate() {
-        let pos = max_lag + row;
-        v.clear();
-        for &l in &spec.lags {
-            v.push(ring[pos.wrapping_sub(l as usize) & mask]);
-        }
-        for c in cols {
-            v.push(c[row]);
-        }
-        let st = eval_one_u32(&spec.state_prog, &mut v);
-        ring[pos & mask] = st;
-        *dst = if let Some(op) = &spec.out_prog {
-            ov.clear();
-            ov.push(st);
-            eval_one_u32(op, &mut ov)
-        } else {
-            st
-        };
-    }
+    scalar(spec, seed, cols, out, eval_one_u32);
 }
 
+/// Generate `out.len()` 64-bit outputs one step at a time.
 pub fn eval_scalar_i64(spec: &RecurrenceSpec, seed: &[i64], cols: &[&[i64]], out: &mut [i64]) {
-    let max_lag = spec.max_lag();
-    let ring_len = (max_lag + 1).next_power_of_two();
-    let mask = ring_len - 1;
-    let mut ring = vec![0i64; ring_len];
-    for (i, &w) in seed[seed.len() - max_lag..].iter().enumerate() {
-        ring[i] = w;
-    }
-    let mut v = Vec::with_capacity(spec.state_prog.n_in as usize + spec.state_prog.ops.len());
-    let mut ov = Vec::new();
-    for (row, dst) in out.iter_mut().enumerate() {
-        let pos = max_lag + row;
-        v.clear();
-        for &l in &spec.lags {
-            v.push(ring[pos.wrapping_sub(l as usize) & mask]);
-        }
-        for c in cols {
-            v.push(c[row]);
-        }
-        let st = eval_one_i64(&spec.state_prog, &mut v);
-        ring[pos & mask] = st;
-        *dst = if let Some(op) = &spec.out_prog {
-            ov.clear();
-            ov.push(st);
-            eval_one_i64(op, &mut ov)
-        } else {
-            st
-        };
-    }
+    scalar(spec, seed, cols, out, eval_one_i64);
 }

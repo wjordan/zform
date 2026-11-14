@@ -8,8 +8,7 @@ use crate::codecs::{ColSummary, ESCAPES, letters_of};
 use crate::container::BlockRows;
 use crate::grammar::{ModelPlan, PlanVariant, parse_logfmt_line};
 use crate::index::{
-    BlockDir, Filter, KIND_BINARY, KIND_CSV, KIND_ENVELOPE, KIND_JSON, KIND_LOGFMT, KIND_RESIDUAL,
-    KIND_TEMPLATE, needle_tokens,
+    BlockDir, Filter, KIND_JSON, KIND_RESIDUAL, KIND_SHAPE, KIND_SHAPE_CELL, needle_tokens,
 };
 use crate::json_tree::{
     JsonBlockMap, JsonCand, JsonDoc, JsonTreePlan, JsonWalk, PathEvent, PathVal, SlotKind,
@@ -503,33 +502,38 @@ impl NeedlePlan {
         };
         let mut vars = Vec::with_capacity(plan.variants.len());
         let mut unknown_kinds = 0u16;
-        for v in &plan.variants {
+        for (vi, v) in plan.variants.iter().enumerate() {
             let (var, kind) = match v {
-                PlanVariant::Residual { col } => {
-                    use_cols(&mut std::iter::once(*col), true);
-                    (VarNeedle::Scan, 0)
-                }
-                PlanVariant::Template(tv) => {
-                    let mut slots = tv.slots.clone();
+                PlanVariant::Shape(s) => {
+                    let mut slots = s.slots.clone();
                     slots.sort_unstable();
                     slots.dedup();
-                    use_cols(&mut slots.into_iter(), true);
-                    let n = tv.literals.len();
-                    let inner = tv
+                    for c in slots {
+                        // `scan_col` reads a nested column's cells as JSON-tagged, which a
+                        // shape's are not.
+                        let nested = plan.columns[c as usize].nested_plan.is_some();
+                        use_cols(&mut std::iter::once(c), !nested);
+                    }
+                    let n = s.literals.len();
+                    let inner = s
                         .literals
                         .iter()
                         .enumerate()
                         .filter(|(i, l)| !(l.is_empty() && (*i == 0 || *i + 1 == n)));
-                    let var = if tv.literals.iter().any(|l| sure(l)) {
+                    let var = if s.literals.iter().any(|l| sure(l)) {
                         VarNeedle::AllTrue
-                    } else if tv.literals.iter().any(|l| has(l) || !joins(l))
+                    } else if s.literals.iter().any(|l| has(l) || !joins(l))
                         || literals_can_overlap_needle(inner.map(|(_, l)| l.as_slice()), needle)
                     {
                         VarNeedle::Unknown
                     } else {
                         VarNeedle::Scan
                     };
-                    (var, KIND_TEMPLATE)
+                    (var, if vi == 0 { KIND_RESIDUAL } else { KIND_SHAPE })
+                }
+                PlanVariant::ShapeCell { cols, .. } => {
+                    use_cols(&mut cols.iter().copied(), false);
+                    (VarNeedle::Unknown, KIND_SHAPE_CELL)
                 }
                 PlanVariant::JsonTree => {
                     let Some(jt) = &plan.json_tree else {
@@ -600,31 +604,6 @@ impl NeedlePlan {
                         KIND_JSON,
                     )
                 }
-                PlanVariant::Envelope(env) => {
-                    use_cols(&mut env.cols.into_iter(), false);
-                    (VarNeedle::Unknown, KIND_ENVELOPE)
-                }
-                PlanVariant::Logfmt => {
-                    let lf_cols = plan.columns.iter().enumerate().filter(|(_, c)| {
-                        c.name.starts_with("logfmt.") || c.name.starts_with("$logfmt")
-                    });
-                    use_cols(&mut lf_cols.map(|(i, _)| i as u16), false);
-                    if let Some(lf) = &plan.logfmt {
-                        use_cols(&mut [lf.recipe_col, lf.overflow_col].into_iter(), false);
-                    }
-                    (VarNeedle::Unknown, KIND_LOGFMT)
-                }
-                PlanVariant::Csv(cs) => {
-                    use_cols(
-                        &mut cs.field_cols.iter().copied().chain([cs.quote_mask_col]),
-                        false,
-                    );
-                    (VarNeedle::Unknown, KIND_CSV)
-                }
-                PlanVariant::BinaryStride(bs) => {
-                    use_cols(&mut bs.slices.iter().map(|s| s.2), false);
-                    (VarNeedle::Unknown, KIND_BINARY)
-                }
             };
             if var == VarNeedle::Unknown {
                 unknown_kinds |= kind;
@@ -636,8 +615,10 @@ impl NeedlePlan {
         for (vi, v) in plan.variants.iter().enumerate() {
             let shared = |c: u16| users[c as usize] > 1;
             let (bad, kind) = match v {
-                PlanVariant::Residual { col } => (shared(*col), KIND_RESIDUAL),
-                PlanVariant::Template(tv) => (tv.slots.iter().any(|&c| shared(c)), KIND_TEMPLATE),
+                PlanVariant::Shape(s) => (
+                    s.slots.iter().any(|&c| !scan_cols[c as usize]),
+                    if vi == 0 { KIND_RESIDUAL } else { KIND_SHAPE },
+                ),
                 PlanVariant::JsonTree => (
                     plan.json_tree.as_ref().is_some_and(|jt| {
                         jt.paths
@@ -657,7 +638,7 @@ impl NeedlePlan {
         NeedlePlan {
             vars,
             unknown_kinds,
-            open_kinds: unknown_kinds | if all_true { KIND_TEMPLATE } else { 0 },
+            open_kinds: unknown_kinds | if all_true { KIND_SHAPE } else { 0 },
             scan_cols,
             letters: letters_of(needle),
             finder: finder.into_owned(),
@@ -1170,16 +1151,10 @@ fn eval_contains(
         _ => vec![Vec::new(); plan.columns.len()],
     };
     for (r, &v) in rows.variant_ids.iter().enumerate() {
-        match &plan.variants[v as usize] {
-            PlanVariant::Residual { col } if want[*col as usize] => {
-                occ_rows[*col as usize].push(r as u32)
+        if let PlanVariant::Shape(s) = &plan.variants[v as usize] {
+            for &c in s.slots.iter().filter(|&&c| want[c as usize]) {
+                occ_rows[c as usize].push(r as u32);
             }
-            PlanVariant::Template(tv) => {
-                for &c in tv.slots.iter().filter(|&&c| want[c as usize]) {
-                    occ_rows[c as usize].push(r as u32);
-                }
-            }
-            _ => {}
         }
     }
     for (cid, occs) in hits {

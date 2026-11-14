@@ -82,7 +82,7 @@ against it. Columns, queries and decode speed are as without one. The price is f
 instead of per block: whoever reads any block reads the whole dictionary first, in the round
 trip that fetches the block's parts, and holds it expanded. The writer is handed the dictionary.
 `DictionaryBuilder` needs a profile and chooses values within a byte budget in a pass before
-writing. The CLI streams its input and writes no file dictionary.
+writing; it skips numbers, which are coded as such. The CLI builds one for a file of over a block under `--best` or `--dict-bytes`.
 
 **The index region is derived data.** Scanning the data region rebuilds it.
 

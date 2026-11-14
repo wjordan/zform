@@ -2,7 +2,7 @@
 
 use super::engine::CompiledProgram;
 use super::graph::{CoreDecoder, GraphBuilder, GraphNode, PayloadGraph};
-use super::ir::{ALL_OPS, Builder, Ins, Len, Op, Program, TableBuf, Width, eval_reference};
+use super::ir::{ALL_OPS, Builder, Ins, Len, Op, Program, TableBuf, V, Width, eval_reference};
 use super::library::{Harvest, LibEntry, Library, with_code_pricing};
 use super::recur::{CompiledRecurrence, RecurrenceSpec, eval_scalar_u32};
 use crate::packs::{PackRegistry, prog_fmt_int, recur_mt19937};
@@ -146,7 +146,11 @@ fn random_program(rng: &mut u64, width: Width, trial: usize) -> Program {
             }
             break cand;
         };
-        let a = (splitmix64(rng) as u32) % avail;
+        let a = if op.arity() >= 1 {
+            (splitmix64(rng) as u32) % avail
+        } else {
+            0
+        };
         let b = if op.arity() >= 2 {
             (splitmix64(rng) as u32) % avail
         } else {
@@ -315,11 +319,7 @@ fn recurrence_matches_native_generators_across_odd_lengths() {
     let c = nb.input(1);
     let x = nb.rr(Op::Xor, a, nb.ri(Op::ShrI, c, 3));
     let y = nb.ri(Op::AddI, x, 0x9e37_79b9u32 as i64);
-    let nonlin = RecurrenceSpec {
-        lags: vec![5, 19],
-        state_prog: nb.finish(&[(y, 4)]),
-        out_prog: None,
-    };
+    let nonlin = one_lane(&[5, 19], nb.finish(&[(y, 4)]));
     let comp_nl = CompiledRecurrence::compile(&nonlin).unwrap();
     let mut want_nl = vec![0u32; 500];
     let mut got_nl = vec![0u32; 500];
@@ -360,11 +360,7 @@ fn bench_recurrences() {
         1_812_433_253,
     );
     let cur = b.rr(Op::Add, mixed, b.input(1));
-    let spec = RecurrenceSpec {
-        lags: vec![1],
-        state_prog: b.finish(&[(cur, 4)]),
-        out_prog: None,
-    };
+    let spec = one_lane(&[1], b.finish(&[(cur, 4)]));
     let lag1 = CompiledRecurrence::compile(&spec).unwrap();
     let idx: Vec<u32> = (1..=623).collect();
     let mut out = vec![0u32; 623];
@@ -391,11 +387,7 @@ fn bench_recurrences() {
         let b = Builder::new_u32(2);
         let x = b.rr(Op::Add, b.input(0), b.ri(Op::ShlI, b.input(1), 3));
         let x = b.rr(Op::Xor, x, b.ri(Op::ShrI, x, 7));
-        let spec = RecurrenceSpec {
-            lags: vec![k, k + 1],
-            state_prog: b.finish(&[(x, 4)]),
-            out_prog: None,
-        };
+        let spec = one_lane(&[k, k + 1], b.finish(&[(x, 4)]));
         let seed: Vec<u32> = (0..=k).map(|i| i * 2_654_435_761).collect();
         let c = CompiledRecurrence::compile(&spec).unwrap();
         let mut out = vec![0u32; 1 << 16];
@@ -407,19 +399,15 @@ fn bench_recurrences() {
             slow as f64 / 65536.0
         );
     }
-}
-
-/// `p` as a recurrence program: one full-width sink, no scans, gathers or buffers.
-fn as_recurrence_prog(mut p: Program) -> Program {
-    for ins in &mut p.ops {
-        if ins.op.is_scan() || ins.op == Op::Gather {
-            ins.op = Op::XorI;
-        }
+    let mut out = vec![0i64; 1 << 16];
+    for (name, spec, seed) in [
+        ("xoroshiro128+", recur_xoroshiro128p(), vec![1, 2]),
+        ("pcg64", recur_pcg64(), vec![3, 4]),
+    ] {
+        let c = CompiledRecurrence::compile(&spec).unwrap();
+        let ns = best(&mut || c.eval_i64(&seed, &[], &mut out));
+        println!("{name}: {:.2} ns/word", ns as f64 / 65536.0);
     }
-    let full = if p.width == Width::W32 { 4 } else { 8 };
-    p.n_bufs = 0;
-    p.sinks = vec![(p.n_in + p.ops.len() as u32 - 1, Len::Fixed(full))];
-    p
 }
 
 #[test]
@@ -431,31 +419,41 @@ fn random_recurrences_match_the_scalar_evaluator() {
         } else {
             Width::W64
         };
-        let state_prog = as_recurrence_prog(random_program(&mut rng, width, 0));
-        let n_lags = 1 + (splitmix64(&mut rng) % u64::from(state_prog.n_in)) as usize;
-        let lags: Vec<u32> = (0..n_lags)
-            .map(|_| [1, 2, 3, 5, 31, 64, 300][(splitmix64(&mut rng) % 7) as usize])
-            .collect();
-        let mut out_prog = None;
-        if splitmix64(&mut rng) % 2 == 0 {
-            let mut p = random_program(&mut rng, width, 0);
-            p.n_in = 1;
-            p.ops.iter_mut().for_each(|i| (i.a, i.b, i.c) = (0, 0, 0));
-            out_prog = Some(as_recurrence_prog(p));
+        let mut prog = random_program(&mut rng, width, 0);
+        for ins in &mut prog.ops {
+            if ins.op.is_scan() || ins.op == Op::Gather {
+                (ins.op, ins.aux) = (Op::XorI, 0);
+            }
         }
+        prog.n_bufs = 0;
+        let n_state = 1 + (splitmix64(&mut rng) % 3) as u32;
+        let n_taps = 1 + (splitmix64(&mut rng) % u64::from(prog.n_in)) as usize;
+        let taps: Vec<(u32, u32)> = (0..n_taps)
+            .map(|_| {
+                let lane = (splitmix64(&mut rng) % u64::from(n_state)) as u32;
+                (lane, [1, 2, 3, 5, 31, 64, 300][(splitmix64(&mut rng) % 7) as usize])
+            })
+            .collect();
+        let n_vals = u64::from(prog.n_in) + prog.ops.len() as u64;
+        let n_sinks = n_state + (splitmix64(&mut rng) % 2) as u32;
+        let full = Len::Fixed(width.bits() as u8 / 8);
+        prog.sinks = (0..n_sinks)
+            .map(|_| ((splitmix64(&mut rng) % n_vals) as u32, full))
+            .collect();
         let spec = RecurrenceSpec {
-            lags,
-            state_prog,
-            out_prog,
+            n_state,
+            taps,
+            prog,
         };
         let n = [0, 1, 7, 300, 1100][trial % 5];
         let cols: Vec<Vec<i64>> = (0..spec.n_cols())
             .map(|_| (0..n).map(|_| splitmix64(&mut rng) as i64).collect())
             .collect();
-        let seed: Vec<i64> = (0..spec.max_lag())
+        let seed: Vec<i64> = (0..spec.max_lag() * n_state as usize)
             .map(|_| splitmix64(&mut rng) as i64)
             .collect();
         let compiled = CompiledRecurrence::compile(&spec).unwrap();
+        assert_eq!(RecurrenceSpec::decode(&spec.encode()).unwrap(), spec);
         if width == Width::W32 {
             let narrow = |v: &[i64]| v.iter().map(|&x| x as u32).collect::<Vec<_>>();
             let cols: Vec<Vec<u32>> = cols.iter().map(|c| narrow(c)).collect();
@@ -474,25 +472,111 @@ fn random_recurrences_match_the_scalar_evaluator() {
     }
 }
 
+/// One state lane read at `lags`.
+fn one_lane(lags: &[u32], prog: Program) -> RecurrenceSpec {
+    RecurrenceSpec {
+        n_state: 1,
+        taps: lags.iter().map(|&l| (0, l)).collect(),
+        prog,
+    }
+}
+
+/// `x` rotated left by `k`.
+fn rotl(b: &Builder, x: V, k: i64) -> V {
+    b.rr(Op::Or, b.ri(Op::ShlI, x, k), b.ri(Op::ShrI, x, 64 - k))
+}
+
+/// xoroshiro128+: lanes `s0`, `s1`; each output is the sum of the state before the step.
+fn recur_xoroshiro128p() -> RecurrenceSpec {
+    let b = Builder::new(2);
+    let (s0, s1) = (b.input(0), b.input(1));
+    let out = b.rr(Op::Add, s0, s1);
+    let t = b.rr(Op::Xor, s1, s0);
+    let n0 = b.rr(Op::Xor, b.rr(Op::Xor, rotl(&b, s0, 24), t), b.ri(Op::ShlI, t, 16));
+    let n1 = rotl(&b, t, 37);
+    RecurrenceSpec {
+        n_state: 2,
+        taps: vec![(0, 1), (1, 1)],
+        prog: b.finish(&[(n0, 8), (n1, 8), (out, 8)]),
+    }
+}
+
+const PCG_MUL: u128 = 0x2360_ed05_1fc6_5da4_4385_df64_9fcc_f645;
+const PCG_INC: u128 = 0x5851_f42d_4c95_7f2d_1405_7b7e_f767_814f;
+
+/// PCG64 (XSL-RR 128/64): lanes `lo`, `hi` of the 128-bit LCG state; each output is the
+/// rotated xor-fold of the state after the step.
+fn recur_pcg64() -> RecurrenceSpec {
+    let b = Builder::new(2);
+    let (lo, hi) = (b.input(0), b.input(1));
+    let (m_lo, m_hi) = (PCG_MUL as u64 as i64, (PCG_MUL >> 64) as u64 as i64);
+    let (i_lo, i_hi) = (PCG_INC as u64 as i64, (PCG_INC >> 64) as u64 as i64);
+    let p = b.ri(Op::MulI, lo, m_lo);
+    let n_lo = b.ri(Op::AddI, p, i_lo);
+    // Carry out of `p + i_lo`: the top bit of `(p & i) | ((p | i) & !sum)`.
+    let keep = b.rr(Op::And, b.ri(Op::OrI, p, i_lo), b.ri(Op::XorI, n_lo, -1));
+    let carry = b.ri(Op::ShrI, b.rr(Op::Or, b.ri(Op::AndI, p, i_lo), keep), 63);
+    let cross = b.rr(Op::Add, b.ri(Op::MulI, hi, m_lo), b.ri(Op::MulI, lo, m_hi));
+    let n_hi = b.rr(Op::Add, b.rr(Op::Add, cross, b.ri(Op::MulHiI, lo, m_lo)), carry);
+    let n_hi = b.ri(Op::AddI, n_hi, i_hi);
+    let x = b.rr(Op::Xor, n_hi, n_lo);
+    let r = b.ri(Op::ShrI, n_hi, 58);
+    let out = b.rr(
+        Op::Or,
+        b.rr(Op::Shr, x, r),
+        b.rr(Op::Shl, x, b.rr(Op::Sub, b.konst(0), r)),
+    );
+    RecurrenceSpec {
+        n_state: 2,
+        taps: vec![(0, 1), (1, 1)],
+        prog: b.finish(&[(n_lo, 8), (n_hi, 8), (out, 8)]),
+    }
+}
+
+#[test]
+fn multi_lane_recurrences_match_xoroshiro128p_and_pcg64() {
+    let n = 1000;
+    let (mut s0, mut s1) = (0x0123_4567_89ab_cdef_u64, 0xfedc_ba98_7654_3210_u64);
+    let mut want = Vec::with_capacity(n);
+    let seed = [s0 as i64, s1 as i64];
+    for _ in 0..n {
+        want.push(s0.wrapping_add(s1) as i64);
+        s1 ^= s0;
+        s0 = s0.rotate_left(24) ^ s1 ^ (s1 << 16);
+        s1 = s1.rotate_left(37);
+    }
+    let mut got = vec![0i64; n];
+    CompiledRecurrence::compile(&recur_xoroshiro128p())
+        .unwrap()
+        .eval_i64(&seed, &[], &mut got);
+    assert_eq!(got, want, "xoroshiro128+");
+
+    let mut state = 0x9e37_79b9_7f4a_7c15_f39c_c060_5ced_c834_u128;
+    let seed = [state as u64 as i64, (state >> 64) as u64 as i64];
+    let want: Vec<i64> = (0..n)
+        .map(|_| {
+            state = state.wrapping_mul(PCG_MUL).wrapping_add(PCG_INC);
+            let x = (state >> 64) as u64 ^ state as u64;
+            x.rotate_right((state >> 122) as u32) as i64
+        })
+        .collect();
+    CompiledRecurrence::compile(&recur_pcg64())
+        .unwrap()
+        .eval_i64(&seed, &[], &mut got);
+    assert_eq!(got, want, "pcg64");
+}
+
 fn recur_lfg(lag_a: u32, lag_b: u32) -> RecurrenceSpec {
     let b = Builder::new_u32(2);
     let sum = b.rr(Op::Add, b.input(0), b.input(1));
-    RecurrenceSpec {
-        lags: vec![lag_a, lag_b],
-        state_prog: b.finish(&[(sum, 4)]),
-        out_prog: None,
-    }
+    one_lane(&[lag_a, lag_b], b.finish(&[(sum, 4)]))
 }
 
 /// Lag-1 running sum `s[i] = s[i - 1] + col[i]` in `W64`.
 fn recur_running_sum() -> RecurrenceSpec {
     let b = Builder::new(2);
     let sum = b.rr(Op::Add, b.input(0), b.input(1));
-    RecurrenceSpec {
-        lags: vec![1],
-        state_prog: b.finish(&[(sum, 8)]),
-        out_prog: None,
-    }
+    one_lane(&[1], b.finish(&[(sum, 8)]))
 }
 
 /// Native generators the recurrence engine must reproduce.
@@ -856,16 +940,16 @@ fn constants_of_combined_operations_take_overrides_alone_or_together() {
     let m = 0x00ff_00ff_00ff_00ff_i64;
     // Each program with its count of constants.
     let cases: Vec<(Program, usize)> = vec![
-        // A constant lane, then one derived from it: only the last instruction's stands alone.
+        // A constant lane, then one derived from it.
         {
             let b = Builder::new(1);
-            let k = b.ri(Op::AddI, b.konst(b.input(0), 5), 7);
+            let k = b.ri(Op::AddI, b.konst(5), 7);
             (
                 {
                     let out = b.rr(Op::Add, b.input(0), k);
                     b.finish(&[(out, 8)])
                 },
-                3,
+                2,
             )
         },
         // Multiply-add: the addend, not the multiplier.
@@ -1009,6 +1093,18 @@ fn sparse_integer_transport_preserves_wide_exceptions_and_validates_framing() {
     let mut bytes = Vec::new();
     stream.encode(&mut bytes);
     let budget = DecodeBudget::default();
+    // A tail that has its own tail is refused.
+    let IntStream::ZigZagBytes { len, head_leaf, .. } = stream.clone() else {
+        unreachable!()
+    };
+    let nested = IntStream::ZigZagBytes {
+        len,
+        head_leaf,
+        tail: Box::new(stream.clone()),
+    };
+    let mut wire = Vec::new();
+    nested.encode(&mut wire);
+    assert!(IntStream::decode_wire(&mut Cursor::new(&wire), &budget, 0).is_err());
     let decoded = IntStream::decode_wire(&mut Cursor::new(&bytes), &budget, 0).unwrap();
     assert_eq!(decoded.unpack(&budget).unwrap(), values);
     for n in 0..bytes.len() {
@@ -1163,4 +1259,167 @@ fn rice_integer_transport_validates_counts_framing_and_allocation_budget() {
             .and_then(|s| s.unpack(&tight))
             .is_err()
     );
+}
+
+#[test]
+fn templates_escape_literal_separators_and_pass_slot_bytes_through() {
+    let a: Vec<&[u8]> = vec![b"x\x1fy", b"", b"\x1f\x00\xff"];
+    let b: Vec<&[u8]> = vec![b"1", b"\x1f\x02", b""];
+    let mut gb = GraphBuilder::new(3);
+    let (sa, sb) = (gb.add_dict_cells(&a), gb.add_dict_cells(&b));
+    let root = gb.add_template(&[b"\x1f<", b"\x1f", b">\x1f"], vec![sa, sb], 3);
+    let cells =
+        CoreDecoder::decode_bytes(&gb.finish(root).encode(), &DecodeBudget::default()).unwrap();
+    for r in 0..3 {
+        let want = [b"\x1f<", a[r], b"\x1f", b[r], b">\x1f"].concat();
+        assert_eq!(cells.get(r).unwrap(), want.as_slice());
+    }
+}
+
+#[test]
+fn dictionary_columns_decode_to_lazy_dictionary_views() {
+    use super::graph::ExtInputs;
+    use crate::cells::Col;
+    let rows: Vec<&[u8]> = (0..200).map(|i| [&b"GET"[..], b"PUT", b"DELETE"][i % 3]).collect();
+    for quoted in [false, true] {
+        let mut gb = GraphBuilder::new(rows.len());
+        let mut root = gb.add_dict_cells(&rows);
+        if quoted {
+            root = gb.add_quote_or_null(root, None);
+        }
+        let graph = PayloadGraph::decode(&gb.finish(root).encode(), &DecodeBudget::default()).unwrap();
+        let col = CoreDecoder::decode_col(&graph, &ExtInputs::empty(), &DecodeBudget::default()).unwrap();
+        let dict_col = match &col {
+            Col::Quoted { inner, .. } if quoted => inner.as_ref(),
+            other => other,
+        };
+        let Col::Dict { dict, ords } = dict_col else {
+            panic!("not a dictionary view: quoted={quoted}");
+        };
+        assert_eq!((dict.len(), ords.len()), (3, rows.len()));
+        for (r, &want) in rows.iter().enumerate() {
+            assert_eq!(dict.get(ords[r] as usize).unwrap(), want);
+        }
+    }
+}
+
+#[test]
+fn templates_from_columns_and_shared_constants_match_per_row_expansion() {
+    let rows: Vec<&[u8]> = vec![b"a\x1f\x00b", b"\x1f\x02-\x1f\x00", b"plain"];
+    let mut gb = GraphBuilder::new(3);
+    let per_row = gb.add_dict_cells(&rows);
+    let shared = gb.add_const_cells(b"k", 3);
+    let quoted = gb.add_dict_cells(&[b"\"x\"", b"\"yy\"", b"z"]);
+    let inner = gb.add_template_cells(per_row, vec![shared, quoted]);
+    // `shared` is both a slot above and the template here, so it is materialized.
+    let root = gb.add_template_cells(shared, vec![inner]);
+    let cells =
+        CoreDecoder::decode_bytes(&gb.finish(root).encode(), &DecodeBudget::default()).unwrap();
+    let want: [&[u8]; 3] = [b"k", b"k", b"k"];
+    for (r, w) in want.iter().enumerate() {
+        assert_eq!(cells.get(r).unwrap(), *w);
+    }
+    let mut gb = GraphBuilder::new(3);
+    let per_row = gb.add_dict_cells(&rows);
+    let shared = gb.add_const_cells(b"k", 3);
+    let quoted = gb.add_dict_cells(&[b"\"x\"", b"\"yy\"", b"z"]);
+    let root = gb.add_template_cells(per_row, vec![shared, quoted]);
+    let cells =
+        CoreDecoder::decode_bytes(&gb.finish(root).encode(), &DecodeBudget::default()).unwrap();
+    let want: [&[u8]; 3] = [b"akb", b"\"yy\"-k", b"plain"];
+    for (r, w) in want.iter().enumerate() {
+        assert_eq!(cells.get(r).unwrap(), *w);
+    }
+}
+
+#[test]
+fn fixed_cells_keep_each_lanes_low_bytes() {
+    let lanes: Vec<i64> = vec![0, -1, 0x0102_0304_0506_0708, i64::MIN, 77];
+    let mut planes = vec![0u8; lanes.len() * 8];
+    for (i, v) in lanes.iter().enumerate() {
+        for (k, b) in v.to_le_bytes().into_iter().enumerate() {
+            planes[k * lanes.len() + i] = b;
+        }
+    }
+    for w in 1..=8u8 {
+        let mut gb = GraphBuilder::new(lanes.len());
+        let ints = if w == 8 { gb.add_planes(&planes, 8) } else { gb.add_ints(&lanes) };
+        let root = gb.add_fixed_cells(ints, w);
+        let cells =
+            CoreDecoder::decode_bytes(&gb.finish(root).encode(), &DecodeBudget::default()).unwrap();
+        for (r, v) in lanes.iter().enumerate() {
+            assert_eq!(cells.get(r).unwrap(), &v.to_le_bytes()[..w as usize], "w={w} r={r}");
+        }
+    }
+}
+
+/// `IndexCells(values, MatchIndex(needles, hay, codes))` over five rows keyed `0 1 0 2 1`.
+fn match_graph(needles: &[i64], codes: &[i64]) -> PayloadGraph {
+    let mut gb = GraphBuilder::new(needles.len());
+    let values = gb.add_dict_cells(&[b"v0", b"v1", b"v2", b"v3", b"v4"]);
+    let n = gb.add_ints(needles);
+    let hay = gb.add_ints(&[0, 1, 0, 2, 1]);
+    let c = gb.add_ints(codes);
+    let idx = gb.add_match_index(n, hay, c);
+    let root = gb.add_index_cells(values, idx);
+    gb.finish(root)
+}
+
+#[test]
+fn match_index_joins_by_key_rank_and_rejects_bad_codes() {
+    let budget = DecodeBudget::default();
+    let decode = |g: &PayloadGraph| {
+        let g = PayloadGraph::decode(&g.encode(), &budget)?;
+        CoreDecoder::decode_bytes(&g.encode(), &budget)
+    };
+    // Second key-0 row, first key-1 row, a miss, second key-1 row.
+    let got = decode(&match_graph(&[0, 1, 7, 1], &[2, 1, 0, 2])).unwrap();
+    assert_eq!(got.iter().collect::<Vec<_>>(), [b"v2", b"v1", b"v0", b"v4"]);
+    assert!(decode(&match_graph(&[0], &[3])).is_err(), "rank past the key's rows");
+    assert!(decode(&match_graph(&[0], &[-1])).is_err(), "negative code");
+    assert!(decode(&match_graph(&[5], &[1])).is_err(), "key not in hay");
+    assert!(decode(&match_graph(&[-1], &[1])).is_err(), "negative key");
+    assert!(decode(&match_graph(&[0, 1], &[1])).is_err(), "code count");
+    let mut gb = GraphBuilder::new(1);
+    let values = gb.add_dict_cells(&[b"v0"]);
+    let n = gb.add_ints(&[0]);
+    let hay = gb.add_ints(&[-3]);
+    let c = gb.add_ints(&[1]);
+    let idx = gb.add_match_index(n, hay, c);
+    let root = gb.add_index_cells(values, idx);
+    assert!(decode(&gb.finish(root)).is_err(), "negative hay key");
+}
+
+#[test]
+fn ext_align_requires_declared_peers_and_supplied_alignment() {
+    let budget = DecodeBudget::default();
+    let mut gb = GraphBuilder::new(2);
+    let keys = gb.add_ext_peer(4);
+    let at = gb.add_ext_align(4, None);
+    let root = gb.add_index_cells(keys, at);
+    let g = gb.finish(root);
+    let wire = g.encode();
+    assert_eq!(PayloadGraph::decode(&wire, &budget).unwrap(), g);
+    let peers = [Arc::new(crate::cells::Cells::from_lens(b"k0k1".to_vec(), &[2, 2]).unwrap())];
+    let aligned = [vec![1i64, 1]];
+    let ext = super::graph::ExtInputs {
+        peers: &peers,
+        aligned: &aligned,
+        ..Default::default()
+    };
+    let got = CoreDecoder::decode_cells(&g, &ext, &budget).unwrap();
+    assert_eq!(got.iter().collect::<Vec<_>>(), [b"k1", b"k1"]);
+    let no_align = super::graph::ExtInputs {
+        peers: &peers,
+        ..Default::default()
+    };
+    assert!(CoreDecoder::decode_cells(&g, &no_align, &budget).is_err());
+    // `ExtAlign` naming key slot 1 of a one-peer list, then `at` past the list.
+    for (key, at) in [(1u8, 0u8), (0, 2)] {
+        let mut bad = wire.clone();
+        let pos = (0..bad.len()).rev().find(|&i| bad[i] == 22).unwrap();
+        bad[pos + 1] = key;
+        bad[pos + 2] = at;
+        assert!(PayloadGraph::decode(&bad, &budget).is_err(), "key={key} at={at}");
+    }
 }

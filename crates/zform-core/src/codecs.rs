@@ -7,12 +7,13 @@
 use std::sync::Arc;
 
 use crate::cells::{Cells, Col};
+use crate::grammar::{ModelPlan, PlanVariant};
 use crate::lex::{parse_exact_int, parse_timestamp};
 pub use crate::packs::EncodedDenseBlock;
 use crate::packs::PackRegistry;
 pub(crate) use crate::packs::{Seeds, with_seeds};
 use crate::payload::graph::{
-    CoreDecoder, EXT_FLAG_DICT, EXT_FLAG_PEERS, EXT_FLAG_POOL, ExtInputs, IntStream,
+    CoreDecoder, EXT_FLAG_DICT, EXT_FLAG_PEERS, EXT_FLAG_POOL, ExtInputs, GraphNode, IntStream,
     NESTED_COLUMN_TAG, PayloadGraph, unpack_leaf, with_encode_opts,
 };
 use crate::payload::library::Library;
@@ -205,6 +206,7 @@ pub fn encode_dense_block_columns(
     horiz_cands: &[Vec<usize>],
     preencoded_nested: &mut [Option<(ColSummary, Vec<u8>)>],
     standalone: &[bool],
+    layout: Option<(&ModelPlan, &[u32])>,
     packs: &PackRegistry,
     backend: EntropyBackend,
     level: i32,
@@ -215,6 +217,7 @@ pub fn encode_dense_block_columns(
         horiz_cands,
         preencoded_nested,
         standalone,
+        layout,
         backend,
         level,
     )
@@ -231,6 +234,94 @@ pub struct BlockDecodeCtx<'a> {
     cells_cache: Vec<Option<Arc<Cells>>>,
     /// The model's library, which the block's code references name.
     library: Arc<Library>,
+    /// The model and each record's variant, which place the cells `ExtAlign` pairs up.
+    layout: Option<(&'a ModelPlan, Arc<[u32]>)>,
+    /// By column: each cell's value id, the rank of its first occurrence among distinct values.
+    key_ids: Vec<Option<Arc<Vec<u32>>>>,
+}
+
+/// For each cell of column `at`, the index of the first cell of column `key` in the same record.
+/// Only shape variants place cells by the variant alone, so any other variant is an error, as is
+/// a record holding an `at` cell and no `key` cell.
+pub fn align_cells(plan: &ModelPlan, variant_ids: &[u32], key: usize, at: usize) -> Result<Vec<i64>> {
+    // Per variant, key and `at` cells per record; `u32::MAX` marks a variant that is no shape.
+    let counts: Vec<(u32, u32)> = plan
+        .variants
+        .iter()
+        .map(|v| match v {
+            PlanVariant::Shape(s) => {
+                let n = |c: usize| s.slots.iter().filter(|&&x| x as usize == c).count() as u32;
+                (n(key), n(at))
+            }
+            _ => (u32::MAX, 0),
+        })
+        .collect();
+    let mut out = Vec::new();
+    let mut k = 0i64;
+    for &v in variant_ids {
+        let &(nk, na) = counts
+            .get(v as usize)
+            .ok_or_else(|| Error::Format("variant id out of range".into()))?;
+        if na > 0 || nk == u32::MAX {
+            if nk == 0 || nk == u32::MAX {
+                return Err(Error::Format("ExtAlign record has no placed key cell".into()));
+            }
+            for _ in 0..na {
+                out.push(k);
+            }
+        }
+        k += i64::from(nk);
+    }
+    Ok(out)
+}
+
+/// Each cell's value id: the rank of its value's first occurrence. Open addressing on a
+/// multiply-fold hash; a hash match is confirmed on the bytes.
+fn value_ids(cells: &Cells) -> Vec<u32> {
+    const K: u64 = 0x9e37_79b9_7f4a_7c15;
+    let word = |c: &[u8], at: usize| u64::from_le_bytes(c[at..at + 8].try_into().unwrap());
+    // Whole words, then the last eight bytes again when they overlap; short cells byte by byte.
+    let hash = |c: &[u8]| {
+        let mut h = c.len() as u64;
+        if c.len() >= 8 {
+            for at in (0..c.len() - 7).step_by(8) {
+                h = (h ^ word(c, at)).wrapping_mul(K).rotate_left(29);
+            }
+            h ^= word(c, c.len() - 8);
+        } else {
+            for &b in c {
+                h = (h << 8) | u64::from(b);
+            }
+        }
+        (h ^ (h >> 29)).wrapping_mul(K) >> 32
+    };
+    let (bytes, ends) = (cells.bytes(), cells.ends());
+    let mask = (ends.len() * 2).next_power_of_two().max(16) - 1;
+    // (hash, first cell's start and end, id); an empty slot has `end == 0` and `start == 1`.
+    let mut slots = vec![(0u64, 1u32, 0u32, 0u32); mask + 1];
+    let mut out = Vec::with_capacity(ends.len());
+    let (mut next, mut start) = (0u32, 0u32);
+    for &end in ends {
+        let c = &bytes[start as usize..end as usize];
+        let h = hash(c);
+        let mut p = h as usize & mask;
+        loop {
+            let (sh, s0, s1, id) = slots[p];
+            if s0 > s1 {
+                slots[p] = (h, start, end, next);
+                out.push(next);
+                next += 1;
+                break;
+            }
+            if sh == h && &bytes[s0 as usize..s1 as usize] == c {
+                out.push(id);
+                break;
+            }
+            p = (p + 1) & mask;
+        }
+        start = end;
+    }
+    out
 }
 
 impl<'a> BlockDecodeCtx<'a> {
@@ -251,7 +342,14 @@ impl<'a> BlockDecodeCtx<'a> {
             cache: (0..n_cols).map(|_| None).collect(),
             cells_cache: (0..n_cols).map(|_| None).collect(),
             library,
+            layout: None,
+            key_ids: (0..n_cols).map(|_| None).collect(),
         }
+    }
+
+    pub fn with_layout(mut self, plan: &'a ModelPlan, variant_ids: Arc<[u32]>) -> Self {
+        self.layout = Some((plan, variant_ids));
+        self
     }
 
     fn ensure_pool(&mut self, budget: &DecodeBudget) -> Result<&Arc<Vec<u8>>> {
@@ -310,8 +408,15 @@ fn ensure_col_inner(
         return Err(Error::BudgetExceeded("dense column occurrence count"));
     }
 
+    // Peers only `ExtAlign` reads stay unmaterialized; their slot holds no cells.
+    let mut as_cells = vec![false; graph.ext_peers.len()];
+    for n in &graph.nodes {
+        if let GraphNode::ExtPeer { slot } = *n {
+            as_cells[slot as usize] = true;
+        }
+    }
     let mut peers = Vec::with_capacity(graph.ext_peers.len());
-    for &peer_id in &graph.ext_peers {
+    for (&peer_id, &as_cells) in graph.ext_peers.iter().zip(&as_cells) {
         let pid = peer_id as usize;
         if pid >= col_idx {
             return Err(Error::Format(
@@ -319,6 +424,10 @@ fn ensure_col_inner(
             ));
         }
         ensure_col_inner(pid, ctx, budget, depth + 1)?;
+        if !as_cells {
+            peers.push(Arc::default());
+            continue;
+        }
         if ctx.cells_cache[pid].is_none() {
             let cells = ctx.cache[pid].as_ref().unwrap().to_cells()?;
             ctx.cells_cache[pid] = Some(Arc::new(cells));
@@ -337,10 +446,39 @@ fn ensure_col_inner(
         None
     };
 
+    let mut aligned = Vec::new();
+    for node in &graph.nodes {
+        if let GraphNode::ExtAlign { key, at } = *node {
+            let col = |s: u16| graph.ext_peers[s as usize] as usize;
+            let (key, at) = (col(key), if at == 0 { col_idx } else { col(at - 1) });
+            if ctx.key_ids[key].is_none() {
+                let ids = match ctx.cache[key].as_ref().unwrap() {
+                    Col::Dict { dict, ords } => {
+                        let d = value_ids(dict);
+                        ords.iter().map(|&o| d[o as usize]).collect()
+                    }
+                    Col::Flat(c) => value_ids(c),
+                    other => value_ids(&other.to_cells()?),
+                };
+                ctx.key_ids[key] = Some(Arc::new(ids));
+            }
+            let ids = Arc::clone(ctx.key_ids[key].as_ref().unwrap());
+            let (plan, vids) = ctx.layout.as_ref().ok_or(Error::NotLoaded)?;
+            let mut idx = align_cells(plan, vids, key, at)?;
+            for i in &mut idx {
+                *i = i64::from(
+                    *ids.get(*i as usize)
+                        .ok_or_else(|| Error::Format("ExtAlign key cell underflow".into()))?,
+                );
+            }
+            aligned.push(idx);
+        }
+    }
     let ext = ExtInputs {
         pool: pool_arc.as_ref(),
         dict: dict_arc.as_ref().map(|(d, a)| (*d, a)),
         peers: &peers,
+        aligned: &aligned,
     };
     let col = CoreDecoder::decode_col(&graph, &ext, budget)?;
     ctx.cache[col_idx] = Some(col);
@@ -402,7 +540,6 @@ mod tests {
                     deltas.push(w[1] - w[0]);
                 }
                 let mut gb = GraphBuilder::new(rows.len());
-                let pfx = gb.add_const_cells(b"ORD-2026-", rows.len());
                 let b = Builder::new(1);
                 let d = b.input(0);
                 let v = b.scan_add(d, nums[0]);
@@ -410,7 +547,7 @@ mod tests {
                 let (_, asc) = crate::packs::eight_digits_raw_and_ascii(&b, scaled);
                 let dn = gb.add_ints(&deltas);
                 let seq_cells = gb.add_prog_cells(b.finish(&[(asc, 6)]), vec![dn], vec![]);
-                let cat = gb.add_concat(vec![pfx, seq_cells]);
+                let cat = gb.add_template(&[b"ORD-2026-", b""], vec![seq_cells], rows.len());
                 Some(gb.finish(cat))
             }
         }
@@ -568,5 +705,100 @@ mod tests {
         }
         let size = pack(&recs);
         assert!(size < 4000, "walk mt size={size}");
+    }
+
+    /// Columns `src`, `key`, `dst` over `recv <key> from <src>` and `got <key> at <dst>`
+    /// records: every key gets one `recv` row, then two `got` rows that mostly repeat its `src`.
+    fn keyed_block() -> (ModelPlan, Vec<u32>, Vec<Vec<Vec<u8>>>) {
+        use crate::grammar::{FrontEnd, Shape};
+        let mut plan = ModelPlan::residual_only();
+        for name in ["src", "key", "dst"] {
+            plan.add_or_get_col(name);
+        }
+        let shape = |lits: &[&[u8]], slots: &[u16]| {
+            PlanVariant::Shape(Shape {
+                literals: lits.iter().map(|l| l.to_vec()).collect(),
+                slots: slots.to_vec(),
+            })
+        };
+        plan.push_variant(shape(&[b"recv ", b" from ", b""], &[2, 1]), FrontEnd::None);
+        plan.push_variant(shape(&[b"got ", b" at ", b""], &[2, 3]), FrontEnd::None);
+        let mut cols = vec![Vec::new(); 4];
+        let mut vids = Vec::new();
+        let mut x = 7u64;
+        let mut ip = || {
+            x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            format!("10.0.{}.{}", (x >> 40) % 8, (x >> 50) % 200).into_bytes()
+        };
+        let mut pending: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for i in 0..1500u32 {
+            let key = format!("blk_{}", i.wrapping_mul(2_654_435_761)).into_bytes();
+            let src = ip();
+            vids.push(1);
+            cols[2].push(key.clone());
+            cols[1].push(src.clone());
+            pending.push((key, src));
+            if pending.len() > 4 {
+                let (key, src) = pending.remove(0);
+                for j in 0..2 {
+                    vids.push(2);
+                    cols[2].push(key.clone());
+                    cols[3].push(if (i + j) % 13 == 0 { ip() } else { src.clone() });
+                }
+            }
+        }
+        (plan, vids, cols)
+    }
+
+    #[test]
+    fn keyed_lookup_round_trips_through_block_layer() {
+        let (plan, vids, cols) = keyed_block();
+        let occ: Vec<Vec<&[u8]>> = cols.iter().map(|c| c.iter().map(|v| &v[..]).collect()).collect();
+        let n = occ.len();
+        let enc = PackRegistry::default().encode_dense_block(
+            &occ,
+            &vec![""; n],
+            &vec![Vec::new(); n],
+            &mut vec![None; n],
+            &vec![false; n],
+            Some((&plan, &vids)),
+            EntropyBackend::Zstd,
+            3,
+        );
+        let budget = DecodeBudget::default();
+        let g = PayloadGraph::decode(&enc.col_blobs[3], &budget).unwrap();
+        assert!(g.nodes.iter().any(|n| matches!(n, GraphNode::MatchIndex { .. })));
+        let blobs = enc.col_blobs.iter().map(|b| Some(&b[..])).collect();
+        let dicts = enc.shared_dict_blobs.iter().map(|b| Some(&b[..])).collect();
+        let mut ctx = BlockDecodeCtx::new(blobs, dicts, None, Arc::default())
+            .with_layout(&plan, vids.clone().into());
+        let got = ensure_dense_block_column(3, &mut ctx, &budget).unwrap().to_cells().unwrap();
+        assert!(got.iter().eq(occ[3].iter().copied()));
+        // Without the layout the column cannot be aligned.
+        let blobs = enc.col_blobs.iter().map(|b| Some(&b[..])).collect();
+        let mut bare = BlockDecodeCtx::new(blobs, vec![], None, Arc::default());
+        assert!(ensure_dense_block_column(3, &mut bare, &budget).is_err());
+    }
+
+    #[test]
+    fn align_cells_pairs_records_and_rejects_unplaced_keys() {
+        let (mut plan, vids, cols) = keyed_block();
+        // Each `got` record's own key cell, in record order.
+        let mut want = Vec::new();
+        let mut k = 0i64;
+        for &v in &vids {
+            if v == 2 {
+                want.push(k);
+            }
+            k += 1;
+        }
+        assert_eq!(align_cells(&plan, &vids, 2, 3).unwrap(), want);
+        assert_eq!(want.len(), cols[3].len());
+        // Records of the second layout hold `dst` but no `src`.
+        assert!(align_cells(&plan, &vids, 1, 3).is_err());
+        // Only shapes place cells.
+        plan.push_variant(PlanVariant::JsonTree, crate::grammar::FrontEnd::None);
+        assert!(align_cells(&plan, &[1, 3], 2, 1).is_err());
+        assert!(align_cells(&plan, &[1, 9], 2, 1).is_err());
     }
 }

@@ -176,7 +176,7 @@ impl Col {
     }
 
     /// The cell's bytes when they exist as one stored slice.
-    #[inline]
+    #[inline(always)]
     fn slice(&self, i: usize) -> Option<Result<&[u8]>> {
         Some(match self {
             Col::Flat(c) => c.get(i).ok_or_else(underflow),
@@ -251,6 +251,9 @@ impl Col {
 
     /// Every cell written out.
     pub fn to_cells(&self) -> Result<Cells> {
+        if let Col::Flat(c) = self {
+            return Ok(c.clone());
+        }
         let n = self.len();
         let mut out = Cells::with_capacity(n, n * 8);
         for i in 0..n {

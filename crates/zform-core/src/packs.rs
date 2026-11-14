@@ -6,11 +6,12 @@
 //! [`CoreDecoder`](crate::payload::graph::CoreDecoder) executes without knowing anything about
 //! the pack that produced it.
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::fmt;
 use std::sync::Arc;
 
-use crate::codecs::{ColSummary, int_bounds, time_bounds};
+use crate::codecs::{ColSummary, align_cells, int_bounds, time_bounds};
+use crate::grammar::{ModelPlan, PlanVariant};
 use crate::payload::graph::{
     FastMap, FastSet, GraphBuilder, GraphNode, IntStream, PayloadGraph, fast_map_with_capacity,
     mtf_split, pack_leaf, with_encode_opts,
@@ -326,14 +327,20 @@ impl PackRegistry {
         let mut won_by_pack = false;
 
         // Ultra-low-cardinality categorical columns (`<= 8` unique values across `>= 64` rows,
-        // already <1 byte/row via `DictCells`) cannot be meaningfully beaten by structural packs
+        // already <1 byte/row as a dictionary) cannot be meaningfully beaten by structural packs
         // unless cells are fixed-width binary (`<= 16` bytes) where an MT walk might apply.
         let is_tiny_dict = n >= 64
             && !is_raw_fallback
             && best_len <= n + 48
             && matches!(
                 &best_graph.nodes[best_graph.root as usize],
-                GraphNode::DictCells { dict_ends, .. } if dict_ends.len() <= 8
+                GraphNode::IndexCells { source, .. } if matches!(
+                    &best_graph.nodes[*source as usize],
+                    GraphNode::SliceBuf { lens, .. } if matches!(
+                        &best_graph.nodes[*lens as usize],
+                        GraphNode::IntStream(s) if s.len() <= 8
+                    )
+                )
             );
         let profile = ColumnProfile::sample(rows);
         if is_tiny_dict && !(profile.min_len == profile.max_len && profile.min_len <= 16) {
@@ -758,40 +765,35 @@ pub fn recur_mt19937(with_temper: bool) -> RecurrenceSpec {
     );
     let mag = b.ri(Op::MulI, b.ri(Op::AndI, y, 1), 0x9908_b0dfu32 as i32 as i64);
     let st = b.rr(Op::Xor, b.rr(Op::Xor, far, b.ri(Op::ShrI, y, 1)), mag);
-    let state_prog = b.finish(&[(st, 4)]);
-
-    let out_prog = if with_temper {
-        let tb = Builder::new_u32(1);
-        let s0 = tb.input(0);
-        let s1 = tb.rr(Op::Xor, s0, tb.ri(Op::ShrI, s0, 11));
-        let s2 = tb.rr(
+    let prog = if with_temper {
+        let s1 = b.rr(Op::Xor, st, b.ri(Op::ShrI, st, 11));
+        let s2 = b.rr(
             Op::Xor,
             s1,
-            tb.ri(
+            b.ri(
                 Op::AndI,
-                tb.ri(Op::ShlI, s1, 7),
+                b.ri(Op::ShlI, s1, 7),
                 0x9d2c_5680u32 as i32 as i64,
             ),
         );
-        let s3 = tb.rr(
+        let s3 = b.rr(
             Op::Xor,
             s2,
-            tb.ri(
+            b.ri(
                 Op::AndI,
-                tb.ri(Op::ShlI, s2, 15),
+                b.ri(Op::ShlI, s2, 15),
                 0xefc6_0000u32 as i32 as i64,
             ),
         );
-        let s4 = tb.rr(Op::Xor, s3, tb.ri(Op::ShrI, s3, 18));
-        Some(tb.finish(&[(s4, 4)]))
+        let s4 = b.rr(Op::Xor, s3, b.ri(Op::ShrI, s3, 18));
+        b.finish(&[(st, 4), (s4, 4)])
     } else {
-        None
+        b.finish(&[(st, 4)])
     };
-
     RecurrenceSpec {
-        lags: vec![624, 623, 227],
-        state_prog,
-        out_prog,
+        n_state: 1,
+        taps: vec![(0, 624), (0, 623), (0, 227)],
+        prog,
     }
 }
 
@@ -827,9 +829,9 @@ fn emit_seeded_mt_words_node(
         );
         let cur = b.rr(Op::Add, mixed, idx);
         RecurrenceSpec {
-            lags: vec![1],
-            state_prog: b.finish(&[(cur, 4)]),
-            out_prog: None,
+            n_state: 1,
+            taps: vec![(0, 1)],
+            prog: b.finish(&[(cur, 4)]),
         }
     };
     let iota_a = add_iota(gb, 1, 623);
@@ -847,9 +849,9 @@ fn emit_seeded_mt_words_node(
         );
         let cur = b.ri(Op::AddI, b.rr(Op::Xor, ai, mixed), seed as i32 as i64);
         RecurrenceSpec {
-            lags: vec![1],
-            state_prog: b.finish(&[(cur, 4)]),
-            out_prog: None,
+            n_state: 1,
+            taps: vec![(0, 1)],
+            prog: b.finish(&[(cur, 4)]),
         }
     };
     let col_a = gb.add_byte_chunks(node_a, 4);
@@ -868,9 +870,9 @@ fn emit_seeded_mt_words_node(
         );
         let cur = b.rr(Op::Sub, b.rr(Op::Xor, bi, mixed), idx);
         RecurrenceSpec {
-            lags: vec![1],
-            state_prog: b.finish(&[(cur, 4)]),
-            out_prog: None,
+            n_state: 1,
+            taps: vec![(0, 1)],
+            prog: b.finish(&[(cur, 4)]),
         }
     };
     let b_tail = gb.add_slice_buf(node_b, 4, &[622 * 4]);
@@ -882,9 +884,8 @@ fn emit_seeded_mt_words_node(
     let mut head8 = [0u8; 8];
     head8[..4].copy_from_slice(&0x8000_0000u32.to_le_bytes());
     head8[4..].copy_from_slice(&c_new_1.to_le_bytes());
-    let head_cell = gb.add_const_cells(&head8, 1);
     let tail_cell = gb.add_slice_buf(node_c, 0, &[622 * 4]);
-    let state_node = gb.add_concat(vec![head_cell, tail_cell]);
+    let state_node = gb.add_template(&[&head8, b""], vec![tail_cell], 1);
 
     // Twist forward `n_words` tempered outputs!
     gb.add_recur_node(recur_mt19937(true), state_node, vec![], n_words, false)
@@ -1194,7 +1195,7 @@ pub(crate) fn try_build_mt_cells(
             let fallback_step = if any_override {
                 b.input(2)
             } else {
-                b.konst(pos, NEG_ZERO)
+                b.konst(NEG_ZERO)
             };
             let step = b.select(fl, mt_step, fallback_step);
             let out = b.scan_f64_add(step, init_f64);
@@ -1294,7 +1295,7 @@ pub fn prog_fmt_int(is_deltas: bool, seed: i64) -> Program {
 
     let sign_mask = b.ri(Op::SarI, val, 63);
     let sign_len = b.ri(Op::ShrI, val, 63);
-    let sign_ch = b.ri(Op::OrI, b.ri(Op::AndI, inp, 0), b'-' as i64);
+    let sign_ch = b.konst(b'-' as i64);
     let abs = b.rr(Op::Sub, b.rr(Op::Xor, val, sign_mask), sign_mask);
 
     let inv_1e8 = 12_379_400_392_853_802_749u64 as i64;
@@ -1312,9 +1313,9 @@ pub fn prog_fmt_int(is_deltas: bool, seed: i64) -> Program {
     let z_mid = b.ri(Op::ShrI, b.r(Op::Ctz, raw_mid), 3);
     let z_lo = b.ri(Op::ShrI, b.r(Op::Ctz, raw_lo), 3);
 
-    let eight = b.ri(Op::AddI, b.ri(Op::AndI, inp, 0), 8);
-    let one = b.ri(Op::AddI, b.ri(Op::AndI, inp, 0), 1);
-    let zero = b.ri(Op::AndI, inp, 0);
+    let eight = b.konst(8);
+    let one = b.konst(1);
+    let zero = b.konst(0);
 
     let len_hi = b.rr(Op::Sub, eight, z_hi);
     let shift_hi = b.ri(Op::ShlI, z_hi, 3);
@@ -1329,7 +1330,7 @@ pub fn prog_fmt_int(is_deltas: bool, seed: i64) -> Program {
     let has_upper = b.rr(Op::Or, hi2, mid8);
     let lo_trimmed_len = b.select(lo8, b.rr(Op::Sub, eight, z_lo), one);
     let len_lo = b.select(has_upper, eight, lo_trimmed_len);
-    let z_lo_clamped = b.select(lo8, z_lo, b.ri(Op::AddI, zero, 7));
+    let z_lo_clamped = b.select(lo8, z_lo, b.konst(7));
     let shift_lo = b.select(has_upper, zero, b.ri(Op::ShlI, z_lo_clamped, 3));
     let bytes_lo = b.rr(Op::Shr, asc_lo, shift_lo);
 
@@ -1547,7 +1548,7 @@ impl CodecPack for ExactIntPack {
 
         let mut gb_dir = GraphBuilder::new(rows.len());
         // Ids that come back (an actor, a repository) are recent ones again.
-        let dir_in = gb_dir.add_mtf_ints(&vals, 4096);
+        let dir_in = gb_dir.add_mtf_ints(&vals);
         let dir_cells = gb_dir.add_prog_cells(prog_fmt_int(false, 0), vec![dir_in], vec![]);
         let dir_root = gb_dir.add_patch(dir_cells, &exc_idx, &exc_vals);
         let g_dir = gb_dir.finish(dir_root);
@@ -1615,7 +1616,7 @@ impl DecimalScaledPack {
         };
         let sign_mask = b.ri(Op::SarI, val, 63);
         let sign_len = b.ri(Op::ShrI, val, 63);
-        let sign_ch = b.ri(Op::OrI, b.ri(Op::AndI, inp, 0), b'-' as i64);
+        let sign_ch = b.konst(b'-' as i64);
         let abs = b.rr(Op::Sub, b.rr(Op::Xor, val, sign_mask), sign_mask);
 
         let pow10 = 10u64.pow(scale as u32);
@@ -1629,9 +1630,9 @@ impl DecimalScaledPack {
         let (raw_lo, asc_lo) = eight_digits_raw_and_ascii(&b, lo_int);
         let (_, asc_frac_full) = eight_digits_raw_and_ascii(&b, frac_val);
 
-        let zero = b.ri(Op::AndI, inp, 0);
-        let one = b.ri(Op::AddI, zero, 1);
-        let eight = b.ri(Op::AddI, zero, 8);
+        let zero = b.konst(0);
+        let one = b.konst(1);
+        let eight = b.konst(8);
 
         let z_hi = b.ri(Op::ShrI, b.r(Op::Ctz, raw_hi), 3);
         let len_hi = b.rr(Op::Sub, eight, z_hi);
@@ -1640,11 +1641,11 @@ impl DecimalScaledPack {
         let z_lo = b.ri(Op::ShrI, b.r(Op::Ctz, raw_lo), 3);
         let lo_trim_len = b.select(lo_int, b.rr(Op::Sub, eight, z_lo), one);
         let len_lo = b.select(hi_int, eight, lo_trim_len);
-        let z_lo_c = b.select(lo_int, z_lo, b.ri(Op::AddI, zero, 7));
+        let z_lo_c = b.select(lo_int, z_lo, b.konst(7));
         let shift_lo = b.select(hi_int, zero, b.ri(Op::ShlI, z_lo_c, 3));
         let bytes_lo = b.rr(Op::Shr, asc_lo, shift_lo);
 
-        let dot_ch = b.ri(Op::AddI, zero, b'.' as i64);
+        let dot_ch = b.konst(b'.' as i64);
         let frac_bytes = b.ri(Op::ShrI, asc_frac_full, ((8 - scale) * 8) as i64);
 
         b.finish_sinks(&[
@@ -1837,13 +1838,13 @@ impl JavaLcgPack {
         let is_back = b.ri(Op::ShrI, forward, 47);
         let back_left = b.rr(
             Op::Sub,
-            b.ri(Op::AddI, b.ri(Op::AndI, forward, 0), 1i64 << 48),
+            b.konst(1i64 << 48),
             forward,
         );
         let mut left = b.select(is_back, back_left, forward);
         let dir_base = b.ri(Op::MulI, is_back, 48 * 16);
-        let mut state = b.ri(Op::AddI, b.ri(Op::AndI, forward, 0), anchor as i64);
-        let one = b.ri(Op::AddI, b.ri(Op::AndI, forward, 0), 1);
+        let mut state = b.konst(anchor as i64);
+        let one = b.konst(1);
 
         for _ in 0..rounds {
             let has_bit = left;
@@ -1937,7 +1938,7 @@ impl CodecPack for JavaLcgPack {
 
         // An id logged several times is a recent one again: only first sightings are
         // generated, and the rows index them.
-        let (codes, firsts) = mtf_split(&steps, 4096);
+        let (codes, firsts) = mtf_split(&steps);
         if firsts.len() * 2 < steps.len() {
             let mut gb = GraphBuilder::new(rows.len());
             let dict = ids(&mut gb, &firsts);
@@ -1946,7 +1947,6 @@ impl CodecPack for JavaLcgPack {
             let ords = gb.push(GraphNode::MtfInts {
                 codes: codes_node,
                 misses: firsts_node,
-                window: 4096,
             });
             let cells = gb.add_index_cells(dict, ords);
             let root = gb.add_patch(cells, &exc_idx, &exc_vals);
@@ -2171,7 +2171,6 @@ impl TimestampIsoPack {
         let b = Builder::new(if has_frac { 2 } else { 1 });
         let sec_d = b.input(0);
         let t = b.scan_add(sec_d, seed_sec);
-        let zero = b.ri(Op::AndI, sec_d, 0);
 
         let (days, sod) = div_mod_const(&b, t, 86_400);
         let z = b.ri(Op::AddI, days, 719_468);
@@ -2246,7 +2245,7 @@ impl TimestampIsoPack {
         if has_frac {
             let sub_d = b.input(1);
             let sub = b.scan_add(sub_d, seed_sub);
-            let fsep_v = b.ri(Op::OrI, zero, layout.frac_sep as i64);
+            let fsep_v = b.konst(layout.frac_sep as i64);
             sinks.push((fsep_v, 1));
             let fd = layout.frac_digits as usize;
             if fd <= 8 {
@@ -2269,7 +2268,7 @@ impl TimestampIsoPack {
             let mut tz_u64 = [0u8; 8];
             tz_u64[..layout.tz_len as usize]
                 .copy_from_slice(&layout.tz_bytes[..layout.tz_len as usize]);
-            let tz_v = b.ri(Op::OrI, zero, u64::from_le_bytes(tz_u64) as i64);
+            let tz_v = b.konst(u64::from_le_bytes(tz_u64) as i64);
             sinks.push((tz_v, layout.tz_len));
         }
 
@@ -2517,16 +2516,7 @@ impl TimestampClfPack {
             b.rr(Op::Or, b.ri(Op::ShrI, mi, 8), b.ri(Op::ShlI, sc, 16)),
             ((b':' as i64) << 8) | ((b' ' as i64) << 32) | (tz_lo4 << 40),
         );
-        let s3 = b.ri(
-            Op::OrI,
-            b.ri(Op::ShrI, yy_lo, 8),
-            ((tz[3] as i64) & 0xff) | ((tz[4] as i64) << 8),
-        );
-        let s3_clean = b.ri(
-            Op::OrI,
-            b.ri(Op::AndI, s3, 0),
-            (tz[3] as i64) | ((tz[4] as i64) << 8),
-        );
+        let s3_clean = b.konst((tz[3] as i64) | ((tz[4] as i64) << 8));
         (
             b.finish(&[(s0, 8), (s1, 8), (s2, 8), (s3_clean, 2)]),
             month_tbl,
@@ -2761,7 +2751,7 @@ impl UuidPack {
 
         let (h_0_7, h_8_15) = emit_hex_64_sinks(&b, hi64_be, 16, upper);
         let (h_16_23, h_24_31) = emit_hex_64_sinks(&b, lo64_be, 16, upper);
-        let dash = b.ri(Op::OrI, b.ri(Op::AndI, lo64_be, 0), b'-' as i64);
+        let dash = b.konst(b'-' as i64);
 
         let g2 = b.ri(Op::AndI, h_8_15, 0xffff_ffff);
         let g3 = b.ri(Op::ShrI, h_8_15, 32);
@@ -3144,15 +3134,15 @@ impl Ipv4Pack {
         Some(([o0, o1, o2, o3], suffix_code))
     }
 
-    fn emit_u16_decimal(b: &Builder, val: V, zero: V) -> (V, V) {
+    fn emit_u16_decimal(b: &Builder, val: V) -> (V, V) {
         let (_, asc8) = eight_digits_raw_and_ascii(b, val);
         let raw8 = b.ri(Op::AddI, asc8, -(0x3030_3030_3030_3030u64 as i64));
         let z_bytes = b.ri(Op::ShrI, b.r(Op::Ctz, raw8), 3);
-        let eight = b.ri(Op::AddI, zero, 8);
-        let one = b.ri(Op::AddI, zero, 1);
+        let eight = b.konst(8);
+        let one = b.konst(1);
         let len_nz = b.rr(Op::Sub, eight, z_bytes);
         let len = b.select(val, len_nz, one);
-        let z_clamped = b.select(val, z_bytes, b.ri(Op::AddI, zero, 7));
+        let z_clamped = b.select(val, z_bytes, b.konst(7));
         let shifted = b.rr(Op::Shr, asc8, b.ri(Op::ShlI, z_clamped, 3));
         (shifted, len)
     }
@@ -3160,18 +3150,18 @@ impl Ipv4Pack {
     fn prog_ipv4(has_suffix: bool) -> Program {
         let b = Builder::new(if has_suffix { 2 } else { 1 });
         let ip = b.input(0);
-        let zero = b.ri(Op::AndI, ip, 0);
-        let dot = b.ri(Op::AddI, zero, b'.' as i64);
+        let zero = b.konst(0);
+        let dot = b.konst(b'.' as i64);
 
         let o0 = b.ri(Op::AndI, ip, 0xff);
         let o1 = b.ri(Op::AndI, b.ri(Op::ShrI, ip, 8), 0xff);
         let o2 = b.ri(Op::AndI, b.ri(Op::ShrI, ip, 16), 0xff);
         let o3 = b.ri(Op::AndI, b.ri(Op::ShrI, ip, 24), 0xff);
 
-        let (b0, l0) = Self::emit_u16_decimal(&b, o0, zero);
-        let (b1, l1) = Self::emit_u16_decimal(&b, o1, zero);
-        let (b2, l2) = Self::emit_u16_decimal(&b, o2, zero);
-        let (b3, l3) = Self::emit_u16_decimal(&b, o3, zero);
+        let (b0, l0) = Self::emit_u16_decimal(&b, o0);
+        let (b1, l1) = Self::emit_u16_decimal(&b, o1);
+        let (b2, l2) = Self::emit_u16_decimal(&b, o2);
+        let (b3, l3) = Self::emit_u16_decimal(&b, o3);
 
         if !has_suffix {
             return b.finish_sinks(&[
@@ -3186,21 +3176,21 @@ impl Ipv4Pack {
         }
 
         let suf = b.input(1);
-        let one = b.ri(Op::AddI, zero, 1);
+        let one = b.konst(1);
         let has_s = b.select(suf, one, zero);
         let is_slash = b.ri(Op::ShrI, b.ri(Op::AddI, suf, -65537), 63);
         let is_colon = is_slash;
         let delim = b.select(
             is_colon,
-            b.ri(Op::AddI, zero, b':' as i64),
-            b.ri(Op::AddI, zero, b'/' as i64),
+            b.konst(b':' as i64),
+            b.konst(b'/' as i64),
         );
         let num = b.select(
             is_colon,
             b.ri(Op::AddI, suf, -1),
             b.ri(Op::AddI, suf, -65537),
         );
-        let (bs, ls_raw) = Self::emit_u16_decimal(&b, b.ri(Op::AndI, num, 0xffff), zero);
+        let (bs, ls_raw) = Self::emit_u16_decimal(&b, b.ri(Op::AndI, num, 0xffff));
         let ls = b.select(suf, ls_raw, zero);
 
         b.finish_sinks(&[
@@ -3432,9 +3422,8 @@ impl TraceparentPack {
         let (s0, s1) = emit_hex_64_sinks(&b, sp, 16, false);
         let (fl_hex, _) = emit_hex_64_sinks(&b, flags, 8, false);
 
-        let zero = b.ri(Op::AndI, flags, 0);
-        let pfx = b.ri(Op::OrI, zero, u32::from_le_bytes(*b"00-\0") as i64);
-        let dash = b.ri(Op::OrI, zero, b'-' as i64);
+        let pfx = b.konst(u32::from_le_bytes(*b"00-\0") as i64);
+        let dash = b.konst(b'-' as i64);
 
         b.finish(&[
             (pfx, 3),
@@ -3555,7 +3544,7 @@ impl StructuredSplitPack {
         } else {
             gb.add_dict_cells(&suffixes)
         };
-        let cat = gb.add_concat(vec![p_node, s_node]);
+        let cat = gb.add_template(&[b"", b"", b""], vec![p_node, s_node], rows.len());
         let root = gb.add_patch(cat, &exc_idx, &exc_vals);
         Some(gb.finish(root))
     }
@@ -3797,16 +3786,16 @@ impl CodecPack for NumericTemplatePack {
         }
 
         let mut gb = GraphBuilder::new(rows.len());
-        let mut parts: Vec<u16> = Vec::with_capacity(2 * n_slots + 1);
+        // Constant slots join the literal text around them.
+        let mut texts: Vec<Vec<u8>> = vec![Vec::new()];
+        let mut slots = Vec::with_capacity(n_slots);
 
         for k in 0..n_slots {
-            if !literals[k].is_empty() {
-                parts.push(gb.add_const_cells(&literals[k], rows.len()));
-            }
+            texts.last_mut().unwrap().extend_from_slice(&literals[k]);
             let srows = &slot_strs[k];
             let s_first = srows[0];
             if srows.iter().all(|&x| x == s_first) {
-                parts.push(gb.add_const_cells(s_first, rows.len()));
+                texts.last_mut().unwrap().extend_from_slice(s_first);
                 continue;
             }
 
@@ -3833,7 +3822,7 @@ impl CodecPack for NumericTemplatePack {
                 }
 
                 let mut sgb_mtf = GraphBuilder::new(rows.len());
-                let mn = sgb_mtf.add_mtf_ints(vals, 4096);
+                let mn = sgb_mtf.add_mtf_ints(vals);
                 let mc = sgb_mtf.add_prog_cells(prog_fmt_int(false, 0), vec![mn], vec![]);
                 let g_mtf = sgb_mtf.finish(mc);
                 let len_mtf = g_mtf.cost();
@@ -3857,16 +3846,15 @@ impl CodecPack for NumericTemplatePack {
                 }
             }
             let (_, slot_g) = best_slot_g?;
-            parts.push(gb.merge_graph(&slot_g));
+            slots.push(gb.merge_graph(&slot_g));
+            texts.push(Vec::new());
         }
-        if !literals[n_slots].is_empty() {
-            parts.push(gb.add_const_cells(&literals[n_slots], rows.len()));
+        texts.last_mut().unwrap().extend_from_slice(&literals[n_slots]);
+        if slots.len() > 64 {
+            return None;
         }
-        let cat = if parts.len() == 1 {
-            parts[0]
-        } else {
-            gb.add_concat(parts)
-        };
+        let texts: Vec<&[u8]> = texts.iter().map(Vec::as_slice).collect();
+        let cat = gb.add_template(&texts, slots, rows.len());
         let root = gb.add_patch(cat, &exc_idx, &exc_vals);
         Some(gb.finish(root))
     }
@@ -4117,7 +4105,7 @@ impl CodecPack for Base64Pack {
         let sliced = gb.add_slice_buf(quads_cells, 0, &cell_lens);
         let target_root = gb.add_patch(sliced, &exc_idx, &exc_vals);
         let root = if use_dedup {
-            let ord_node = gb.add_mtf_ints(&ords, 4096);
+            let ord_node = gb.add_mtf_ints(&ords);
             gb.add_index_cells(target_root, ord_node)
         } else {
             target_root
@@ -4215,9 +4203,8 @@ impl CodecPack for F64BinaryPack {
                 }
             }
             let mut gb_r = GraphBuilder::new(n);
-            let r_buf = gb_r.add_bytes(&raw_planes);
-            let unshuf_r = gb_r.add_byte_unshuffle(r_buf, 8);
-            let r_root = gb_r.add_slice_buf(unshuf_r, 0, &vec![8i64; n]);
+            let r_ints = gb_r.add_planes(&raw_planes, 8);
+            let r_root = gb_r.add_fixed_cells(r_ints, 8);
             let g_r = gb_r.finish(r_root);
             let r_len = g_r.cost();
             if best.as_ref().is_none_or(|(bl, _)| r_len < *bl) {
@@ -4267,9 +4254,7 @@ impl CodecPack for F64BinaryPack {
             let plane_prog = pb.finish(&[(raw_bits, 8)]);
 
             let mut gb_p = GraphBuilder::new(n);
-            let p_buf = gb_p.add_bytes(&planes);
-            let unshuf = gb_p.add_byte_unshuffle(p_buf, 8);
-            let zz_col = gb_p.add_byte_chunks(unshuf, 8);
+            let zz_col = gb_p.add_planes(&planes, 8);
             let rp = gb_p.add_prog_cells(plane_prog, vec![zz_col], vec![]);
             let g_p = gb_p.finish(rp);
             let p_len = g_p.cost();
@@ -4324,9 +4309,8 @@ impl CodecPack for BinaryPlanesPack {
             }
         }
         let mut gb = GraphBuilder::new(n);
-        let p_buf = gb.add_bytes(&planes);
-        let unshuf = gb.add_byte_unshuffle(p_buf, w as u8);
-        let root = gb.add_slice_buf(unshuf, 0, &vec![w as i64; n]);
+        let ints = gb.add_planes(&planes, w as u8);
+        let root = gb.add_fixed_cells(ints, w as u8);
         let mut best_g = gb.finish(root);
 
         if w == 4 {
@@ -4364,9 +4348,7 @@ impl CodecPack for BinaryPlanesPack {
             let f32_prog = fb.finish(&[(raw32, 4)]);
 
             let mut gb_f = GraphBuilder::new(n);
-            let f_buf = gb_f.add_bytes(&f32_planes);
-            let unshuf_f = gb_f.add_byte_unshuffle(f_buf, 4);
-            let zz_col = gb_f.add_byte_chunks(unshuf_f, 4);
+            let zz_col = gb_f.add_planes(&f32_planes, 4);
             let f_root = gb_f.add_prog_cells(f32_prog, vec![zz_col], vec![]);
             let g_f = gb_f.finish(f_root);
             if g_f.cost() < best_g.cost() {
@@ -4398,6 +4380,91 @@ fn replace_subslice(hay: &[u8], needle: &[u8], rep: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Column `cid` as the value an earlier column `src` holds in a record with the same `key` cell:
+/// `IndexCells(src, MatchIndex(key at cid, key at src, ranks))` with misses patched. Returns the
+/// smallest of a few (src, key) pairs, priced.
+fn keyed_lookup<'v>(
+    cid: usize,
+    occ: &[Vec<&'v [u8]>],
+    nested: &[Option<(ColSummary, Vec<u8>)>],
+    head: impl Fn(usize) -> &'v FastSet<&'v [u8]>,
+    align: impl Fn(usize, usize) -> Option<Vec<i64>>,
+) -> Option<(Vec<u8>, usize)> {
+    // Small columns rarely repay the search.
+    let vals = &occ[cid];
+    if vals.len() < 1024 {
+        return None;
+    }
+    let usable = |c: usize| !occ[c].is_empty() && nested.get(c).is_none_or(|x| x.is_none());
+    // Sources hold a quarter of this column's first distinct values among their first values.
+    let probe: FastSet<&[u8]> = vals[..64].iter().copied().collect();
+    let srcs: Vec<usize> = (0..cid)
+        .rev()
+        .filter(|&s| usable(s))
+        .filter(|&s| probe.iter().filter(|v| head(s).contains(*v)).count() * 4 >= probe.len())
+        .take(2)
+        .collect();
+    if srcs.is_empty() {
+        return None;
+    }
+    // Keys: the most varied earlier columns whose values recur, as a record's key must for
+    // other records to share it.
+    let mut keys: Vec<(usize, usize)> = (0..cid)
+        .filter(|&k| usable(k))
+        .map(|k| (head(k).len(), k))
+        .filter(|&(d, k)| d >= 64 && d * 4 <= occ[k].len().min(1024) * 3)
+        .collect();
+    keys.sort_unstable_by(|a, b| b.cmp(a));
+    let mut best: Option<(Vec<u8>, usize)> = None;
+    let mut tries = 0;
+    for &s in &srcs {
+        for &(_, k) in &keys {
+            if k == s || tries >= 3 {
+                continue;
+            }
+            let (Some(kc), Some(ks)) = (align(k, cid), align(k, s)) else {
+                continue;
+            };
+            tries += 1;
+            let (key, src) = (&occ[k], &occ[s]);
+            // The rank of the first source row holding each (key, value) among its key's rows.
+            let mut seen: FastMap<&[u8], i64> = fast_map_with_capacity(ks.len());
+            let mut first: FastMap<(&[u8], &[u8]), i64> = fast_map_with_capacity(ks.len());
+            for (&kj, &sv) in ks.iter().zip(src) {
+                let n = seen.entry(key[kj as usize]).or_insert(0);
+                *n += 1;
+                first.entry((key[kj as usize], sv)).or_insert(*n);
+            }
+            let mut codes = Vec::with_capacity(vals.len());
+            let (mut exc_idx, mut exc_vals) = (Vec::new(), Vec::new());
+            for (i, &v) in vals.iter().enumerate() {
+                let code = first.get(&(key[kc[i] as usize], v)).copied().unwrap_or(0);
+                codes.push(code);
+                if code == 0 {
+                    exc_idx.push(i);
+                    exc_vals.push(v);
+                }
+            }
+            if exc_idx.len() * 2 > vals.len() {
+                continue;
+            }
+            let mut gb = GraphBuilder::new(vals.len());
+            let src_n = gb.add_ext_peer(s as u32);
+            let needles = gb.add_ext_align(k as u32, None);
+            let hay = gb.add_ext_align(k as u32, Some(s as u32));
+            let codes_n = gb.add_ints(&codes);
+            let idx = gb.add_match_index(needles, hay, codes_n);
+            let base = gb.add_index_cells(src_n, idx);
+            let root = gb.add_patch(base, &exc_idx, &exc_vals);
+            let cand = gb.finish(root).priced();
+            if best.as_ref().is_none_or(|b| cand.1 < b.1) {
+                best = Some(cand);
+            }
+        }
+    }
+    best
+}
+
 impl PackRegistry {
     /// Encodes all dense occurrence columns of a structural block, coordinating single-column
     /// [`CodecPack`]s, horizontal peer derivations (`ExtPeer`), cross-column dictionary sharing
@@ -4410,6 +4477,7 @@ impl PackRegistry {
         horiz_cands: &[Vec<usize>],
         preencoded_nested: &mut [Option<(ColSummary, Vec<u8>)>],
         standalone: &[bool],
+        layout: Option<(&ModelPlan, &[u32])>,
         backend: EntropyBackend,
         level: i32,
     ) -> EncodedDenseBlock {
@@ -4437,6 +4505,15 @@ impl PackRegistry {
                     }
                 }
             }
+
+            // Keyed lookups need a layout that places every cell, and reuse each column's first
+            // distinct values.
+            let shaped = layout.filter(|(plan, vids)| {
+                vids.iter().all(|&v| {
+                    matches!(plan.variants.get(v as usize), Some(PlanVariant::Shape(_)))
+                })
+            });
+            let heads: Vec<OnceCell<FastSet<&[u8]>>> = (0..n_cols).map(|_| OnceCell::new()).collect();
 
             // Phase 1: Single-column `PayloadGraph` + horizontal `ExtPeer` derivations.
             for cid in 0..n_cols {
@@ -4726,7 +4803,7 @@ impl PackRegistry {
                                     if exc_idx.len() < occ_len {
                                         let mut gb = GraphBuilder::new(occ_len);
                                         let peer = gb.add_ext_peer(src_i as u32);
-                                        let idx_node = gb.add_mtf_ints(&idxs, 4096);
+                                        let idx_node = gb.add_mtf_ints(&idxs);
                                         let indexed = gb.add_index_cells(peer, idx_node);
                                         let root = gb.add_patch(indexed, &exc_idx, &exc_vals);
                                         let (cand, cand_cost) = gb.finish(root).priced();
@@ -4743,6 +4820,23 @@ impl PackRegistry {
                                 }
                             }
                         }
+                    }
+
+                    // 1d. Keyed lookup: a value an earlier column holds in a record with the
+                    // same key.
+                    if let Some((plan, vids)) = shaped
+                        && let Some((cand, cand_cost)) = keyed_lookup(
+                            cid,
+                            occ_streams,
+                            preencoded_nested,
+                            |c| heads[c].get_or_init(|| occ_streams[c].iter().take(1024).copied().collect()),
+                            |key, at| align_cells(plan, vids, key, at).ok(),
+                        )
+                        && cand_cost + 12 < best_cost
+                    {
+                        best_blob = cand;
+                        best_cost = cand_cost;
+                        used_ext[cid] = true;
                     }
                 }
 
@@ -4839,7 +4933,7 @@ impl PackRegistry {
                 let mut entries: Vec<(&[u8], u32)> = merged.into_iter().collect();
                 entries.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
                 let entry_slices: Vec<&[u8]> = entries.iter().map(|e| e.0).collect();
-                let dict_blob = self.encode_best(&entry_slices);
+                let (dict_blob, dict_cost) = self.encode_best_graph(&entry_slices).priced();
 
                 let mut lut: FastMap<&[u8], i64> = fast_map_with_capacity(entry_slices.len());
                 for (id, &s) in entry_slices.iter().enumerate() {
@@ -4848,7 +4942,7 @@ impl PackRegistry {
 
                 let dict_id = shared_dict_blobs.len() as u16;
                 let mut cur_sum = 0usize;
-                let mut new_sum = dict_blob.len() + 3;
+                let mut new_sum = dict_cost + 3;
                 let mut member_blobs = Vec::with_capacity(cluster.len());
                 for &ci in &cluster {
                     let cid = dict_cands[ci].cid;
@@ -4864,7 +4958,7 @@ impl PackRegistry {
                         .collect();
                     let mut gb = GraphBuilder::new(vals.len());
                     let d_node = gb.add_ext_dict(dict_id);
-                    let o_node = gb.add_mtf_ints(&ords, 4096);
+                    let o_node = gb.add_mtf_ints(&ords);
                     let idx_node = gb.add_index_cells(d_node, o_node);
                     let root = if all_q {
                         gb.add_quote_or_null(idx_node, None)

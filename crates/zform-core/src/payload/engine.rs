@@ -274,6 +274,7 @@ fn exec<T: Lane>(st: &Step, p: &Program, s: &mut Slots<T>, bufs: &[TableBuf<'_>]
                 *x = if c != T::default() { a } else { b };
             }
         }
+        Op::Const => s.split(st.d).0.fill(i),
         Op::AddI => un(s, st, |a| a.add(i)),
         Op::MulI => un(s, st, |a| a.mul(i)),
         Op::AndI => un(s, st, |a| T::from_u64(a.u64() & i.u64())),
@@ -417,9 +418,9 @@ impl<'c, 'p, T: Lane> Runner<'c, 'p, T> {
         chunk_steps(&plan.steps, self.cp.p, &mut slots, b, &mut self.scans);
     }
 
-    /// The first sink's values in the last chunk.
-    pub(crate) fn sink(&self) -> &[T] {
-        &self.s[self.cp.plan.sinks[0].0 as usize * self.nc..][..self.nc]
+    /// Sink `k`'s values in the last chunk.
+    pub(crate) fn sink(&self, k: usize) -> &[T] {
+        &self.s[self.cp.plan.sinks[k].0 as usize * self.nc..][..self.nc]
     }
 }
 

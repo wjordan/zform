@@ -71,9 +71,11 @@ pub enum Op {
     ScanF64Add = 31,
     I64ToF64 = 32,
     F64DivI = 33,
+    // No operands: `imm` in every row
+    Const = 34,
 }
 
-pub const ALL_OPS: [Op; 34] = [
+pub const ALL_OPS: [Op; 35] = [
     Op::Add,
     Op::Sub,
     Op::Mul,
@@ -108,6 +110,7 @@ pub const ALL_OPS: [Op; 34] = [
     Op::ScanF64Add,
     Op::I64ToF64,
     Op::F64DivI,
+    Op::Const,
 ];
 
 impl Op {
@@ -126,6 +129,7 @@ impl Op {
             | Self::F64Add
             | Self::F64Sub
             | Self::F64Mul => 2,
+            Self::Const => 0,
             _ => 1,
         }
     }
@@ -164,6 +168,7 @@ impl Op {
                 | Self::ScanAdd
                 | Self::ScanXor
                 | Self::ScanF64Add
+                | Self::Const
         )
     }
 
@@ -724,14 +729,9 @@ impl Builder {
         self.push(Op::ScanF64Add, a.0, 0, 0, 0, seed.to_bits() as i64)
     }
 
-    /// Constant lane from any anchor input `any`.
-    pub fn konst(&self, any: V, val: i64) -> V {
-        let z = self.ri(Op::AndI, any, 0);
-        if val == 0 {
-            z
-        } else {
-            self.ri(Op::OrI, z, val)
-        }
+    /// `val` in every row.
+    pub fn konst(&self, val: i64) -> V {
+        self.push(Op::Const, 0, 0, 0, 0, val)
     }
 
     /// Unsigned `x / d` for `0 <= x < 2^bits`, synthesized as multiply + shift
@@ -846,7 +846,7 @@ pub fn eval_reference(p: &Program, inputs: &[&[i64]], bufs: &[TableBuf<'_>]) -> 
             });
         }
         for (idx, ins) in p.ops.iter().enumerate() {
-            let a = v[ins.a as usize];
+            let a = v.get(ins.a as usize).copied().unwrap_or(0);
             let b = v.get(ins.b as usize).copied().unwrap_or(0);
             let c = v.get(ins.c as usize).copied().unwrap_or(0);
             let res =
@@ -911,6 +911,7 @@ pub fn eval_reference(p: &Program, inputs: &[&[i64]], bufs: &[TableBuf<'_>]) -> 
                                 scan_state[idx] = acc as i64;
                                 acc
                             }
+                            Op::Const => iu,
                             _ => unreachable!(),
                         };
                         r32 as i64
@@ -991,6 +992,7 @@ pub fn eval_reference(p: &Program, inputs: &[&[i64]], bufs: &[TableBuf<'_>]) -> 
                             scan_state[idx] = acc;
                             acc
                         }
+                        Op::Const => ins.imm,
                         Op::ScanF64Add => {
                             let prev = f64::from_bits(scan_state[idx] as u64);
                             let prev = if prev.is_nan() { 0.0 } else { prev };

@@ -163,9 +163,7 @@ impl FloatEncoder {
                 }
             }
             let mut graph = GraphBuilder::new(n);
-            let source = graph.add_bytes(&bytes);
-            let source = graph.add_byte_unshuffle(source, 8);
-            let root = graph.add_byte_chunks(source, 8);
+            let root = graph.add_planes(&bytes, 8);
             graph.finish(root).fuse_numeric_programs().encode()
         })
     }

@@ -126,9 +126,9 @@ A model routes each record to one variant; the block's `variant_ids` name it per
 
 - `0 = Shape`: `n: uvarint`, then `n + 1` literals (`blob` each), then `n` slot column ids (`uvarint` each). The record is `lit[0] cell lit[1] cell ... lit[n]`, each cell being the next unread cell of its slot's column. A column may fill several slots of a shape and slots of many shapes.
 - `1 = JsonTree`: a tree of JSON paths. Objects have shape tables with inline constant fields, arrays have count streams (`$.payload.commits[]`), scalars are typed cells, a string holding JSON may carry a nested plan one level deep, and a value may be derived from other paths by `Copy`, `Affix` or `MultiConcat` candidates. The trainer keeps up to 1,024 paths and a decoder accepts 2,048.
-- `2 = ShapeCell`: `col: uvarint`. The next cell of `col` holds a shape in the encoding above and the record follows it. This carries layouts that vary by row: key order, optional fields, per-field quoting.
+- `2 = ShapeCell`: `col: uvarint`, `n: uvarint`, then `n` column ids (`uvarint` each), the columns its shapes may name. The next cell of `col` holds exactly one shape in the encoding above and the record follows it. This carries layouts that vary by row: key order, optional fields, per-field quoting.
 
-Variant `0` of every model is a one-slot shape with empty literals over `$residual`: the record verbatim. Other tags are rejected. A slot id outside the column table is rejected when the model is decoded; a `ShapeCell` shape is checked when its cell is read and may not name its own column.
+Variant `0` of every model is a one-slot shape with empty literals over `$residual`: the record verbatim. Other tags are rejected. A slot or declared column id outside the column table, or a `ShapeCell` that declares its own `col`, is rejected when the model is decoded; a `ShapeCell` shape is checked when its cell is read, and a slot naming a column its variant does not declare rejects the block.
 
 Record syntax is the writer's business. Its front ends (a template miner, Kubernetes CRI and syslog prefixes, logfmt, CSV, fixed-stride binary) choose columns and emit shapes: separators, keys and quotes are literals, and a field's name is its column's name. A new syntax needs a front end and no reader change. After the variants comes `hints: blob`, which a reader skips: per variant, the front end that made it and its parameters, so a profile splits new records the same way.
 
@@ -159,13 +159,13 @@ rows = 3, flags = 0
 
 node 0: IntStream [0, 0, 1]              -> integers (row ordinals)
 node 1: Bytes "authcart"                 -> buffer
-node 2: DictCells(codes = 0,
-                  dict_ends = [4, 8],
-                  dict_bytes = 1)       -> cells ["auth", "auth", "cart"]
-root = 2
+node 2: IntStream [4, 4]                 -> integers (entry lengths)
+node 3: SliceBuf(buf = 1, base = 0, lens = 2)       -> cells ["auth", "cart"]
+node 4: IndexCells(source = 3, indices = 0)         -> cells ["auth", "auth", "cart"]
+root = 4
 ```
 
-`dict_ends` is an inline `IntStream` of cumulative byte offsets, so the dictionary is `auth`, then `cart`. `CoreDecoder` needs only the node semantics to reconstruct the column. The writer may select a different graph if it is smaller.
+`CoreDecoder` needs only the node semantics to reconstruct the column. The writer may select a different graph if it is smaller.
 
 A complete payload for three copies of `ok` is nine bytes:
 
@@ -239,14 +239,11 @@ Unless typed otherwise, operands are `uvarint`. `ref` names an earlier node; `re
 | `1` | `IntStream` | `stream: IntStream` | Integers |
 | `2` | `ByteChunks` | `buf: ref`, `chunk_bytes: u8` | Integers from 1–8 byte LE chunks; short chunks are zero-extended |
 | `3` | `MtfFixed` | `codes: ref`, `fallback_buf: ref`, `width: u8` | Buffer of fixed-width items, width 1–64 |
-| `4` | `DictCells` | `codes: ref`, `dict_ends: IntStream`, `dict_bytes: ref` | Cells selected by zero-based dictionary ordinals |
 | `5` | `RecurBuf` | `spec: code_ref`, `seed: ref`, `cols: refs`, `out_words` | Buffer of recurrence output words, optionally prefixed with seed bytes |
 | `6` | `ProgramI64` | `prog: code_ref`, `inputs: refs`, `bufs: refs` | Integer lanes from one eight-byte output of a 64-bit program |
 | `7` | `ProgramCells` | `prog: code_ref`, `inputs: refs`, `bufs: refs` | One cell per input row, concatenating the program's outputs |
 | `8` | `PatchCells` | `base: ref`, `indices: ref`, `values: ref` | Base cells with exception cells substituted |
-| `9` | `ConcatCells` | `parts: refs` | Row-wise concatenation of 1–32 cell sequences |
-| `10` | `ByteUnshuffle` | `buf: ref`, `width: u8` | Buffer interleaving byte planes into items of width 1–64 |
-| `11` | `MtfInts` | `codes: ref`, `misses: ref`, `window` | Integer move-to-front decoding, window 1–4,096 |
+| `11` | `MtfInts` | `codes: ref`, `misses: ref` | Integer move-to-front decoding over the last 4,096 distinct values |
 | `12` | `SliceBuf` | `buf: ref`, `base`, `lens: ref` | Consecutive cells of the given lengths, starting at byte offset `base` |
 | `13` | `IndexCells` | `source: ref`, `indices: ref` | Cells selected by zero-based indices |
 | `14` | `TemplateCells` | `template: ref`, `slots: refs` | Templates with same-row slot values inserted; 1–64 slots |
@@ -257,10 +254,14 @@ Unless typed otherwise, operands are `uvarint`. `ref` names an earlier node; `re
 | `19` | `ExtDict` | `dict_id` | The declared external dictionary cells |
 | `20` | `ExtPeer` | `slot` | Cells from that slot in the declared peer list |
 | `21` | `LibraryBytes` | `id` | Buffer from a byte-table library entry |
+| `22` | `ExtAlign` | `key`, `at` | Integers: for each cell of `at`, the value id of the first `key` cell in its record |
+| `23` | `MatchIndex` | `needles: ref`, `hay: ref`, `codes: ref` | Integers: positions in `hay` matched by key |
 
-`MtfFixed` keeps the last 64 items, most recent first. Code `0` consumes the next `width` fallback bytes and inserts that item. Code `k > 0` selects rank `k - 1` and moves it to the front. `MtfInts` uses the same code convention with integer misses and its explicit window.
+`MtfFixed` keeps the last 64 items, most recent first. Code `0` consumes the next `width` fallback bytes and inserts that item. Code `k > 0` selects rank `k - 1` and moves it to the front. `MtfInts` uses the same code convention with integer misses.
 
-`DictCells.dict_ends` contains cumulative byte offsets, ending at the buffer's length. `PatchCells.indices` holds the first absolute occurrence index followed by nonnegative differences from the previous patch index. `ConcatCells` concatenates bytes within each row, not whole columns end to end.
+`ExtAlign.key` is a peer slot; `at` is `0` for this column or `s + 1` for peer slot `s`. The block supplies it from `variant_ids` and the shapes' slots, so every record must be of a `Shape` variant and every record holding an `at` cell must hold a `key` cell. A value id is the rank of the value's first occurrence among the `key` column's distinct values, so equal values get equal ids. For needle `i` with code `c > 0`, `MatchIndex` yields the position of the `c`-th `hay` entry equal to the needle; code `0` yields `0`, which the writer patches. `hay` entries must be nonnegative; the reader sizes tables by the largest. With `IndexCells` over a peer and `ExtAlign` for both columns, this codes a value as the one another column holds in a record with the same key.
+
+`PatchCells.indices` holds the first absolute occurrence index followed by nonnegative differences from the previous patch index.
 
 `TemplateCells` copies literal bytes until `0x1f`. The next byte is either `0xff`, meaning a literal `0x1f`, or `(slot << 1) | strip`. A slot inserts that row's cell; `strip = 1` removes its first and last byte when it has at least two bytes. All template and slot sequences have the same row count.
 
@@ -287,7 +288,7 @@ An `IntStream` starts with `kind: u8`, then `length: uvarint`, followed by the o
 - **Bit-packed:** the expanded leaf holds unsigned offsets from `min`, each in `bits` bits, least-significant bit first. `bits` is 0–64. Add `min` with 64-bit wrapping arithmetic to reconstruct each lane.
 - **ZigZag varints:** the expanded leaf holds exactly `length` `ivarint` values.
 - **Byte planes:** `width` is 1, 2, 4, or 8. The expanded leaf holds `length * width` bytes: all low bytes of unsigned offsets from `min`, then all second bytes, and so on. Interleave and add `min` with 64-bit wrapping arithmetic.
-- **Byte head and exceptions:** the expanded head holds one byte per lane. Bytes 0–254 represent offsets from `min` (kind `5`) or ZigZag codes (kind `6`). Byte 255 consumes the next tail value and adds 255 to obtain the offset or ZigZag code. Each exception consumes exactly one tail value. Kind `5` tails must be nonnegative; kind `6` tails carry unsigned bit patterns in signed lanes. Tail nesting permits at most four edges from the outer stream.
+- **Byte head and exceptions:** the expanded head holds one byte per lane. Bytes 0–254 represent offsets from `min` (kind `5`) or ZigZag codes (kind `6`). Byte 255 consumes the next tail value and adds 255 to obtain the offset or ZigZag code. Each exception consumes exactly one tail value. Kind `5` tails must be nonnegative; kind `6` tails carry unsigned bit patterns in signed lanes. A tail is never itself kind `5` or `6`.
 - **Centered Rice:** `bytes` contains `center: ivarint`, `k: u8`, then a least-significant-bit-first bitstream. ZigZag-encode each signed difference from `center`. Write `code >> k` zero bits, one bit, then the low `k` bits. `k` is 0–63. Decoders reject arithmetic overflow, truncation, trailing bytes, and nonzero padding.
 
 Delta reconstruction, common integer factors, floating-point scaling, and formatting are programs around these transports. They have no separate `IntStream` mode or domain tag.
@@ -328,7 +329,7 @@ rows: uvarint | 0x80: u8 | is_json_tagged: u8
 row_modes: u32_seq | child_block: blob | [fallback_graph: blob]
 ```
 
-`row_modes` has one entry per occurrence. Mode `1` consumes a child record. Mode `2` consumes a child record and restores a trailing newline for JSON-tagged values. Mode `3` consumes a fallback cell. The fallback graph is present only when mode `3` occurs. JSON-tagged values receive an internal `1` byte for child records or `0` for fallbacks. The structural model uses these tags when restoring the enclosing JSON string. Envelope inner records use untagged values. The child block decodes with the nested model and its library. `0x80` is not a `PayloadGraph` flag accepted by `CoreDecoder`.
+`row_modes` has one entry per occurrence. Mode `1` consumes a child record. Mode `2` consumes a child record and restores a trailing newline for JSON-tagged values. Mode `3` consumes a fallback cell. The fallback graph is present only when mode `3` occurs. JSON-tagged values receive an internal `1` byte for child records or `0` for fallbacks. The structural model uses these tags when restoring the enclosing JSON string. Other inner records use untagged values. The child block decodes with the nested model and its library. `0x80` is not a `PayloadGraph` flag accepted by `CoreDecoder`.
 
 ### decoding and implementation map
 
@@ -362,7 +363,7 @@ Derived from the data region and rebuilt by scanning it. `pack` appends it at EO
 All fields below are `uvarint` unless typed.
 
 - **Root**: `data_len`; `n_models`, then each model as a length and its `ModelPlan` bytes, each stored once; `n_blocks`, then per block:
-  - `kind: u8`. `0` is a structured block, followed by its model id and `kinds`, a mask of what its rows are: `0x01` residual, `0x02` JSON, `0x04` template, `0x08` envelope, `0x10` logfmt, `0x20` CSV, `0x40` binary. `1` is a verbatim block, followed by its `ResolvedFraming`.
+  - `kind: u8`. `0` is a structured block, followed by its model id and `kinds`, a mask of what its rows are: `0x01` variant 0, `0x02` `JsonTree`, `0x04` another `Shape`, `0x08` `ShapeCell`. `1` is a verbatim block, followed by its `ResolvedFraming`.
   - the gap between the previous block's end and this block's offset in the data region, its length, its row count, its directory page length and its filter page length. Page offsets follow from the lengths.
 
   After the blocks comes the length of the dictionary's leaf in the data region, `0` when there is none, else followed by the leaf's offset and `id: u64 LE`.

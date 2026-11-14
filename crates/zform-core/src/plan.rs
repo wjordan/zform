@@ -6,9 +6,9 @@
 use crate::codecs::encode_present_slice;
 use crate::framing::{FramingSpec, ResolvedFraming, split_chunk};
 use crate::grammar::{
-    BinaryStrideSpec, CsvSpec, EnvelopeKind, EnvelopeSpec, LogfmtSpec, ModelPlan, PlanVariant,
-    SlotClass, TemplateVariant, match_template, parse_k8s_cri, parse_logfmt_line,
-    parse_syslog_envelope, split_csv_exact, split_records_with_plan, tokenize_template_line,
+    FrontEnd, ModelPlan, PlanVariant, Shape, SlotClass, TemplateVariant, csv_shape, envelope_shape,
+    logfmt_shape, match_template, parse_k8s_cri, parse_logfmt_line, parse_syslog_envelope,
+    split_csv_exact, split_records_with_plan, tokenize_template_line,
 };
 use crate::json_tree::{JsonDoc, train_json_tree};
 use crate::lex::parse_exact_int;
@@ -201,23 +201,24 @@ pub fn train_from_records(
         for &vid in &prev_split.variant_ids {
             var_hits[vid as usize] += 1;
         }
-        let keep_all_prior = prev.template_indices.len() < opts.max_templates / 2;
-        for (vi, v) in prev.variants.iter().enumerate().skip(1) {
-            if !keep_all_prior && var_hits[vi] == 0 {
+        let keep_all_prior = prev.routes.templates.len() < opts.max_templates / 2;
+        for (vi, tv) in &prev.routes.templates {
+            if !keep_all_prior && var_hits[*vi as usize] == 0 {
                 continue;
             }
-            if let PlanVariant::Template(tv) = v {
-                let slots: Vec<u16> = tv
-                    .slots
-                    .iter()
-                    .map(|&old_c| {
-                        let oc = &prev.columns[old_c as usize];
-                        plan.add_or_get_col_with_group(&oc.name, &oc.dict_group)
-                    })
-                    .collect();
-                let tv = TemplateVariant::new(tv.literals.clone(), slots);
-                plan.variants.push(PlanVariant::Template(tv));
-            }
+            let slots: Vec<u16> = tv
+                .slots
+                .iter()
+                .map(|&old_c| {
+                    let oc = &prev.columns[old_c as usize];
+                    plan.add_or_get_col_with_group(&oc.name, &oc.dict_group)
+                })
+                .collect();
+            let literals = tv.literals.clone();
+            plan.push_variant(
+                PlanVariant::Shape(Shape { literals, slots }),
+                FrontEnd::Template,
+            );
         }
     }
 
@@ -257,7 +258,7 @@ pub fn train_from_records(
                 }
             }
             plan.json_tree = Some(jt);
-            plan.variants.push(PlanVariant::JsonTree);
+            plan.push_variant(PlanVariant::JsonTree, FrontEnd::None);
         } else if let Some(prev) = prior
             && let Some(prev_jt) = &prev.json_tree
         {
@@ -271,7 +272,7 @@ pub fn train_from_records(
             }
             cloned_jt.rebuild_runtime_index();
             plan.json_tree = Some(cloned_jt);
-            plan.variants.push(PlanVariant::JsonTree);
+            plan.push_variant(PlanVariant::JsonTree, FrontEnd::None);
         }
     } else if let Some(prev) = prior
         && let Some(prev_jt) = &prev.json_tree
@@ -285,7 +286,7 @@ pub fn train_from_records(
         }
         cloned_jt.rebuild_runtime_index();
         plan.json_tree = Some(cloned_jt);
-        plan.variants.push(PlanVariant::JsonTree);
+        plan.push_variant(PlanVariant::JsonTree, FrontEnd::None);
     }
 
     // 3. Train Kubernetes CRI & Syslog Envelope Arms (with recursive inner ModelPlan!)
@@ -305,10 +306,8 @@ pub fn train_from_records(
         if inner_plan.variants.len() > 1 {
             plan.columns[c_inner as usize].nested_plan = Some(Box::new(inner_plan));
         }
-        plan.variants.push(PlanVariant::Envelope(EnvelopeSpec {
-            kind: EnvelopeKind::KubernetesCri,
-            cols: [c_ts, c_stream, c_flag, c_inner],
-        }));
+        let shape = envelope_shape(false, [c_ts, c_stream, c_flag, c_inner]);
+        plan.push_variant(PlanVariant::Shape(shape), FrontEnd::Cri);
     }
     if syslog_inners.len() >= 4 {
         let c_pri = plan.add_or_get_col("$syslog.pri");
@@ -326,10 +325,8 @@ pub fn train_from_records(
         if inner_plan.variants.len() > 1 {
             plan.columns[c_inner as usize].nested_plan = Some(Box::new(inner_plan));
         }
-        plan.variants.push(PlanVariant::Envelope(EnvelopeSpec {
-            kind: EnvelopeKind::Syslog,
-            cols: [c_pri, c_ts, c_ht, c_inner],
-        }));
+        let shape = envelope_shape(true, [c_pri, c_ts, c_ht, c_inner]);
+        plan.push_variant(PlanVariant::Shape(shape), FrontEnd::Syslog);
     }
 
     // 4. Train `logfmt` (`key=value`) Arm
@@ -362,21 +359,21 @@ fn train_binary_stride(samples: &[&[u8]], stride: u32, plan: &mut ModelPlan) {
     // Fewer trial rows for wider records, so training cost does not grow with the stride.
     let whole = samples.iter().copied().filter(|r| r.len() == s);
     let rows: Vec<&[u8]> = whole.take(((1 << 18) / s).max(64)).collect();
-    let mut slices = Vec::new();
+    let (mut slots, mut widths) = (Vec::new(), Vec::new());
     let mut off = 0usize;
     while off < s {
         let w = [8, 4, 2, 1].into_iter().find(|w| off + w <= s).unwrap();
         for (off, w) in binary_fields(&rows, off, w).1 {
-            let cid = plan.add_or_get_col(&format!("$bin.{off}_{w}"));
-            slices.push((off as u16, w as u16, cid));
+            slots.push(plan.add_or_get_col(&format!("$bin.{off}_{w}")));
+            widths.push(w as u16);
         }
         off += w;
     }
-    plan.variants
-        .push(PlanVariant::BinaryStride(BinaryStrideSpec {
-            stride,
-            slices,
-        }));
+    let literals = vec![Vec::new(); slots.len() + 1];
+    plan.push_variant(
+        PlanVariant::Shape(Shape { literals, slots }),
+        FrontEnd::Binary { widths },
+    );
 }
 
 /// The fields in the `w` bytes at `off` and their encoded size over `rows`: one field, or the
@@ -430,14 +427,41 @@ fn train_logfmt_arm(rows: &[&[u8]], plan: &mut ModelPlan) {
             key_to_col.insert(k, cid);
         }
     }
-    let recipe_col = plan.add_or_get_col("$logfmt.recipe");
-    let overflow_col = plan.add_or_get_col_with_group("$logfmt.overflow", "text");
-    plan.logfmt = Some(LogfmtSpec {
-        key_to_col,
-        recipe_col,
-        overflow_col,
-    });
-    plan.variants.push(PlanVariant::Logfmt);
+    let shape_col = plan.add_or_get_col("$logfmt.shape");
+    let overflow = plan.add_or_get_col_with_group("$logfmt.overflow", "text");
+    let (mut enc, mut vals, mut seen) = (Vec::new(), Vec::new(), HashMap::new());
+    for pairs in rows.iter().filter_map(|r| parse_logfmt_line(r)) {
+        logfmt_shape(&pairs, &key_to_col, overflow, &mut enc, &mut vals);
+        *seen.entry(enc.clone()).or_insert(0usize) += 1;
+    }
+    let mut cols: Vec<u16> = key_to_col.into_values().chain([overflow]).collect();
+    cols.sort_unstable();
+    let cell = PlanVariant::ShapeCell {
+        col: shape_col,
+        cols,
+    };
+    plan.push_variant(cell, FrontEnd::LogfmtCell { overflow });
+    for enc in frequent_layouts(seen) {
+        let s = Shape::decode(&mut Cursor::new(&enc), plan.columns.len()).expect("own encoding");
+        plan.push_variant(PlanVariant::Shape(s), FrontEnd::Logfmt);
+    }
+}
+
+/// Layouts seen in this many sample rows get a variant of their own; rarer ones are stored as
+/// shape cells.
+const MIN_LAYOUT_ROWS: usize = 2;
+/// Most layout variants one front end adds.
+const MAX_LAYOUTS: usize = 64;
+
+/// The most frequent layouts of `seen` (layout -> rows) that get a variant.
+fn frequent_layouts<K: Ord>(seen: HashMap<K, usize>) -> Vec<K> {
+    let mut v: Vec<(K, usize)> = seen
+        .into_iter()
+        .filter(|e| e.1 >= MIN_LAYOUT_ROWS)
+        .collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    v.truncate(MAX_LAYOUTS);
+    v.into_iter().map(|e| e.0).collect()
 }
 
 fn train_csv_if_tabular(rows: &[&[u8]], plan: &mut ModelPlan) -> bool {
@@ -460,16 +484,27 @@ fn train_csv_if_tabular(rows: &[&[u8]], plan: &mut ModelPlan) -> bool {
             if delim == b',' && total_spaces > probe * n_fields * 2 {
                 continue;
             }
-            let quote_mask_col = plan.add_or_get_col("$csv.qmask");
-            let mut field_cols = Vec::with_capacity(n_fields);
-            for fi in 0..n_fields {
-                field_cols.push(plan.add_or_get_col(&format!("$csv.{fi}")));
+            let shape_col = plan.add_or_get_col("$csv.shape");
+            let fields: Vec<u16> = (0..n_fields)
+                .map(|fi| plan.add_or_get_col(&format!("$csv.{fi}")))
+                .collect();
+            let mut seen = HashMap::new();
+            for (_, mask) in rows
+                .iter()
+                .filter_map(|r| split_csv_exact(r, delim, n_fields))
+            {
+                *seen.entry(mask).or_insert(0usize) += 1;
             }
-            plan.variants.push(PlanVariant::Csv(CsvSpec {
-                delim,
-                field_cols,
-                quote_mask_col,
-            }));
+            let layouts = frequent_layouts(seen);
+            let cell = PlanVariant::ShapeCell {
+                col: shape_col,
+                cols: fields.clone(),
+            };
+            plan.push_variant(cell, FrontEnd::CsvCell { delim });
+            for mask in layouts {
+                let s = csv_shape(delim, &fields, mask);
+                plan.push_variant(PlanVariant::Shape(s), FrontEnd::Csv);
+            }
             return true;
         }
     }
@@ -658,13 +693,15 @@ fn train_templates_arm<'a>(rows: &[&'a [u8]], opts: &TrainOptions, plan: &mut Mo
             slots.push(cid);
         }
 
-        let already = plan.variants.iter().any(|v| match v {
-            PlanVariant::Template(tv) => tv.literals == literals,
+        let already = plan.variants.iter().zip(&plan.fronts).any(|v| match v {
+            (PlanVariant::Shape(s), FrontEnd::Template) => s.literals == literals,
             _ => false,
         });
         if !already {
-            plan.variants
-                .push(PlanVariant::Template(TemplateVariant::new(literals, slots)));
+            plan.push_variant(
+                PlanVariant::Shape(Shape { literals, slots }),
+                FrontEnd::Template,
+            );
         }
     }
 }
@@ -778,11 +815,16 @@ fn discover_horizontal_candidates(samples: &[&[u8]], plan: &mut ModelPlan) {
     let split = split_records_with_plan(probe, plan);
     let n_cols = plan.columns.len();
 
-    let skip_col: Vec<bool> = plan
+    let mut skip_col: Vec<bool> = plan
         .columns
         .iter()
         .map(|c| c.name.starts_with("$logfmt.") || c.nested_plan.is_some())
         .collect();
+    for v in &plan.variants {
+        if let PlanVariant::ShapeCell { col, .. } = v {
+            skip_col[*col as usize] = true;
+        }
+    }
 
     let views: Vec<Vec<&[u8]>> = (0..n_cols)
         .map(|c| {
@@ -868,10 +910,9 @@ mod tests {
 
         let mut plan = ModelPlan::default();
         train_binary_stride(&rows, 16, &mut plan);
-        let Some(PlanVariant::BinaryStride(spec)) = plan.variants.last() else {
+        let Some(FrontEnd::Binary { widths }) = plan.fronts.last() else {
             panic!("no stride variant");
         };
-        let fields = spec.slices.iter().map(|&(off, w, _)| (off, w));
-        assert_eq!(fields.collect::<Vec<_>>(), [(0, 8), (8, 4), (12, 4)]);
+        assert_eq!(widths, &[8, 4, 4]);
     }
 }

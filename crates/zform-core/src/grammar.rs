@@ -1,13 +1,9 @@
-//! Unified Multi-Arm Structural Grammar (`ModelPlan`):
-//! Simultaneously routes and losslessly decomposes:
-//! - Hierarchical JSON trees (`JsonTreePlan`: recursive objects, arrays, inline constants, cross-path derivations, nested JSON-in-string)
-//! - Kubernetes CRI & Syslog envelopes (with recursive inner `ModelPlan`)
-//! - First-class `logfmt` (`key=value` with dynamic per-row layout recipes)
-//! - Rich plain-text templates (with pinned constants, context-keyed slots, and variable-word refinement)
-//! - Dialect-exact CSV/TSV
-//! - Fixed-stride binary structs (`sao`-class)
-//! - Verbatim residuals (`Variant 0`), all into **dense occurrence streams** (zero `n_rows × n_cols` sparse matrix!).
+//! Structural model (`ModelPlan`). A reader rebuilds every record from one of three variants:
+//! `Shape` (literals around column cells), `ShapeCell` (a per-row shape stored in a column) and
+//! `JsonTree`. Record syntax lives in the writer's front ends (templates, CRI and syslog
+//! prefixes, logfmt, CSV, fixed-stride binary), which split records into those variants.
 
+use crate::cells::{Col, underflow};
 use crate::codecs::BlockDecodeCtx;
 use crate::container::block_col;
 use crate::json_tree::{JsonTreeBlockReconstructor, JsonTreeBlockSplitter, JsonTreePlan};
@@ -34,7 +30,60 @@ pub struct ColumnDef {
     pub nested_plan: Option<Box<ModelPlan>>,
 }
 
-/// Plain-text template (`literals.len() == slots.len() + 1`).
+/// A record layout: `literals[0] cell literals[1] ... literals[n]`, each cell the next unread
+/// one of its slot's column.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct Shape {
+    pub literals: Vec<Vec<u8>>,
+    pub slots: Vec<u16>,
+}
+
+impl Shape {
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        put_uvarint(out, self.slots.len() as u64);
+        for l in &self.literals {
+            put_bytes(out, l);
+        }
+        for &c in &self.slots {
+            put_uvarint(out, c as u64);
+        }
+    }
+
+    /// Decodes a shape whose slots must name one of `n_cols` columns.
+    pub fn decode(cur: &mut Cursor<'_>, n_cols: usize) -> Result<Self> {
+        let n = cur.uvar()? as usize;
+        // Every literal and slot takes a byte or more, so this bounds the allocations.
+        if n > cur.remaining() / 2 {
+            return Err(Error::Format("shape slot count exceeds its bytes".into()));
+        }
+        let literals = (0..=n)
+            .map(|_| cur.bytes().map(<[u8]>::to_vec))
+            .collect::<Result<_>>()?;
+        let slots = (0..n)
+            .map(|_| match cur.uvar()? {
+                c if (c as usize) < n_cols => Ok(c as u16),
+                c => Err(Error::Format(format!("shape slot column {c} out of range"))),
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self { literals, slots })
+    }
+}
+
+/// The CRI and syslog front ends' literals around `[ts, stream, flag, inner]` and
+/// `[pri, ts, host_tag, inner]`.
+const CRI_LITS: [&[u8]; 5] = [b"", b" ", b" ", b" ", b""];
+const SYSLOG_LITS: [&[u8]; 5] = [b"", b"", b" ", b": ", b""];
+
+/// The shape an envelope front end writes over its four columns.
+pub fn envelope_shape(syslog: bool, cols: [u16; 4]) -> Shape {
+    let lits = if syslog { SYSLOG_LITS } else { CRI_LITS };
+    Shape {
+        literals: lits.iter().map(|l| l.to_vec()).collect(),
+        slots: cols.to_vec(),
+    }
+}
+
+/// Matcher for a template variant, built once: building a searcher costs more than a search.
 #[derive(Debug, Clone)]
 pub struct TemplateVariant {
     pub literals: Vec<Vec<u8>>,
@@ -42,7 +91,6 @@ pub struct TemplateVariant {
     /// Index of the longest interior literal, searched first to reject a line early; 0 if none.
     anchor_idx: usize,
     min_len: usize,
-    /// One searcher per literal, built once: building one costs more than searching a line.
     finders: Vec<Finder<'static>>,
 }
 
@@ -66,58 +114,132 @@ impl TemplateVariant {
     }
 }
 
-/// Envelope prefix wrapper (e.g. Kubernetes CRI `<ts> <stream> <tag> <inner>` or Syslog `<ts> <host> <app>: <inner>`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum EnvelopeKind {
-    /// `<iso_ts> <stdout|stderr> <F|P> <inner>`
-    KubernetesCri = 0,
-    /// `<Optional <PRI>><syslog_or_iso_ts> <host> <app_tag>: <inner>`
-    Syslog = 1,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct EnvelopeSpec {
-    pub kind: EnvelopeKind,
-    /// Prefix columns (`[ts_col, col1, col2]`) + `inner_col` (which carries a `nested_plan`!).
-    pub cols: [u16; 4],
-}
-
-#[derive(Debug, Clone)]
-pub struct LogfmtSpec {
-    /// Known key names -> `col_id`.
-    pub key_to_col: HashMap<Vec<u8>, u16>,
-    /// Stores exact per-row layout recipe (`sep + quote_flag + known/key` sequence) so key order & spacing are 100% lossless!
-    pub recipe_col: u16,
-    /// Stores values of rare/unknown keys concatenated with `\x1f` separator (or falls back to Residual if `\x1f` present).
-    pub overflow_col: u16,
-}
-
-#[derive(Debug, Clone)]
-pub struct CsvSpec {
-    pub delim: u8,
-    pub field_cols: Vec<u16>,
-    /// Per-row bitmask of quoted fields (`"..."` without interior `""` escapes; rows with `""` fall back to Residual).
-    pub quote_mask_col: u16,
-}
-
-#[derive(Debug, Clone)]
-pub struct BinaryStrideSpec {
-    pub stride: u32,
-    /// `(offset, len, col_id)` partitioning `0..stride`.
-    pub slices: Vec<(u16, u16, u16)>,
-}
-
-/// Variant tag dispatch entry (`0` is always `Residual` into column `0`).
+/// What a reader rebuilds a record with. Variant `0` is a one-slot shape over `$residual`.
 #[derive(Debug, Clone)]
 pub enum PlanVariant {
-    Residual { col: u16 },
+    Shape(Shape),
     JsonTree,
-    Envelope(EnvelopeSpec),
+    /// The next cell of `col` holds the record's shape, whose slots name only `cols`.
+    ShapeCell {
+        col: u16,
+        cols: Vec<u16>,
+    },
+}
+
+/// The writer front end that made a variant, with what it needs to route records there again.
+/// Stored as hints a reader skips.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrontEnd {
+    /// Variant 0, the JSON tree, or a hint this writer does not know.
+    None,
+    Template,
+    Cri,
+    Syslog,
+    /// Each slot is a field `width` bytes wide; the record is the fields back to back.
+    Binary {
+        widths: Vec<u16>,
+    },
+    /// A logfmt layout seen in training.
     Logfmt,
-    Template(TemplateVariant),
-    Csv(CsvSpec),
-    BinaryStride(BinaryStrideSpec),
+    /// Every other logfmt layout. The variant's other columns hold keys, a key's text being
+    /// its column's name after `logfmt.`; a value whose key has none is a cell of `overflow`.
+    LogfmtCell {
+        overflow: u16,
+    },
+    /// A CSV quote pattern seen in training.
+    Csv,
+    /// Every other CSV quote pattern; the variant's columns are the fields in order.
+    CsvCell {
+        delim: u8,
+    },
+}
+
+impl FrontEnd {
+    fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            FrontEnd::None => out.push(0),
+            FrontEnd::Template => out.push(1),
+            FrontEnd::Cri => out.push(2),
+            FrontEnd::Syslog => out.push(3),
+            FrontEnd::Binary { widths } => {
+                out.push(4);
+                put_uvars(out, widths);
+            }
+            FrontEnd::Logfmt => out.push(5),
+            FrontEnd::LogfmtCell { overflow } => {
+                out.push(6);
+                put_uvarint(out, *overflow as u64);
+            }
+            FrontEnd::Csv => out.push(7),
+            FrontEnd::CsvCell { delim } => out.extend([8, *delim]),
+        }
+    }
+
+    fn decode(cur: &mut Cursor<'_>) -> Result<Self> {
+        Ok(match cur.u8()? {
+            0 => FrontEnd::None,
+            1 => FrontEnd::Template,
+            2 => FrontEnd::Cri,
+            3 => FrontEnd::Syslog,
+            4 => FrontEnd::Binary {
+                widths: uvars(cur)?,
+            },
+            5 => FrontEnd::Logfmt,
+            6 => FrontEnd::LogfmtCell {
+                overflow: cur.uvar()? as u16,
+            },
+            7 => FrontEnd::Csv,
+            8 => FrontEnd::CsvCell { delim: cur.u8()? },
+            t => return Err(Error::Format(format!("unknown front end {t}"))),
+        })
+    }
+}
+
+fn put_uvars(out: &mut Vec<u8>, v: &[u16]) {
+    put_uvarint(out, v.len() as u64);
+    v.iter().for_each(|&x| put_uvarint(out, x as u64));
+}
+
+fn uvars(cur: &mut Cursor<'_>) -> Result<Vec<u16>> {
+    let n = cur.uvar()? as usize;
+    if n > cur.remaining() {
+        return Err(underflow());
+    }
+    (0..n).map(|_| Ok(cur.uvar()? as u16)).collect()
+}
+
+/// Writer routing built from `fronts`. A hint that does not fit its variant routes nothing.
+#[derive(Debug, Clone, Default)]
+pub struct Routes {
+    /// Template variants in variant order.
+    pub templates: Vec<(u32, TemplateVariant)>,
+    cri: Option<u32>,
+    syslog: Option<u32>,
+    /// Variant, record length, and `(offset, width, column)` of each field.
+    binary: Option<(u32, usize, Vec<(usize, usize, u16)>)>,
+    logfmt: Option<LogfmtRoute>,
+    csv: Option<CsvRoute>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LogfmtRoute {
+    /// The `ShapeCell` variant and its column.
+    cell: u32,
+    shape_col: u16,
+    overflow: u16,
+    keys: HashMap<Vec<u8>, u16>,
+    /// Encoded shape of each layout variant.
+    layouts: HashMap<Vec<u8>, u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CsvRoute {
+    cell: u32,
+    shape_col: u16,
+    delim: u8,
+    fields: Vec<u16>,
+    /// Quote mask of each layout variant.
+    layouts: HashMap<u64, u32>,
 }
 
 /// Complete, self-contained structural model embedded in `ZFM1` frames and `ZFP1` profile files.
@@ -125,10 +247,10 @@ pub enum PlanVariant {
 pub struct ModelPlan {
     pub columns: Vec<ColumnDef>,
     pub variants: Vec<PlanVariant>,
+    /// By variant.
+    pub fronts: Vec<FrontEnd>,
     pub json_tree: Option<JsonTreePlan>,
-    pub logfmt: Option<LogfmtSpec>,
-    /// Cached variant indices for fast template matching.
-    pub template_indices: Vec<u32>,
+    pub routes: Routes,
     /// The programs and tables blocks under this model name instead of carrying.
     pub library: Arc<Library>,
 }
@@ -148,21 +270,109 @@ impl ModelPlan {
                 horiz_candidates: Vec::new(),
                 nested_plan: None,
             }],
-            variants: vec![PlanVariant::Residual { col: 0 }],
+            variants: vec![PlanVariant::Shape(Shape {
+                literals: vec![Vec::new(), Vec::new()],
+                slots: vec![0],
+            })],
+            fronts: vec![FrontEnd::None],
             json_tree: None,
-            logfmt: None,
-            template_indices: Vec::new(),
+            routes: Routes::default(),
             library: Arc::default(),
         }
     }
 
+    pub fn push_variant(&mut self, v: PlanVariant, front: FrontEnd) {
+        self.variants.push(v);
+        self.fronts.push(front);
+    }
+
     pub fn rebuild_indexes(&mut self) {
-        self.template_indices.clear();
-        for (vi, v) in self.variants.iter().enumerate() {
-            if matches!(v, PlanVariant::Template(_)) {
-                self.template_indices.push(vi as u32);
+        let mut r = Routes::default();
+        for (vi, (v, front)) in self.variants.iter().zip(&self.fronts).enumerate() {
+            let (PlanVariant::ShapeCell { col, cols }, vi) = (v, vi as u32) else {
+                continue;
+            };
+            match front {
+                FrontEnd::LogfmtCell { overflow }
+                    if r.logfmt.is_none() && cols.contains(overflow) =>
+                {
+                    let keys = cols.iter().filter(|&c| c != overflow);
+                    let key = |c: u16| {
+                        let name = &self.columns[c as usize].name;
+                        name.strip_prefix("logfmt.")
+                            .unwrap_or(name)
+                            .as_bytes()
+                            .to_vec()
+                    };
+                    r.logfmt = Some(LogfmtRoute {
+                        cell: vi,
+                        shape_col: *col,
+                        overflow: *overflow,
+                        keys: keys.map(|&c| (key(c), c)).collect(),
+                        layouts: HashMap::new(),
+                    });
+                }
+                FrontEnd::CsvCell { delim }
+                    if r.csv.is_none() && (1..=62).contains(&cols.len()) =>
+                {
+                    r.csv = Some(CsvRoute {
+                        cell: vi,
+                        shape_col: *col,
+                        delim: *delim,
+                        fields: cols.clone(),
+                        layouts: HashMap::new(),
+                    });
+                }
+                _ => {}
             }
         }
+        for (vi, (v, front)) in self.variants.iter().zip(&self.fronts).enumerate() {
+            let (PlanVariant::Shape(s), vi) = (v, vi as u32) else {
+                continue;
+            };
+            let lits_are = |want: [&[u8]; 5]| s.slots.len() == 4 && s.literals == want;
+            match front {
+                FrontEnd::Template => r.templates.push((
+                    vi,
+                    TemplateVariant::new(s.literals.clone(), s.slots.clone()),
+                )),
+                FrontEnd::Cri if lits_are(CRI_LITS) => _ = r.cri.get_or_insert(vi),
+                FrontEnd::Syslog if lits_are(SYSLOG_LITS) => _ = r.syslog.get_or_insert(vi),
+                FrontEnd::Binary { widths }
+                    if r.binary.is_none()
+                        && widths.len() == s.slots.len()
+                        && s.literals.iter().all(Vec::is_empty) =>
+                {
+                    let mut off = 0usize;
+                    let fields = widths
+                        .iter()
+                        .zip(&s.slots)
+                        .map(|(&w, &c)| {
+                            off += w as usize;
+                            (off - w as usize, w as usize, c)
+                        })
+                        .collect();
+                    r.binary = Some((vi, off, fields));
+                }
+                FrontEnd::Logfmt if r.logfmt.is_some() => {
+                    let mut enc = Vec::new();
+                    s.encode(&mut enc);
+                    let lf = r.logfmt.as_mut().unwrap();
+                    lf.layouts.entry(enc).or_insert(vi);
+                }
+                FrontEnd::Csv if r.csv.is_some() => {
+                    let cs = r.csv.as_mut().unwrap();
+                    let quoted = |i: usize| s.literals.get(i).is_some_and(|l| l.ends_with(b"\""));
+                    let mask =
+                        (0..cs.fields.len()).fold(0u64, |m, i| m | u64::from(quoted(i)) << i);
+                    if csv_shape(cs.delim, &cs.fields, mask) == *s {
+                        cs.layouts.entry(mask).or_insert(vi);
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.routes = r;
         if let Some(jt) = &mut self.json_tree {
             jt.rebuild_runtime_index();
         }
@@ -222,67 +432,24 @@ impl ModelPlan {
         } else {
             out.push(0);
         }
-        if let Some(lf) = &self.logfmt {
-            out.push(1);
-            put_uvarint(out, lf.recipe_col as u64);
-            put_uvarint(out, lf.overflow_col as u64);
-            let mut pairs: Vec<(&Vec<u8>, &u16)> = lf.key_to_col.iter().collect();
-            pairs.sort_by_key(|p| *p.1);
-            put_uvarint(out, pairs.len() as u64);
-            for (k, &cid) in pairs {
-                put_bytes(out, k);
-                put_uvarint(out, cid as u64);
-            }
-        } else {
-            out.push(0);
-        }
         put_uvarint(out, self.variants.len() as u64);
         for v in &self.variants {
             match v {
-                PlanVariant::Residual { col } => {
+                PlanVariant::Shape(s) => {
                     out.push(0);
-                    put_uvarint(out, *col as u64);
+                    s.encode(out);
                 }
                 PlanVariant::JsonTree => out.push(1),
-                PlanVariant::Envelope(env) => {
-                    out.push(3);
-                    out.push(env.kind as u8);
-                    for c in env.cols {
-                        put_uvarint(out, c as u64);
-                    }
-                }
-                PlanVariant::Logfmt => out.push(4),
-                PlanVariant::Template(tv) => {
-                    out.push(5);
-                    put_uvarint(out, tv.slots.len() as u64);
-                    for l in &tv.literals {
-                        put_bytes(out, l);
-                    }
-                    for &cid in &tv.slots {
-                        put_uvarint(out, cid as u64);
-                    }
-                }
-                PlanVariant::Csv(cs) => {
-                    out.push(6);
-                    out.push(cs.delim);
-                    put_uvarint(out, cs.quote_mask_col as u64);
-                    put_uvarint(out, cs.field_cols.len() as u64);
-                    for &cid in &cs.field_cols {
-                        put_uvarint(out, cid as u64);
-                    }
-                }
-                PlanVariant::BinaryStride(bs) => {
-                    out.push(7);
-                    put_uvarint(out, bs.stride as u64);
-                    put_uvarint(out, bs.slices.len() as u64);
-                    for &(off, len, cid) in &bs.slices {
-                        put_uvarint(out, off as u64);
-                        put_uvarint(out, len as u64);
-                        put_uvarint(out, cid as u64);
-                    }
+                PlanVariant::ShapeCell { col, cols } => {
+                    out.push(2);
+                    put_uvarint(out, *col as u64);
+                    put_uvars(out, cols);
                 }
             }
         }
+        let mut hints = Vec::new();
+        self.fronts.iter().for_each(|f| f.encode(&mut hints));
+        put_bytes(out, &hints);
         self.library.encode(out);
     }
 
@@ -323,24 +490,6 @@ impl ModelPlan {
         } else {
             None
         };
-        let logfmt = if cur.u8()? != 0 {
-            let recipe_col = cur.uvar()? as u16;
-            let overflow_col = cur.uvar()? as u16;
-            let nk = cur.uvar()? as usize;
-            let mut key_to_col = HashMap::with_capacity(nk.min(4096));
-            for _ in 0..nk {
-                let k = cur.bytes()?.to_vec();
-                let cid = cur.uvar()? as u16;
-                key_to_col.insert(k, cid);
-            }
-            Some(LogfmtSpec {
-                key_to_col,
-                recipe_col,
-                overflow_col,
-            })
-        } else {
-            None
-        };
         let n_vars = cur.uvar()? as usize;
         if n_vars == 0 || n_vars > 8192 {
             return Err(Error::Format("invalid variant count".into()));
@@ -348,72 +497,44 @@ impl ModelPlan {
         let mut variants = Vec::with_capacity(n_vars);
         for _ in 0..n_vars {
             match cur.u8()? {
-                0 => variants.push(PlanVariant::Residual {
-                    col: cur.uvar()? as u16,
-                }),
+                0 => variants.push(PlanVariant::Shape(Shape::decode(cur, n_cols)?)),
                 1 => variants.push(PlanVariant::JsonTree),
-                3 => {
-                    let kind = match cur.u8()? {
-                        0 => EnvelopeKind::KubernetesCri,
-                        1 => EnvelopeKind::Syslog,
-                        x => return Err(Error::Format(format!("bad envelope kind {x}"))),
-                    };
-                    let cols = [
-                        cur.uvar()? as u16,
-                        cur.uvar()? as u16,
-                        cur.uvar()? as u16,
-                        cur.uvar()? as u16,
-                    ];
-                    variants.push(PlanVariant::Envelope(EnvelopeSpec { kind, cols }));
-                }
-                4 => variants.push(PlanVariant::Logfmt),
-                5 => {
-                    let k = cur.uvar()? as usize;
-                    let mut literals = Vec::with_capacity(k + 1);
-                    for _ in 0..=k {
-                        literals.push(cur.bytes()?.to_vec());
+                2 => {
+                    let col = cur.uvar()? as usize;
+                    let cols = uvars(cur)?;
+                    if col >= n_cols
+                        || cols
+                            .iter()
+                            .any(|&c| c as usize >= n_cols || c as usize == col)
+                    {
+                        return Err(Error::Format("ShapeCell columns out of range".into()));
                     }
-                    let mut slots = Vec::with_capacity(k);
-                    for _ in 0..k {
-                        slots.push(cur.uvar()? as u16);
-                    }
-                    variants.push(PlanVariant::Template(TemplateVariant::new(literals, slots)));
-                }
-                6 => {
-                    let delim = cur.u8()?;
-                    let quote_mask_col = cur.uvar()? as u16;
-                    let nf = cur.uvar()? as usize;
-                    let mut field_cols = Vec::with_capacity(nf);
-                    for _ in 0..nf {
-                        field_cols.push(cur.uvar()? as u16);
-                    }
-                    variants.push(PlanVariant::Csv(CsvSpec {
-                        delim,
-                        field_cols,
-                        quote_mask_col,
-                    }));
-                }
-                7 => {
-                    let stride = cur.uvar()? as u32;
-                    let ns = cur.uvar()? as usize;
-                    let mut slices = Vec::with_capacity(ns);
-                    for _ in 0..ns {
-                        slices.push((cur.uvar()? as u16, cur.uvar()? as u16, cur.uvar()? as u16));
-                    }
-                    variants.push(PlanVariant::BinaryStride(BinaryStrideSpec {
-                        stride,
-                        slices,
-                    }));
+                    variants.push(PlanVariant::ShapeCell {
+                        col: col as u16,
+                        cols,
+                    })
                 }
                 tag => return Err(Error::Format(format!("unknown PlanVariant tag {tag}"))),
             }
         }
+        // The writer stores what it cannot place in variant 0.
+        if !matches!(variants.first(), Some(PlanVariant::Shape(s))
+            if s.slots == [0] && s.literals.iter().all(Vec::is_empty))
+        {
+            return Err(Error::Format("variant 0 is not the residual shape".into()));
+        }
+        // Hints only steer a writer, so one that does not parse is dropped, not an error.
+        let mut hc = Cursor::new(cur.bytes()?);
+        let fronts = (0..n_vars)
+            .map(|_| FrontEnd::decode(&mut hc))
+            .collect::<Result<_>>()
+            .unwrap_or_else(|_| vec![FrontEnd::None; n_vars]);
         let mut plan = Self {
             columns,
             variants,
+            fronts,
             json_tree,
-            logfmt,
-            template_indices: Vec::new(),
+            routes: Routes::default(),
             library: Arc::new(Library::decode(cur)?),
         };
         plan.rebuild_indexes();
@@ -577,6 +698,39 @@ pub fn parse_logfmt_line(line: &[u8]) -> Option<Vec<LogfmtPair<'_>>> {
         }
     }
     if pairs.len() >= 2 { Some(pairs) } else { None }
+}
+
+/// Encodes the shape of a logfmt line into `out` and lists its values in `vals`. Separators,
+/// keys, `=` and quotes are literals; a key's first value fills the key's column, and any other
+/// value is a cell of `overflow`.
+pub fn logfmt_shape<'a>(
+    pairs: &[LogfmtPair<'a>],
+    keys: &HashMap<Vec<u8>, u16>,
+    overflow: u16,
+    out: &mut Vec<u8>,
+    vals: &mut Vec<(u16, &'a [u8])>,
+) {
+    out.clear();
+    vals.clear();
+    put_uvarint(out, pairs.len() as u64);
+    let mut lit = Vec::with_capacity(64);
+    for p in pairs {
+        let quote = if p.quoted { &b"\""[..] } else { b"" };
+        lit.extend_from_slice(p.sep_before);
+        lit.extend_from_slice(p.key);
+        lit.push(b'=');
+        lit.extend_from_slice(quote);
+        put_bytes(out, &lit);
+        lit.clear();
+        lit.extend_from_slice(quote);
+        let col = match keys.get(p.key) {
+            Some(&c) if !vals.iter().any(|v| v.0 == c) => c,
+            _ => overflow,
+        };
+        vals.push((col, p.val_inner));
+    }
+    put_bytes(out, &lit);
+    vals.iter().for_each(|v| put_uvarint(out, v.0 as u64));
 }
 
 // ============================================================================
@@ -924,6 +1078,19 @@ pub fn match_template<'a>(
 // 4. Dialect-Exact CSV / TSV Row Splitter
 // ============================================================================
 
+/// The shape of a CSV row whose fields `mask` marks are quoted.
+pub fn csv_shape(delim: u8, fields: &[u16], mask: u64) -> Shape {
+    let q = |i: usize| if mask >> i & 1 != 0 { &b"\""[..] } else { b"" };
+    let n = fields.len();
+    let mut literals = vec![q(0).to_vec()];
+    literals.extend((1..n).map(|i| [q(i - 1), &[delim], q(i)].concat()));
+    literals.push(q(n - 1).to_vec());
+    Shape {
+        literals,
+        slots: fields.to_vec(),
+    }
+}
+
 pub fn split_csv_exact(
     line: &[u8],
     delim: u8,
@@ -984,7 +1151,7 @@ pub fn split_csv_exact(
 // 5. Dense Occurrence Block Splitter & Streaming Block Reconstructor
 // ============================================================================
 
-/// Scratch arena holding synthesized per-row bytes (recipes, quote masks, unescaped nested JSON strings).
+/// Scratch arena holding synthesized per-row bytes (shape cells, unescaped nested JSON strings).
 #[derive(Default)]
 pub struct RowScratch {
     pub items: Vec<Vec<u8>>,
@@ -1050,40 +1217,24 @@ pub fn split_records_with_plan<'a>(records: &[&'a [u8]], plan: &ModelPlan) -> Sp
     let json_vi = plan.json_tree_variant_id();
     let mut json_splitter = plan.json_tree.as_ref().map(JsonTreeBlockSplitter::new);
 
-    let logfmt_vi = plan
-        .variants
-        .iter()
-        .position(|v| matches!(v, PlanVariant::Logfmt))
-        .map(|i| i as u32);
-    let cri_var = plan.variants.iter().enumerate().find_map(|(i, v)| match v {
-        PlanVariant::Envelope(e) if e.kind == EnvelopeKind::KubernetesCri => Some((i as u32, *e)),
-        _ => None,
-    });
-    let syslog_var = plan.variants.iter().enumerate().find_map(|(i, v)| match v {
-        PlanVariant::Envelope(e) if e.kind == EnvelopeKind::Syslog => Some((i as u32, *e)),
-        _ => None,
-    });
-    let csv_var = plan.variants.iter().enumerate().find_map(|(i, v)| match v {
-        PlanVariant::Csv(c) => Some((i as u32, c)),
-        _ => None,
-    });
-    let bin_var = plan.variants.iter().enumerate().find_map(|(i, v)| match v {
-        PlanVariant::BinaryStride(b) => Some((i as u32, b)),
-        _ => None,
-    });
+    let routes = &plan.routes;
+    let slots_of = |vi: u32| match &plan.variants[vi as usize] {
+        PlanVariant::Shape(s) => &s.slots[..],
+        _ => &[],
+    };
+    let mut shape_buf = Vec::new();
 
     // Columns holding one occurrence of each record so far.
     let mut one_each: Vec<u16> = (0..n_cols as u16).collect();
     for (r, &line) in records.iter().enumerate() {
         one_each.retain(|&c| col_occs[c as usize].len() == r);
         // 1. Fixed-Stride Binary
-        if let Some((vi, bs)) = bin_var
-            && line.len() == bs.stride as usize
+        if let Some((vi, stride, fields)) = &routes.binary
+            && line.len() == *stride
         {
-            variant_ids.push(vi);
-            for &(off, len, cid) in &bs.slices {
-                let s = off as usize;
-                col_occs[cid as usize].push(OccRef::Borrowed(&line[s..s + len as usize]));
+            variant_ids.push(*vi);
+            for &(off, len, cid) in fields {
+                col_occs[cid as usize].push(OccRef::Borrowed(&line[off..off + len]));
             }
             continue;
         }
@@ -1098,103 +1249,59 @@ pub fn split_records_with_plan<'a>(records: &[&'a [u8]], plan: &ModelPlan) -> Sp
         }
 
         // 3. Envelopes (Kubernetes CRI & Syslog)
-        if let Some((vi, env)) = cri_var
-            && let Some((ts, stream, flag, inner)) = parse_k8s_cri(line)
-        {
+        let envelope = routes
+            .cri
+            .and_then(|vi| Some((vi, parse_k8s_cri(line)?)))
+            .or_else(|| Some((routes.syslog?, parse_syslog_envelope(line)?)));
+        if let Some((vi, (a, b, c, d))) = envelope {
             variant_ids.push(vi);
-            col_occs[env.cols[0] as usize].push(OccRef::Borrowed(ts));
-            col_occs[env.cols[1] as usize].push(OccRef::Borrowed(stream));
-            col_occs[env.cols[2] as usize].push(OccRef::Borrowed(flag));
-            col_occs[env.cols[3] as usize].push(OccRef::Borrowed(inner));
-            continue;
-        }
-        if let Some((vi, env)) = syslog_var
-            && let Some((pri, ts, host_tag, inner)) = parse_syslog_envelope(line)
-        {
-            variant_ids.push(vi);
-            col_occs[env.cols[0] as usize].push(OccRef::Borrowed(pri));
-            col_occs[env.cols[1] as usize].push(OccRef::Borrowed(ts));
-            col_occs[env.cols[2] as usize].push(OccRef::Borrowed(host_tag));
-            col_occs[env.cols[3] as usize].push(OccRef::Borrowed(inner));
+            for (&cid, v) in slots_of(vi).iter().zip([a, b, c, d]) {
+                col_occs[cid as usize].push(OccRef::Borrowed(v));
+            }
             continue;
         }
 
-        // 4. `logfmt` (`key=value`)
-        if let (Some(vi), Some(lf)) = (logfmt_vi, &plan.logfmt)
+        // 4. `logfmt` (`key=value`) and 5. CSV / TSV: a layout seen in training has a variant of
+        // its own, any other is stored as a shape cell.
+        let mut layout = None;
+        if let Some(lf) = &routes.logfmt
             && let Some(pairs) = parse_logfmt_line(line)
         {
-            let mut recipe = Vec::with_capacity(pairs.len() * 8);
-            put_uvarint(&mut recipe, pairs.len() as u64);
-            let mut overflow_vals = Vec::<&[u8]>::new();
-            let mut assigned = Vec::<(u16, &[u8])>::with_capacity(pairs.len());
-            let mut ok = true;
-            for p in &pairs {
-                put_bytes(&mut recipe, p.sep_before);
-                recipe.push(u8::from(p.quoted));
-                if let Some(&cid) = lf.key_to_col.get(p.key)
-                    && !assigned.iter().any(|&(c, _)| c == cid)
-                {
-                    recipe.push(1);
-                    put_uvarint(&mut recipe, cid as u64);
-                    assigned.push((cid, p.val_inner));
-                } else {
-                    if p.val_inner.contains(&0x1f) {
-                        ok = false;
-                        break;
-                    }
-                    recipe.push(0);
-                    put_bytes(&mut recipe, p.key);
-                    overflow_vals.push(p.val_inner);
-                }
-            }
-            if ok {
-                // Push overflow flag byte (`1` if any overflow values on this row, else `0`) so dense overflow stream stays exact!
-                recipe.insert(0, u8::from(!overflow_vals.is_empty()));
-                variant_ids.push(vi);
-                let r_idx = scratch.alloc(recipe);
-                col_occs[lf.recipe_col as usize].push(OccRef::Scratch(r_idx));
-                if !overflow_vals.is_empty() {
-                    let mut ov = Vec::new();
-                    for (oi, v) in overflow_vals.iter().enumerate() {
-                        if oi > 0 {
-                            ov.push(0x1f);
-                        }
-                        ov.extend_from_slice(v);
-                    }
-                    let o_idx = scratch.alloc(ov);
-                    col_occs[lf.overflow_col as usize].push(OccRef::Scratch(o_idx));
-                }
-                for (cid, val) in assigned {
-                    col_occs[cid as usize].push(OccRef::Borrowed(val));
-                }
-                continue;
-            }
-        }
-
-        // 5. CSV / TSV Dialect
-        if let Some((vi, cs)) = csv_var
-            && let Some((cells, qmask)) = split_csv_exact(line, cs.delim, cs.field_cols.len())
+            logfmt_shape(&pairs, &lf.keys, lf.overflow, &mut shape_buf, &mut tmp_vals);
+            layout = Some((lf.layouts.get(&shape_buf).copied(), lf.cell, lf.shape_col));
+        } else if let Some(cs) = &routes.csv
+            && let Some((cells, mask)) = split_csv_exact(line, cs.delim, cs.fields.len())
         {
-            variant_ids.push(vi);
-            let q_idx = scratch.alloc(qmask.to_string().into_bytes());
-            col_occs[cs.quote_mask_col as usize].push(OccRef::Scratch(q_idx));
-            for (fi, &cid) in cs.field_cols.iter().enumerate() {
-                col_occs[cid as usize].push(OccRef::Borrowed(cells[fi]));
+            tmp_vals.clear();
+            tmp_vals.extend(cs.fields.iter().copied().zip(cells));
+            let fixed = cs.layouts.get(&mask).copied();
+            if fixed.is_none() {
+                shape_buf.clear();
+                csv_shape(cs.delim, &cs.fields, mask).encode(&mut shape_buf);
+            }
+            layout = Some((fixed, cs.cell, cs.shape_col));
+        }
+        if let Some((fixed, cell, shape_col)) = layout {
+            match fixed {
+                Some(vi) => variant_ids.push(vi),
+                None => {
+                    variant_ids.push(cell);
+                    let i = scratch.alloc(shape_buf.clone());
+                    col_occs[shape_col as usize].push(OccRef::Scratch(i));
+                }
+            }
+            for &(cid, val) in &tmp_vals {
+                col_occs[cid as usize].push(OccRef::Borrowed(val));
             }
             continue;
         }
 
         // 6. Plain-Text Templates
-        let mut matched_tpl = None;
-        for &vi in &plan.template_indices {
-            if let PlanVariant::Template(tv) = &plan.variants[vi as usize]
-                && match_template(line, tv, &mut tmp_vals)
-            {
-                matched_tpl = Some(vi);
-                break;
-            }
-        }
-        if let Some(vi) = matched_tpl {
+        let matched_tpl = routes
+            .templates
+            .iter()
+            .find(|(_, tv)| match_template(line, tv, &mut tmp_vals));
+        if let Some(&(vi, _)) = matched_tpl {
             variant_ids.push(vi);
             for &(cid, val) in &tmp_vals {
                 col_occs[cid as usize].push(OccRef::Borrowed(val));
@@ -1236,6 +1343,16 @@ pub fn split_records_with_plan<'a>(records: &[&'a [u8]], plan: &ModelPlan) -> Sp
 pub struct BlockReconstructor {
     col_pos: Vec<usize>,
     json_rec: Option<JsonTreeBlockReconstructor>,
+    cell_shapes: Vec<CellShapes>,
+}
+
+/// The shapes one `ShapeCell` column holds, each parsed once per block.
+struct CellShapes {
+    variant: u32,
+    shapes: Vec<Shape>,
+    /// By entry of a dictionary-coded column: index into `shapes` plus one, 0 until parsed.
+    by_entry: Vec<u32>,
+    by_bytes: HashMap<Vec<u8>, u32>,
 }
 
 impl BlockReconstructor {
@@ -1247,6 +1364,7 @@ impl BlockReconstructor {
         Self {
             col_pos: vec![0usize; plan.columns.len()],
             json_rec,
+            cell_shapes: Vec::new(),
         }
     }
 
@@ -1274,6 +1392,90 @@ impl BlockReconstructor {
         block_col(c, plan, ctx, budget)?.write(*p - 1, out)
     }
 
+    #[inline(always)]
+    fn emit_shape(
+        col_pos: &mut [usize],
+        s: &Shape,
+        plan: &ModelPlan,
+        ctx: &mut BlockDecodeCtx<'_>,
+        budget: &DecodeBudget,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        // Most literals are empty or one separator byte, where a memmove call costs more than
+        // the copy.
+        let lit = |out: &mut Vec<u8>, l: &[u8]| match l {
+            [] => {}
+            &[b] => out.push(b),
+            _ => out.extend_from_slice(l),
+        };
+        lit(out, &s.literals[0]);
+        for (&cid, l) in s.slots.iter().zip(&s.literals[1..]) {
+            Self::emit(col_pos, plan, ctx, budget, out, cid)?;
+            lit(out, l);
+        }
+        Ok(())
+    }
+
+    /// Reads the next cell of `col` as the shape of a row of `ShapeCell` variant `variant`:
+    /// `(cell_shapes index, shape index)`.
+    fn cell_shape(
+        &mut self,
+        (variant, col, cols): (u32, u16, &[u16]),
+        plan: &ModelPlan,
+        ctx: &mut BlockDecodeCtx<'_>,
+        budget: &DecodeBudget,
+    ) -> Result<(usize, usize)> {
+        let ci = match self.cell_shapes.iter().position(|c| c.variant == variant) {
+            Some(ci) => ci,
+            None => {
+                self.cell_shapes.push(CellShapes {
+                    variant,
+                    shapes: Vec::new(),
+                    by_entry: Vec::new(),
+                    by_bytes: HashMap::new(),
+                });
+                self.cell_shapes.len() - 1
+            }
+        };
+        let pos = self.col_pos[col as usize];
+        self.col_pos[col as usize] += 1;
+        let cs = &mut self.cell_shapes[ci];
+        let mut parse = |cell: &[u8]| -> Result<u32> {
+            let mut cur = Cursor::new(cell);
+            let s = Shape::decode(&mut cur, plan.columns.len())?;
+            if cur.remaining() != 0 || !s.slots.iter().all(|c| cols.contains(c)) {
+                return Err(Error::Format("invalid shape cell".into()));
+            }
+            cs.shapes.push(s);
+            Ok(cs.shapes.len() as u32)
+        };
+        let k = match block_col(col as usize, plan, ctx, budget)? {
+            Col::Dict { dict, ords } => {
+                let o = *ords.get(pos).ok_or_else(underflow)? as usize;
+                if cs.by_entry.len() < dict.len() {
+                    cs.by_entry.resize(dict.len(), 0);
+                }
+                if cs.by_entry[o] == 0 {
+                    cs.by_entry[o] = parse(dict.get(o).ok_or_else(underflow)?)?;
+                }
+                cs.by_entry[o]
+            }
+            other => {
+                let mut scratch = Vec::new();
+                let cell = other.get(pos, &mut scratch)?;
+                match cs.by_bytes.get(cell) {
+                    Some(&k) => k,
+                    None => {
+                        let k = parse(cell)?;
+                        cs.by_bytes.insert(cell.to_vec(), k);
+                        k
+                    }
+                }
+            }
+        };
+        Ok((ci, k as usize - 1))
+    }
+
     pub fn reconstruct_next(
         &mut self,
         variant_id: u32,
@@ -1288,8 +1490,17 @@ impl BlockReconstructor {
             .ok_or_else(|| Error::Format(format!("variant_id {variant_id} out of range")))?;
 
         match var {
-            PlanVariant::Residual { col } => {
-                Self::emit(&mut self.col_pos, plan, ctx, budget, out, *col)?;
+            PlanVariant::Shape(s) => {
+                Self::emit_shape(&mut self.col_pos, s, plan, ctx, budget, out)?
+            }
+            PlanVariant::ShapeCell { col, cols } => {
+                let (ci, si) = self.cell_shape((variant_id, *col, cols), plan, ctx, budget)?;
+                let start = out.len();
+                let s = &self.cell_shapes[ci].shapes[si];
+                Self::emit_shape(&mut self.col_pos, s, plan, ctx, budget, out)?;
+                if out.len() - start > budget.max_block_decoded_bytes {
+                    return Err(Error::BudgetExceeded("shape cell record size"));
+                }
             }
             PlanVariant::JsonTree => {
                 let jt = plan
@@ -1302,135 +1513,12 @@ impl BlockReconstructor {
                     .ok_or_else(|| Error::Format("missing JsonTreeBlockReconstructor".into()))?;
                 jr.reconstruct_row(jt, plan, ctx, &mut self.col_pos, out, budget)?;
             }
-            PlanVariant::Envelope(env) => match env.kind {
-                EnvelopeKind::KubernetesCri => {
-                    Self::emit(&mut self.col_pos, plan, ctx, budget, out, env.cols[0])?;
-                    out.push(b' ');
-                    Self::emit(&mut self.col_pos, plan, ctx, budget, out, env.cols[1])?;
-                    out.push(b' ');
-                    Self::emit(&mut self.col_pos, plan, ctx, budget, out, env.cols[2])?;
-                    out.push(b' ');
-                    Self::emit(&mut self.col_pos, plan, ctx, budget, out, env.cols[3])?;
-                }
-                EnvelopeKind::Syslog => {
-                    Self::emit(&mut self.col_pos, plan, ctx, budget, out, env.cols[0])?;
-                    Self::emit(&mut self.col_pos, plan, ctx, budget, out, env.cols[1])?;
-                    out.push(b' ');
-                    Self::emit(&mut self.col_pos, plan, ctx, budget, out, env.cols[2])?;
-                    out.extend_from_slice(b": ");
-                    Self::emit(&mut self.col_pos, plan, ctx, budget, out, env.cols[3])?;
-                }
-            },
-            PlanVariant::Logfmt => {
-                let lf = plan
-                    .logfmt
-                    .as_ref()
-                    .ok_or_else(|| Error::Format("Logfmt variant without config".into()))?;
-                let (mut recipe, mut overflow) = (Vec::new(), Vec::new());
-                Self::emit(
-                    &mut self.col_pos,
-                    plan,
-                    ctx,
-                    budget,
-                    &mut recipe,
-                    lf.recipe_col,
-                )?;
-                let mut rc = Cursor::new(&recipe);
-                let has_ov = rc.u8()? != 0;
-                let k = rc.uvar()? as usize;
-                if has_ov {
-                    Self::emit(
-                        &mut self.col_pos,
-                        plan,
-                        ctx,
-                        budget,
-                        &mut overflow,
-                        lf.overflow_col,
-                    )?;
-                }
-                let mut ov_iter = has_ov.then(|| overflow.split(|&c| c == 0x1f));
-                for _ in 0..k {
-                    let sep = rc.bytes()?;
-                    let quoted = rc.u8()? != 0;
-                    let is_known = rc.u8()? != 0;
-                    out.extend_from_slice(sep);
-                    if is_known {
-                        let cid = rc.uvar()? as u16;
-                        let col_name = &plan.columns[cid as usize].name;
-                        let key_name = col_name.strip_prefix("logfmt.").unwrap_or(col_name);
-                        out.extend_from_slice(key_name.as_bytes());
-                        out.push(b'=');
-                        if quoted {
-                            out.push(b'"');
-                        }
-                        Self::emit(&mut self.col_pos, plan, ctx, budget, out, cid)?;
-                        if quoted {
-                            out.push(b'"');
-                        }
-                    } else {
-                        let key_b = rc.bytes()?;
-                        let val = ov_iter
-                            .as_mut()
-                            .and_then(|it| it.next())
-                            .ok_or_else(|| Error::Format("Logfmt overflow value missing".into()))?;
-                        out.extend_from_slice(key_b);
-                        out.push(b'=');
-                        if quoted {
-                            out.push(b'"');
-                            out.extend_from_slice(val);
-                            out.push(b'"');
-                        } else {
-                            out.extend_from_slice(val);
-                        }
-                    }
-                }
-            }
-            PlanVariant::Template(tv) => {
-                out.extend_from_slice(&tv.literals[0]);
-                for (i, &cid) in tv.slots.iter().enumerate() {
-                    Self::emit(&mut self.col_pos, plan, ctx, budget, out, cid)?;
-                    out.extend_from_slice(&tv.literals[i + 1]);
-                }
-            }
-            PlanVariant::Csv(cs) => {
-                let mut mask_str = Vec::new();
-                Self::emit(
-                    &mut self.col_pos,
-                    plan,
-                    ctx,
-                    budget,
-                    &mut mask_str,
-                    cs.quote_mask_col,
-                )?;
-                let mask: u64 = std::str::from_utf8(&mask_str)
-                    .ok()
-                    .and_then(|m| m.parse().ok())
-                    .ok_or_else(|| Error::Format("invalid CSV quote mask".into()))?;
-                for (fi, &cid) in cs.field_cols.iter().enumerate() {
-                    if fi > 0 {
-                        out.push(cs.delim);
-                    }
-                    let quoted = (mask & (1u64 << fi)) != 0;
-                    if quoted {
-                        out.push(b'"');
-                    }
-                    Self::emit(&mut self.col_pos, plan, ctx, budget, out, cid)?;
-                    if quoted {
-                        out.push(b'"');
-                    }
-                }
-            }
-            PlanVariant::BinaryStride(bs) => {
-                for &(_off, _len, cid) in &bs.slices {
-                    Self::emit(&mut self.col_pos, plan, ctx, budget, out, cid)?;
-                }
-            }
         }
         Ok(())
     }
 
-    /// Advances occurrence cursors (`col_pos` and `json_rec.struct_pos`) across a skipped row without
-    /// touching value columns (except `lf.recipe_col` when skipping a `Logfmt` row)!
+    /// Advances occurrence cursors (`col_pos` and `json_rec.struct_pos`) across a skipped row,
+    /// reading no value column but a `ShapeCell` row's shape.
     pub fn skip_next(
         &mut self,
         variant_id: u32,
@@ -1443,8 +1531,12 @@ impl BlockReconstructor {
             .get(variant_id as usize)
             .ok_or_else(|| Error::Format(format!("variant_id {variant_id} out of range")))?;
         match var {
-            PlanVariant::Residual { col } => {
-                self.col_pos[*col as usize] += 1;
+            PlanVariant::Shape(s) => s.slots.iter().for_each(|&c| self.col_pos[c as usize] += 1),
+            PlanVariant::ShapeCell { col, cols } => {
+                let (ci, si) = self.cell_shape((variant_id, *col, cols), plan, ctx, budget)?;
+                for &c in &self.cell_shapes[ci].shapes[si].slots {
+                    self.col_pos[c as usize] += 1;
+                }
             }
             PlanVariant::JsonTree => {
                 let jt = plan
@@ -1457,59 +1549,169 @@ impl BlockReconstructor {
                     .ok_or_else(|| Error::Format("missing JsonTreeBlockReconstructor".into()))?;
                 jr.skip_row(jt, &mut self.col_pos, budget)?;
             }
-            PlanVariant::Envelope(env) => {
-                for c in env.cols {
-                    self.col_pos[c as usize] += 1;
-                }
-            }
-            PlanVariant::Logfmt => {
-                let lf = plan
-                    .logfmt
-                    .as_ref()
-                    .ok_or_else(|| Error::Format("Logfmt variant without config".into()))?;
-                let mut recipe = Vec::new();
-                Self::emit(
-                    &mut self.col_pos,
-                    plan,
-                    ctx,
-                    budget,
-                    &mut recipe,
-                    lf.recipe_col,
-                )?;
-                let mut rc = Cursor::new(&recipe);
-                let has_ov = rc.u8()? != 0;
-                let k = rc.uvar()? as usize;
-                if has_ov {
-                    self.col_pos[lf.overflow_col as usize] += 1;
-                }
-                for _ in 0..k {
-                    let _ = rc.bytes()?;
-                    let _ = rc.u8()?;
-                    if rc.u8()? != 0 {
-                        let cid = rc.uvar()? as usize;
-                        self.col_pos[cid] += 1;
-                    } else {
-                        let _ = rc.bytes()?;
-                    }
-                }
-            }
-            PlanVariant::Template(tv) => {
-                for &cid in &tv.slots {
-                    self.col_pos[cid as usize] += 1;
-                }
-            }
-            PlanVariant::Csv(cs) => {
-                self.col_pos[cs.quote_mask_col as usize] += 1;
-                for &cid in &cs.field_cols {
-                    self.col_pos[cid as usize] += 1;
-                }
-            }
-            PlanVariant::BinaryStride(bs) => {
-                for &(_off, _len, cid) in &bs.slices {
-                    self.col_pos[cid as usize] += 1;
-                }
-            }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packs::PackRegistry;
+
+    fn shape(lits: &[&[u8]], slots: &[u16]) -> Shape {
+        let literals = lits.iter().map(|l| l.to_vec()).collect();
+        Shape {
+            literals,
+            slots: slots.to_vec(),
+        }
+    }
+
+    fn cell(s: &Shape) -> Vec<u8> {
+        let mut b = Vec::new();
+        s.encode(&mut b);
+        b
+    }
+
+    fn reload(p: &ModelPlan) -> Result<ModelPlan> {
+        let mut wire = Vec::new();
+        p.encode(&mut wire);
+        ModelPlan::decode(&mut Cursor::new(&wire), 0)
+    }
+
+    /// Columns `$residual`, `a`, `b`, `$shape`, `c`; variants: residual, `a=<a> b=<b>`, cell
+    /// shapes over `a` and `b`.
+    fn plan() -> ModelPlan {
+        let mut p = ModelPlan::residual_only();
+        for name in ["a", "b", "$shape", "c"] {
+            p.add_or_get_col(name);
+        }
+        let ab = shape(&[b"a=", b" b=", b""], &[1, 2]);
+        p.push_variant(PlanVariant::Shape(ab), FrontEnd::None);
+        let cell = PlanVariant::ShapeCell {
+            col: 3,
+            cols: vec![1, 2],
+        };
+        p.push_variant(cell, FrontEnd::None);
+        reload(&p).unwrap()
+    }
+
+    /// Rebuilds rows `vids` from `cols`, skipping the rows `skip` marks.
+    fn rebuild(
+        p: &ModelPlan,
+        vids: &[u32],
+        skip: &[bool],
+        cols: &[&[&[u8]]],
+    ) -> Result<Vec<Vec<u8>>> {
+        let blobs: Vec<Vec<u8>> = cols
+            .iter()
+            .map(|c| PackRegistry::default().encode_best(c))
+            .collect();
+        let col_blobs = blobs.iter().map(|b| Some(&b[..])).collect();
+        let mut ctx = BlockDecodeCtx::new(col_blobs, vec![], None, p.library.clone());
+        let mut rec = BlockReconstructor::new(p, vec![]);
+        let budget = DecodeBudget::default();
+        let mut rows = Vec::new();
+        for (&v, &skip) in vids.iter().zip(skip) {
+            if skip {
+                rec.skip_next(v, p, &mut ctx, &budget)?;
+            } else {
+                let mut out = Vec::new();
+                rec.reconstruct_next(v, p, &mut ctx, &mut out, &budget)?;
+                rows.push(out);
+            }
+        }
+        Ok(rows)
+    }
+
+    #[test]
+    fn shape_and_shape_cell_round_trip() {
+        let p = plan();
+        let ba = cell(&shape(&[b"b=", b" a=\"", b"\""], &[2, 1]));
+        let aa = cell(&shape(&[b"", b",", b""], &[1, 1]));
+        let cols: [&[&[u8]]; 5] = [
+            &[b"x y"],
+            &[b"1", b"2", b"3", b"4", b"5"],
+            &[b"p", b"q", b"r"],
+            &[&ba, &aa, &ba],
+            &[],
+        ];
+        let vids = [1, 2, 0, 2, 2];
+        let rows = rebuild(&p, &vids, &[false; 5], &cols).unwrap();
+        let want: [&[u8]; 5] = [b"a=1 b=p", b"b=q a=\"2\"", b"x y", b"3,4", b"b=r a=\"5\""];
+        assert_eq!(rows, want);
+        // Skipping a cell row still advances the columns its shape names.
+        let skip = [false, true, false, true, false];
+        let rows = rebuild(&p, &vids, &skip, &cols).unwrap();
+        assert_eq!(rows, [want[0], want[2], want[4]]);
+    }
+
+    #[test]
+    fn rejects_bad_slots() {
+        let p = plan();
+        let mut bad = p.clone();
+        bad.push_variant(PlanVariant::Shape(shape(&[b"", b""], &[5])), FrontEnd::None);
+        assert!(reload(&bad).is_err());
+        for (col, cols) in [(9, vec![1]), (3, vec![1, 5]), (3, vec![1, 3])] {
+            let mut bad = p.clone();
+            bad.push_variant(PlanVariant::ShapeCell { col, cols }, FrontEnd::None);
+            assert!(reload(&bad).is_err());
+        }
+
+        // A cell shape may name only its variant's declared columns.
+        let own = cell(&shape(&[b"", b""], &[3]));
+        let wide = cell(&shape(&[b"", b""], &[5]));
+        let undeclared = cell(&shape(&[b"", b""], &[4]));
+        for c in [own, wide, undeclared] {
+            let cols: [&[&[u8]]; 5] = [&[], &[b"1"], &[], &[&c], &[b"z"]];
+            assert!(rebuild(&p, &[2], &[false], &cols).is_err());
+            assert!(rebuild(&p, &[2], &[true], &cols).is_err());
+        }
+    }
+
+    /// Trains on `train`, then packs `rows` and checks they come back whole; returns the variant
+    /// each row of `rows` took.
+    fn round_trip(train: &[&[u8]], rows: &[&[u8]]) -> (ModelPlan, Vec<PlanVariant>) {
+        use crate::block::{BlockOptions, decode_block, encode_block};
+        use crate::plan::TrainOptions;
+        let model = crate::block::train(train, &TrainOptions::default(), None);
+        let (bytes, fit) = encode_block(rows, &model, &BlockOptions::default());
+        assert_eq!(fit.residual_rows, 0);
+        let back = decode_block(&model, &bytes, rows.len(), &DecodeBudget::default()).unwrap();
+        assert_eq!(back, rows);
+        let split = split_records_with_plan(rows, &model);
+        let vars = split.variant_ids.iter();
+        let vars = vars.map(|&v| model.variants[v as usize].clone()).collect();
+        (model, vars)
+    }
+
+    #[test]
+    fn logfmt_new_key_order_takes_a_shape_cell() {
+        let train: Vec<Vec<u8>> = (0..8)
+            .map(|i| {
+                format!("level=info ts=2024-05-0{i}T00:00:00Z msg=\"hi {i}\" n={i}").into_bytes()
+            })
+            .collect();
+        let train: Vec<&[u8]> = train.iter().map(|r| r.as_slice()).collect();
+        let rows: [&[u8]; 3] = [
+            train[0],
+            b"msg=\"new order\" level=warn  n=7 ts=2024-05-09T00:00:00Z extra=\"a b\" n=8",
+            train[1],
+        ];
+        let (_, vars) = round_trip(&train, &rows);
+        assert!(matches!(vars[0], PlanVariant::Shape(_)));
+        assert!(matches!(vars[1], PlanVariant::ShapeCell { .. }));
+    }
+
+    #[test]
+    fn csv_new_quote_pattern_takes_a_shape_cell() {
+        let train: Vec<Vec<u8>> = (0..8)
+            .map(|i| format!("{i},name{i},\"ab\",{}", i * 3).into_bytes())
+            .collect();
+        let train: Vec<&[u8]> = train.iter().map(|r| r.as_slice()).collect();
+        let rows: [&[u8]; 2] = [b"\"9\",x,y,\"\"", train[2]];
+        let (_, vars) = round_trip(&train, &rows);
+        assert!(matches!(vars[0], PlanVariant::ShapeCell { .. }));
+        assert!(matches!(vars[1], PlanVariant::Shape(_)));
     }
 }

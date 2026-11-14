@@ -16,13 +16,12 @@ pub const INDEX_HEAD_LEN: usize = 12;
 pub const INDEX_TAIL_LEN: usize = 24;
 
 // What a block's rows are made of. A reader plans from these before it has any of the block.
+/// Variant 0, the record verbatim.
 pub const KIND_RESIDUAL: u16 = 1 << 0;
 pub const KIND_JSON: u16 = 1 << 1;
-pub const KIND_TEMPLATE: u16 = 1 << 2;
-pub const KIND_ENVELOPE: u16 = 1 << 3;
-pub const KIND_LOGFMT: u16 = 1 << 4;
-pub const KIND_CSV: u16 = 1 << 5;
-pub const KIND_BINARY: u16 = 1 << 6;
+/// Any other `Shape` variant.
+pub const KIND_SHAPE: u16 = 1 << 2;
+pub const KIND_SHAPE_CELL: u16 = 1 << 3;
 
 // ============================================================================
 // Substring filter

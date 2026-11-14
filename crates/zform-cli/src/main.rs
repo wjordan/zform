@@ -1,12 +1,14 @@
 use std::env;
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use zform::{
-    Archive, DecodeBudget, EntropyBackend, FramingSpec, PackOptions, Predicate, Profile, Stats,
-    TrainOptions, inspect_stream, logical, pack, train, train_seekable, unpack_with_budget,
+    Archive, DecodeBudget, EntropyBackend, FramingSpec, PackOptions, Predicate,
+    Profile, Stats, TrainOptions, build_dictionary, inspect_stream, logical, pack, train,
+    train_seekable, unpack_with_budget,
 };
 
 fn usage() -> &'static str {
@@ -26,7 +28,7 @@ OPTIONS:
   -o, --output <FILE>       Output path (defaults to stdout for filter commands)
   -l, --level <1..19>       Compression level (default: 3)
   --fast                    Fast preset (level 1, 4,096 training rows)
-  --best                    High-density preset (level 19, 65,536 training rows)
+  --best                    High-density preset (level 19, 65,536 training rows, file dictionary)
   --lz4                     Compress columns with LZ4 instead of zstd
   --profile <FILE.zfp>      Use (or extend on `train --extend`) a ZFP1 structural profile
   --fixed-profile           Disable online drift retraining when `--profile` is set
@@ -34,6 +36,8 @@ OPTIONS:
   --chunk-bytes <BYTES>     Streaming frame raw chunk size (default: 16777216 = 16 MiB)
   --block-bytes <BYTES>     Raw bytes per block, the unit a query reads (default: 8388608 = 8 MiB)
   --block-rows <N>          Max records per block (default: 65536)
+  --dict-bytes <BYTES>      File dictionary budget, for a file input of over one block whose text
+                            values recur across blocks (default: 0 = none; 8 MiB with --best)
   --framing <MODE>          Record framing: auto (default), lf, crlf, nul, u32le, json, stride:<N>[:<HDR>]
   --no-checksum             Omit per-frame XXH64 content checksum
   --no-index                Omit the trailing index region (`grep` / `select` need it)
@@ -192,6 +196,8 @@ fn cmd_pack(args: &[String]) -> Result<(), String> {
     let mut input: Option<&str> = None;
     let mut output: Option<&str> = None;
     let mut profile_path: Option<&str> = None;
+    let mut dict_bytes: Option<usize> = None;
+    let mut best = false;
     let mut i = 0usize;
     while i < args.len() {
         let a = args[i].as_str();
@@ -199,6 +205,15 @@ fn cmd_pack(args: &[String]) -> Result<(), String> {
             "-o" | "--output" => {
                 i += 1;
                 output = Some(args.get(i).ok_or("missing value for -o")?);
+            }
+            "--dict-bytes" => {
+                i += 1;
+                dict_bytes = Some(
+                    args.get(i)
+                        .ok_or("missing value for --dict-bytes")?
+                        .parse()
+                        .map_err(|_| "invalid --dict-bytes")?,
+                );
             }
             "-l" | "--level" => {
                 i += 1;
@@ -213,6 +228,7 @@ fn cmd_pack(args: &[String]) -> Result<(), String> {
                 opts.train.max_sample_rows = 4_096;
             }
             "--best" => {
+                best = true;
                 opts.level = 19;
                 opts.train.max_sample_rows = 65_536;
                 opts.train.max_sample_bytes = 64 << 20;
@@ -289,10 +305,38 @@ fn cmd_pack(args: &[String]) -> Result<(), String> {
     }
 
     check_not_same_file(input, output)?;
+    if let Some(p) = input.filter(|p| *p != "-") {
+        let budget = dict_bytes.unwrap_or(if best { 8 << 20 } else { 0 });
+        file_dictionary(p, &mut opts, budget)?;
+    }
     let rdr = open_input(input)?;
     let mut wtr = open_output(output)?;
     pack(rdr, &mut wtr, &opts).map_err(|e| e.to_string())?;
     wtr.flush().map_err(|e| e.to_string())
+}
+
+/// Gives `opts` a dictionary for packing the file at `path`, chosen in a pass over it, unless the
+/// file is one block or less or no text value recurs across its blocks. The profile trained to
+/// choose it is kept for the write, which then does not train its own.
+fn file_dictionary(path: &str, opts: &mut PackOptions, max_bytes: usize) -> Result<(), String> {
+    let io_err = |e: io::Error| format!("{path}: {e}");
+    let err = |e: zform::Error| format!("{path}: {e}");
+    let mut f = File::open(path).map_err(io_err)?;
+    let meta = f.metadata().map_err(io_err)?;
+    if max_bytes == 0 || !meta.is_file() || meta.len() <= opts.block_bytes as u64 {
+        return Ok(());
+    }
+    let mut trained = opts.clone();
+    if opts.profile.is_none() {
+        trained.profile = Some(train_seekable(&mut f, &opts.train, None).map_err(err)?);
+        f.seek(SeekFrom::Start(0)).map_err(io_err)?;
+    }
+    let rdr = BufReader::with_capacity(256 << 10, f);
+    if let Some(dict) = build_dictionary(rdr, &trained, max_bytes).map_err(err)? {
+        opts.profile = trained.profile;
+        opts.dictionary = Some(Arc::new(dict));
+    }
+    Ok(())
 }
 
 fn cmd_unpack(args: &[String], test_only: bool) -> Result<(), String> {

@@ -2516,14 +2516,13 @@ fn every_pack_survives_near_miss_rows() {
 }
 
 /// `vals` through move-to-front codes and back, as cells of their decimal text.
-fn mtf_roundtrip(codes: &[i64], misses: &[i64], window: u16) -> crate::wire::Result<Vec<i64>> {
+fn mtf_roundtrip(codes: &[i64], misses: &[i64]) -> crate::wire::Result<Vec<i64>> {
     let mut gb = GraphBuilder::new(codes.len());
     let codes_node = gb.add_ints(codes);
     let misses_node = gb.add_ints(misses);
     let ints = gb.push(GraphNode::MtfInts {
         codes: codes_node,
         misses: misses_node,
-        window,
     });
     let root = gb.add_prog_cells(prog_fmt_int(false, 0), vec![ints], vec![]);
     let cells = CoreDecoder::decode_bytes(&gb.finish(root).encode(), &DecodeBudget::default())?;
@@ -2535,9 +2534,9 @@ fn mtf_roundtrip(codes: &[i64], misses: &[i64], window: u16) -> crate::wire::Res
 
 #[test]
 fn recency_codes_survive_eviction_and_deep_ranks() {
-    // 300 ids over a window of 64: most repeats find their id evicted, the rest sit deep.
+    // 8,000 ids over the window: many repeats find their id evicted, the rest sit deep.
     let mut x = 0x9e37_79b9_7f4a_7c15u64;
-    let vals: Vec<i64> = (0..5000)
+    let vals: Vec<i64> = (0..30_000)
         .map(|i| {
             x ^= x << 13;
             x ^= x >> 7;
@@ -2545,21 +2544,22 @@ fn recency_codes_survive_eviction_and_deep_ranks() {
             if i % 3 == 0 {
                 (x % 8) as i64
             } else {
-                (x % 300) as i64 - 150
+                (x % 8000) as i64 - 4000
             }
         })
         .collect();
-    for window in [1, 2, 64, 4096] {
-        let (codes, misses) = mtf_split(&vals, window);
-        assert!(codes.iter().all(|&c| (0..=window as i64).contains(&c)));
-        assert_eq!(mtf_roundtrip(&codes, &misses, window as u16).unwrap(), vals);
-    }
+    let (codes, misses) = mtf_split(&vals);
+    assert!(codes.iter().all(|&c| (0..=crate::payload::graph::MTF_WINDOW as i64).contains(&c)));
+    assert!(codes.iter().any(|&c| c > 2048));
+    let evicted = misses.len() - vals.iter().collect::<std::collections::HashSet<_>>().len();
+    assert!(evicted > 1000);
+    assert_eq!(mtf_roundtrip(&codes, &misses).unwrap(), vals);
 }
 
 #[test]
 fn recency_codes_out_of_range_are_refused() {
     assert_eq!(
-        mtf_roundtrip(&[0, 1, 0, 2, 2], &[7, 9], 4).unwrap(),
+        mtf_roundtrip(&[0, 1, 0, 2, 2], &[7, 9]).unwrap(),
         [7, 7, 9, 7, 9]
     );
     // A rank past the window's contents, a negative one, and misses short or left over.
@@ -2571,7 +2571,7 @@ fn recency_codes_out_of_range_are_refused() {
         (&[0, 1], &[7, 9]),
     ] {
         assert!(
-            mtf_roundtrip(codes, misses, 4).is_err(),
+            mtf_roundtrip(codes, misses).is_err(),
             "{codes:?} {misses:?}"
         );
     }

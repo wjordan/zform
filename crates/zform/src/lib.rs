@@ -22,8 +22,8 @@ pub use zform_core::{
     CodecPack, ColumnProfile, CoreDecoder, DecodeBudget, Dictionary, DictionaryBuilder,
     EntropyBackend, Error, FrameFit,
     FramingSpec, InspectReport, ModelPlan, PackOptions, PackRegistry, PayloadGraph, Predicate,
-    Profile, ResolvedFraming, Result, StreamEncoder, TrainOptions, eval_raw_record, inspect_stream,
-    logical, pack_stream, raw_field_values,
+    Profile, ResolvedFraming, Result, StreamEncoder, TrainOptions, build_dictionary,
+    eval_raw_record, inspect_stream, logical, pack_stream, raw_field_values,
 };
 
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -1143,9 +1143,9 @@ mod tests {
         assert_eq!(session.stats.rebuilt, 0);
     }
 
-    #[test]
-    fn file_dictionary_holds_what_blocks_share() {
-        // Long values that recur across blocks and seldom within one.
+    /// 300 long values and `n` rows that each hold one, so that the values recur across blocks
+    /// and seldom within one.
+    fn shared_texts(n: usize) -> (Vec<String>, Vec<String>) {
         let mut state = 7u64;
         let mut text = || -> String {
             let words = (0..12).map(|_| {
@@ -1157,12 +1157,45 @@ mod tests {
             words.collect()
         };
         let texts: Vec<String> = (0..300).map(|_| text()).collect();
-        let rows: Vec<String> = (0..4000)
+        let rows = (0..n)
             .map(|i| {
                 let body = &texts[(i * 7919) % 300];
                 format!("{{\"id\":{i},\"svc\":\"svc{}\",\"body\":\"{body}\"}}", i % 7)
             })
             .collect();
+        (texts, rows)
+    }
+
+    #[test]
+    fn stream_packs_with_the_dictionary_it_built() {
+        // Smaller than a stream needs to beat plain zstd, which `file_dictionary_holds_what_blocks_share`
+        // measures: this checks the stream's reading and writing of a dictionary.
+        let (_, rows) = shared_texts(400);
+        let raw = rows.join("\n") + "\n";
+        let recs = lines(raw.as_bytes());
+        let profile = train(raw.as_bytes(), &TrainOptions::default(), None).unwrap();
+        let mut opts = PackOptions { block_rows: 50, profile: Some(profile), ..Default::default() };
+        let plain = assert_roundtrip(raw.as_bytes(), &opts);
+        let dict = build_dictionary(raw.as_bytes(), &opts, 1 << 20).unwrap().unwrap();
+        let mut by_record = DictionaryBuilder::new(&opts, 1 << 20).unwrap();
+        recs.iter().for_each(|r| by_record.push(r));
+        assert_eq!(dict.id(), by_record.finish().unwrap().id());
+        opts.dictionary = Some(std::sync::Arc::new(dict));
+        let with = assert_roundtrip(raw.as_bytes(), &opts);
+        let rep = inspect_stream(&with[..], &DecodeBudget::default()).unwrap();
+        assert!(rep.passthrough_frames == 0 && rep.column_bytes.iter().any(|c| c.0 == "$dictionary"));
+        assert_grep(&with, &recs, &eq("svc", "svc3"));
+
+        // Concatenated after a stream with no dictionary, and before one.
+        let cat = [&plain[..], &with, &plain].concat();
+        let mut restored = Vec::new();
+        unpack(&cat[..], &mut restored).unwrap();
+        assert!(restored == raw.repeat(3).into_bytes());
+    }
+
+    #[test]
+    fn file_dictionary_holds_what_blocks_share() {
+        let (texts, rows) = shared_texts(4000);
         let recs: Vec<&[u8]> = rows.iter().map(|r| r.as_bytes()).collect();
         let profile = train(rows.join("\n").as_bytes(), &TrainOptions::default(), None).unwrap();
         let mut opts = PackOptions {
