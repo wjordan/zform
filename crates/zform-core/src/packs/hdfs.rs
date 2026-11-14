@@ -64,45 +64,76 @@ impl RelationPack for HdfsRelations {
     }
 
     fn row_order(&self, recs: &[&[u8]]) -> Option<Vec<u32>> {
-        // A block's write pipeline rows sit together by thread id, so its relations look one row
-        // back; the other rows follow in file order.
+        // Rows sit together by block: first each block's write pipeline by thread id, so its
+        // relations look a row or two back, then each block's other rows in file order. Block
+        // ids are successive `java.util.Random` outputs, so blocks in allocation order make each
+        // new id a short step from the one before. Rows naming no block follow in file order.
         const WRITE: [&[u8]; 4] = [
             b"Receiving block",
             b"PacketResponder",
             b"addStoredBlock: blockMap",
             b"allocateBlock",
         ];
-        let mut groups = std::collections::HashMap::new();
-        let mut members: Vec<Vec<u32>> = Vec::new();
-        let mut rest = Vec::new();
+        let (mut writes, mut others, mut rest) = (Vec::new(), Vec::new(), Vec::new());
         for (i, r) in recs.iter().enumerate() {
-            let blk = WRITE
-                .iter()
-                .any(|w| memchr::memmem::find(r, w).is_some())
-                .then(|| block_token(r))
-                .flatten();
-            match blk {
-                Some(b) => {
-                    let g = *groups.entry(b).or_insert_with(|| {
-                        members.push(Vec::new());
-                        members.len() - 1
-                    });
-                    members[g].push(i as u32);
+            match block_token(r) {
+                Some(_) if WRITE.iter().any(|w| memchr::memmem::find(r, w).is_some()) => {
+                    writes.push(i as u32)
                 }
+                Some(_) => others.push(i as u32),
                 None => rest.push(i as u32),
             }
         }
-        if members.is_empty() {
+        if writes.is_empty() && others.is_empty() {
             return None;
         }
+        let (writes, others) = (by_block(recs, &writes), by_block(recs, &others));
+        let anchor = writes
+            .iter()
+            .chain(&others)
+            .find_map(|g| lcg_state(recs[g[0] as usize]));
         let mut order = Vec::with_capacity(recs.len());
-        for mut m in members {
-            m.sort_by_key(|&i| thread_id(recs[i as usize]));
-            order.extend(m);
+        for mut g in in_allocation_order(recs, writes, anchor) {
+            g.sort_by_key(|&i| thread_id(recs[i as usize]));
+            order.extend(g);
         }
+        in_allocation_order(recs, others, anchor)
+            .into_iter()
+            .for_each(|g| order.extend(g));
         order.extend(rest);
         Some(order)
     }
+}
+
+/// `rows` grouped by their first block id, groups in order of first appearance.
+fn by_block(recs: &[&[u8]], rows: &[u32]) -> Vec<Vec<u32>> {
+    let mut at = std::collections::HashMap::new();
+    let mut groups: Vec<Vec<u32>> = Vec::new();
+    for &i in rows {
+        let b = block_token(recs[i as usize]).unwrap_or_default();
+        let g = *at.entry(b).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[g].push(i);
+    }
+    groups
+}
+
+/// Groups by the step from `anchor` to their block id's generator state; ids no generator made
+/// go last.
+fn in_allocation_order(
+    recs: &[&[u8]],
+    mut groups: Vec<Vec<u32>>,
+    anchor: Option<u64>,
+) -> Vec<Vec<u32>> {
+    if let Some(anchor) = anchor {
+        groups.sort_by_cached_key(|g| match lcg_state(recs[g[0] as usize]) {
+            Some(s) => (false, JavaLcgPack::distance(anchor, s)),
+            None => (true, 0),
+        });
+    }
+    groups
 }
 
 /// The first `blk_<id>` token of a record.
@@ -112,6 +143,18 @@ fn block_token(r: &[u8]) -> Option<&[u8]> {
     let n = usize::from(tail.first() == Some(&b'-'));
     let d = tail[n..].iter().take_while(|b| b.is_ascii_digit()).count();
     (d > 0).then(|| &r[s..s + 4 + n + d])
+}
+
+/// The `java.util.Random` state behind a record's first block id.
+fn lcg_state(r: &[u8]) -> Option<u64> {
+    let t = &block_token(r)?[4..];
+    let (neg, d) = match t.strip_prefix(b"-") {
+        Some(d) => (true, d),
+        None => (false, t),
+    };
+    let v = std::str::from_utf8(d).ok()?.parse::<u64>().ok()?;
+    let v = if neg { 0i64.checked_sub_unsigned(v)? } else { i64::try_from(v).ok()? };
+    JavaLcgPack::state_of(v)
 }
 
 /// The third space-separated field of a record as a number: the logging thread in HDFS lines.
