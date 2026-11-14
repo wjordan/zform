@@ -1,0 +1,275 @@
+{
+  "date": "2026-11-14",
+  "input": {
+    "name": "BGL-full.log",
+    "bytes": 743185031,
+    "rows": 4747963,
+    "sha256": "666130b15ef44eb32fd02bd053e6c6e007c37696b5e7e8b9d8e45b729876a5d2"
+  },
+  "environment": {
+    "cpu": "AMD Ryzen 9 7900X",
+    "rustc": "1.93.0",
+    "profile": "release, opt-level=3, no target-cpu override",
+    "git_head": "6579fbb7dc8f6e8a7f280ad1f94b8efdc28987df",
+    "workspace": "Existing uncommitted core engine changes retained; source hashes recorded."
+  },
+  "method": "Sequential local warm-cache manual benchmarks without CPU pinning. Two native hybrid encode runs; other full runs once. Wall time includes process startup, input/output, parsing, checksum, all compression and archive serialization. Correctness hashing is outside measured time. Decode files were removed after verification to conserve scratch disk space. An initial decode encountered ENOSPC; the partial output matched the source prefix, was discarded, and the complete successful rerun is reported.",
+  "phase_definitions": {
+    "parse_seconds": "Read input, hash SHA256, parse/validate rows, build first-use dictionaries, select templates and numeric lanes; comparable to the Python parse_seconds boundary.",
+    "frontend_seconds": "Native parse_seconds plus topology dictionaries, metadata and xz auxiliary streams.",
+    "mixer_seconds": "Direct in-memory context mixer call, including model allocation.",
+    "clock_seconds": "Direct in-memory payload graph encoding.",
+    "seconds": "Complete process wall time as measured by the benchmark driver."
+  },
+  "implementation": [
+    "Borrowed byte-slice dictionaries and cached message tokenization over the input buffer.",
+    "memchr delimiter scanning for newlines and the first nine spaces.",
+    "Timestamp/epoch validation and run-length offsets in Rust.",
+    "Direct calls to the same Rust mixer and payload graph encoder, without column files or subprocesses.",
+    "Native archive serialization, xz dictionaries, SHA256 checking and text reconstruction."
+  ],
+  "build": "cargo build --locked --release --manifest-path bench/bgl-native/Cargo.toml",
+  "encode": "bench/bgl-native/target/release/bgl-native pack BGL.log out.bcm --hybrid",
+  "decode": "bench/bgl-native/target/release/bgl-native unpack out.bcm restored.log",
+  "summary": {
+    "native_hybrid_encode_seconds_mean": 10.417032297700644,
+    "native_parse_seconds_mean": 2.028310042,
+    "native_frontend_seconds_mean": 3.033153529,
+    "python_hybrid_encode_seconds": 17.098687348887324,
+    "python_parse_seconds": 7.85,
+    "encode_speedup": 1.6414163708277574,
+    "parse_speedup": 3.8702169971310525,
+    "encode_time_reduction_percent": 39.07700582420136,
+    "archive_bytes": 11180337,
+    "encoding_weissman_infinity": 21.048974305657296,
+    "encoding_weissman_infinity_over_gzip6": 1.7301166172581341
+  },
+  "full_runs": [
+    {
+      "name": "native_hybrid_0",
+      "seconds": 10.391400638967752,
+      "bytes": 11180337,
+      "sha256": "605074b4d61e187a2b8e4741c5931f919cba0e9d565bc748e7ce1cf9d8e2e777",
+      "report": {
+        "clock_seconds": 0.197613066,
+        "fallback_rows": 20997,
+        "frontend_seconds": 3.043807372,
+        "mixer_seconds": 7.131612444,
+        "parse_seconds": 2.029849722,
+        "rows": 4747963,
+        "seconds": 10.376218804,
+        "selected_templates": 787,
+        "sha256": "666130b15ef44eb32fd02bd053e6c6e007c37696b5e7e8b9d8e45b729876a5d2",
+        "streams": {
+          "clock": 8800049,
+          "cm": 2178654,
+          "fallback": 134384,
+          "header": 174,
+          "heads": 620,
+          "nodes": 56260,
+          "shapes": 10196
+        },
+        "total_bytes": 11180337
+      },
+      "command": [
+        "/home/will/Code/zform/bench/bgl-native/target/release/bgl-native",
+        "pack",
+        "/tmp/zform-corpus-candidates/BGL-full.log",
+        "/tmp/zform-bgl-native/hybrid.bcm",
+        "--hybrid"
+      ],
+      "identical_to": "/tmp/zform-cm-rust/hybrid.bcm"
+    },
+    {
+      "name": "native_hybrid_1",
+      "seconds": 10.442663956433535,
+      "bytes": 11180337,
+      "sha256": "605074b4d61e187a2b8e4741c5931f919cba0e9d565bc748e7ce1cf9d8e2e777",
+      "report": {
+        "clock_seconds": 0.189192333,
+        "fallback_rows": 20997,
+        "frontend_seconds": 3.022499686,
+        "mixer_seconds": 7.21050368,
+        "parse_seconds": 2.026770362,
+        "rows": 4747963,
+        "seconds": 10.426384931,
+        "selected_templates": 787,
+        "sha256": "666130b15ef44eb32fd02bd053e6c6e007c37696b5e7e8b9d8e45b729876a5d2",
+        "streams": {
+          "clock": 8800049,
+          "cm": 2178654,
+          "fallback": 134384,
+          "header": 174,
+          "heads": 620,
+          "nodes": 56260,
+          "shapes": 10196
+        },
+        "total_bytes": 11180337
+      },
+      "command": [
+        "/home/will/Code/zform/bench/bgl-native/target/release/bgl-native",
+        "pack",
+        "/tmp/zform-corpus-candidates/BGL-full.log",
+        "/tmp/zform-bgl-native/hybrid.bcm",
+        "--hybrid"
+      ],
+      "identical_to": "/tmp/zform-cm-rust/hybrid.bcm"
+    },
+    {
+      "name": "native_hybrid_decode",
+      "seconds": 8.79114529863,
+      "bytes": 743185031,
+      "sha256": "666130b15ef44eb32fd02bd053e6c6e007c37696b5e7e8b9d8e45b729876a5d2",
+      "report": {
+        "codec_seconds": 7.708066774,
+        "rows": 4747963,
+        "seconds": 8.778205849,
+        "sha256": "ok"
+      },
+      "command": [
+        "/home/will/Code/zform/bench/bgl-native/target/release/bgl-native",
+        "unpack",
+        "/tmp/zform-bgl-native/hybrid.bcm",
+        "/tmp/zform-bgl-native/hybrid.log"
+      ],
+      "identical_to": "/tmp/zform-corpus-candidates/BGL-full.log"
+    },
+    {
+      "name": "native_cm",
+      "seconds": 23.08643302693963,
+      "bytes": 10077966,
+      "sha256": "26d02cb309d23c8070002744df07703e6622d079839ba9e763496299d8e7dde6",
+      "report": {
+        "clock_seconds": 2e-08,
+        "fallback_rows": 20997,
+        "frontend_seconds": 3.001419303,
+        "mixer_seconds": 20.064515049,
+        "parse_seconds": 2.002085009,
+        "rows": 4747963,
+        "seconds": 23.069508814,
+        "selected_templates": 787,
+        "sha256": "666130b15ef44eb32fd02bd053e6c6e007c37696b5e7e8b9d8e45b729876a5d2",
+        "streams": {
+          "clock": 0,
+          "cm": 9876332,
+          "fallback": 134384,
+          "header": 174,
+          "heads": 620,
+          "nodes": 56260,
+          "shapes": 10196
+        },
+        "total_bytes": 10077966
+      },
+      "command": [
+        "/home/will/Code/zform/bench/bgl-native/target/release/bgl-native",
+        "pack",
+        "/tmp/zform-corpus-candidates/BGL-full.log",
+        "/tmp/zform-bgl-native/cm.bcm"
+      ],
+      "identical_to": "/tmp/zform-cm-rust/rust.bcm"
+    },
+    {
+      "name": "native_cm_decode",
+      "seconds": 21.61609460785985,
+      "bytes": 743185031,
+      "sha256": "666130b15ef44eb32fd02bd053e6c6e007c37696b5e7e8b9d8e45b729876a5d2",
+      "report": {
+        "codec_seconds": 20.547311844,
+        "rows": 4747963,
+        "seconds": 21.602487586,
+        "sha256": "ok"
+      },
+      "command": [
+        "/home/will/Code/zform/bench/bgl-native/target/release/bgl-native",
+        "unpack",
+        "/tmp/zform-bgl-native/cm.bcm",
+        "/tmp/zform-bgl-native/cm.log"
+      ],
+      "identical_to": "/tmp/zform-corpus-candidates/BGL-full.log"
+    },
+    {
+      "name": "python_hybrid_control",
+      "seconds": 17.098687348887324,
+      "bytes": 11180337,
+      "sha256": "605074b4d61e187a2b8e4741c5931f919cba0e9d565bc748e7ce1cf9d8e2e777",
+      "report": {
+        "total_bytes": 11180337,
+        "streams": {
+          "header": 174,
+          "cm": 2178654,
+          "nodes": 56260,
+          "heads": 620,
+          "shapes": 10196,
+          "fallback": 134384,
+          "clock": 8800049
+        },
+        "codec": {
+          "rows": 4747963,
+          "model_mb": {
+            "node.rank": 0.687509,
+            "node.within": 0.19669,
+            "node.escape": 0.207936,
+            "selector.flags": 0.040627,
+            "selector.cache": 0.011655,
+            "selector.raw": 0.004111,
+            "head": 0.003149,
+            "clock.cm": 0.0,
+            "clock.raw": 0.0,
+            "nums.flags": 0.212554,
+            "nums.cache": 0.10729,
+            "nums.value": 0.707107,
+            "total": 2.178631
+          },
+          "stream_bytes": 2178650
+        },
+        "selected_templates": 787,
+        "fallback_rows": 20997,
+        "parse_seconds": 7.85,
+        "seconds": 16.95
+      },
+      "command": [
+        "python3",
+        "bench/bgl_cm.py",
+        "pack",
+        "/tmp/zform-corpus-candidates/BGL-full.log",
+        "/tmp/zform-bgl-native/python.bcm",
+        "--bin",
+        "/tmp/zform-cm-rust/refactored",
+        "--clock-bin",
+        "target/release/examples/bgl_payload_probe"
+      ],
+      "identical_to": "/tmp/zform-bgl-native/hybrid.bcm"
+    }
+  ],
+  "gzip6_control": {
+    "seconds": 6.47386229224503,
+    "bytes": 62933217,
+    "size_source": "same source file and gzip flags as previous recorded archive; output discarded for timing"
+  },
+  "weissman": {
+    "formula": "R * log10(1 + S/(D*R)); R=raw/compressed, S=raw decimal MB/s, D=1 decimal MB/s",
+    "source": "https://cbloomrants.blogspot.com/2018/01/05-17-16-weissman-score.html"
+  },
+  "validation": [
+    "Both complete BGLCM1 and BGLCM2 archives equal their Python-driven reference archives byte-for-byte.",
+    "Both native full-file decodes reproduce the original input SHA256.",
+    "Differential synthetic archives and cross-decoding cover numeric/hex token boundaries, percent escaping, absent/empty messages, binary bytes, alternate node copies, fallback messages, final newline variants, negative epochs and changing offsets.",
+    "Invalid date/clock/epoch cases and backwards clocks rejected.",
+    "Native checks passed in 0.290s with AVX2 and 0.277s with scalar fallback; shared mixer checks passed in 0.256s, each under a one-second deadline.",
+    "Formatting and git diff whitespace checks passed."
+  ],
+  "source_sha256": {
+    "bench/bgl-native/Cargo.toml": "7c6be7bf57dda75895ece515b5e91a5cc7c2cd565ed051cf23806dd21143d57d",
+    "bench/bgl-native/Cargo.lock": "0f519f52e734710c1f65b45d156d71b7befafb7f0b5dc408a42117292a8c9aa7",
+    "bench/bgl-native/src/main.rs": "1c93355a5fe224d36037aa734136b87a9edae0fd03ac6ac01e0caf46fd6f8a64",
+    "bench/bgl-native/src/parser.rs": "2703b24148ba788e4c1e4b6aa666b3a39837c17ad100ed4866bf5315214b10a9",
+    "bench/bgl_cm.rs": "5d0b37883fbc6fe7cb4288d543753acff0345d231c80f01ff7c555fcf8f02657",
+    "bench/bgl_cm.py": "ae2733d10d4b8ba7820de60ee8dc85ed5cdc7d2e80f346875eb7302c41d3f720",
+    "bench/bgl_native_test.py": "11861e1e827e91ff261f6b6ce3351904983ab6d76269537bccbb2eb9e9317fc1",
+    "bench/bgl_cm_test.py": "f623c824107e10e6500a5f1fbb28feabbc62cabcac26022306f089198cbfe124",
+    "crates/zform-core/examples/bgl_payload_probe.rs": "926a07ca681818a91f559bab2c1b9f35c1da6673675b4482b3ce6cfa7b286394",
+    "crates/zform-core/src/payload/graph.rs": "e945a6198e10bf64081237cd559f0e8a0d902d08879756394f80dfb838c72318",
+    "crates/zform-core/src/payload/engine.rs": "46110653328920240495a159248459734722d142276452d0761c7663906c9563"
+  },
+  "binary_sha256": "4d7f0a02e02f65c2f901c46b13fbc77fb9c13b715d8d11dc93a1cf800d891a49"
+}

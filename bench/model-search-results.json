@@ -1,0 +1,953 @@
+{
+  "method": "Sequential single-thread warm-cache process runs; median times include input I/O, profile search, encoding and index. All variants use context mixing. Verify deterministic bytes, exact SHA256 roundtrips, and grep against raw records.",
+  "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.42",
+  "binary_sha256": "3d35947c10014ae3790ec0a3b430aeef8a0a5399c1c5973d70875bcd26d4ccfb",
+  "probe_sha256": "ad1162cd8f2eb8fe1635a4cf391eab9303890efd1a0043f736291173433f538f",
+  "datasets": [
+    {
+      "source": "/tmp/zform-corpus-candidates/HealthApp-full.log",
+      "raw_bytes": 23529930,
+      "raw_sha256": "d9d76ad2fb8f34ebba9ceda27d4ec9577ad7d5a3ec711f3396680e41d3f0d29c",
+      "variants": [
+        {
+          "mode": "baseline",
+          "bytes": 520781,
+          "encode_seconds": 0.9064531438052654,
+          "decode_seconds": 0.2252072636038065,
+          "encode_samples": [
+            0.9064531438052654,
+            0.8925841636955738,
+            0.9077003393322229
+          ],
+          "decode_samples": [
+            0.22480187378823757,
+            0.22828029096126556,
+            0.2252072636038065
+          ],
+          "compressed_sha256": "b283b3e978045d102442ffb5bd21791c16a22e6bc9ce91d40d23972ae3fe2860",
+          "roundtrip": true,
+          "grep": true,
+          "choices": []
+        },
+        {
+          "mode": "none",
+          "bytes": 520150,
+          "encode_seconds": 1.0234238393604755,
+          "decode_seconds": 0.22174346446990967,
+          "encode_samples": [
+            1.0234238393604755,
+            1.025292456150055,
+            1.0205193161964417
+          ],
+          "decode_samples": [
+            0.22534888610243797,
+            0.22174346446990967,
+            0.2215798106044531
+          ],
+          "compressed_sha256": "2454bf5fb4a28db4375c2a97f3ee85e0e0cae3e9e289a0fc8a7d9454c9803d16",
+          "roundtrip": true,
+          "grep": true,
+          "choices": []
+        },
+        {
+          "mode": "adaptive-fast",
+          "bytes": 420947,
+          "encode_seconds": 1.127028152346611,
+          "decode_seconds": 0.2166125513613224,
+          "encode_samples": [
+            1.1280728541314602,
+            1.127028152346611,
+            1.1231802627444267
+          ],
+          "decode_samples": [
+            0.2166125513613224,
+            0.2201937846839428,
+            0.2153858169913292
+          ],
+          "compressed_sha256": "63d5a3e8608c9a0e24ee55d304b99a689e6cc941a19b78ce5745186c510955cf",
+          "roundtrip": true,
+          "grep": true,
+          "choices": [
+            "split $int._: estimated 123285 -> 43098 bytes, 4 groups",
+            "split $int._#1: estimated 141404 -> 43469 bytes, 4 groups",
+            "split $int._#2: estimated 38255 -> 10553 bytes, 3 groups"
+          ]
+        }
+      ]
+    },
+    {
+      "source": "/tmp/zform-corpus-candidates/HealthApp-8MiB.log",
+      "raw_bytes": 8388486,
+      "raw_sha256": "3a68d9702898c428f57a1a32fd5ca3c6805b896b6ed99c5b5b3b8dd834b1ca28",
+      "variants": [
+        {
+          "mode": "baseline",
+          "bytes": 188864,
+          "encode_seconds": 0.3887884821742773,
+          "decode_seconds": 0.07927480153739452,
+          "encode_samples": [
+            0.39281465113162994,
+            0.3887884821742773,
+            0.38685064390301704
+          ],
+          "decode_samples": [
+            0.08122008107602596,
+            0.07696948572993279,
+            0.07927480153739452
+          ],
+          "compressed_sha256": "6a06a97a2dadf17d1e3d9c1ca1de31fdacbb3d172c37e68a8f85564fb5ef5acc",
+          "roundtrip": true,
+          "grep": true,
+          "choices": []
+        },
+        {
+          "mode": "none",
+          "bytes": 188864,
+          "encode_seconds": 0.39300933107733727,
+          "decode_seconds": 0.07850568741559982,
+          "encode_samples": [
+            0.39257767982780933,
+            0.39300933107733727,
+            0.3976025637239218
+          ],
+          "decode_samples": [
+            0.07887231558561325,
+            0.07836626470088959,
+            0.07850568741559982
+          ],
+          "compressed_sha256": "6a06a97a2dadf17d1e3d9c1ca1de31fdacbb3d172c37e68a8f85564fb5ef5acc",
+          "roundtrip": true,
+          "grep": true,
+          "choices": []
+        },
+        {
+          "mode": "adaptive-fast",
+          "bytes": 154104,
+          "encode_seconds": 0.45000211521983147,
+          "decode_seconds": 0.07468322478234768,
+          "encode_samples": [
+            0.44664822332561016,
+            0.45000211521983147,
+            0.45003033243119717
+          ],
+          "decode_samples": [
+            0.07468322478234768,
+            0.07524380274116993,
+            0.0730039905756712
+          ],
+          "compressed_sha256": "02542508f06f343de3dbe3958c4aa68716a312dd0d08357cd7c53297198726f7",
+          "roundtrip": true,
+          "grep": true,
+          "choices": [
+            "split $int._: estimated 42814 -> 14503 bytes, 5 groups",
+            "split $int._#1: estimated 48762 -> 14411 bytes, 5 groups",
+            "split $int._#2: estimated 12131 -> 3364 bytes, 3 groups"
+          ]
+        }
+      ]
+    },
+    {
+      "source": "/tmp/zform-gains/health-middle.log",
+      "raw_bytes": 8388551,
+      "raw_sha256": "34009263080f4fdde7a0fdca3cdec3c755998dad156109e05438aebed3059f02",
+      "variants": [
+        {
+          "mode": "baseline",
+          "bytes": 194318,
+          "encode_seconds": 0.38102580048143864,
+          "decode_seconds": 0.07681657373905182,
+          "encode_samples": [
+            0.38835371658205986,
+            0.38102580048143864,
+            0.3782168794423342
+          ],
+          "decode_samples": [
+            0.07681657373905182,
+            0.07683173194527626,
+            0.07558159157633781
+          ],
+          "compressed_sha256": "d1769723cfb34abcae07a4aa2ee18291fe542ca964e80e1c9b399529efb29aad",
+          "roundtrip": true,
+          "grep": true,
+          "choices": []
+        },
+        {
+          "mode": "none",
+          "bytes": 194318,
+          "encode_seconds": 0.38814312405884266,
+          "decode_seconds": 0.07559202238917351,
+          "encode_samples": [
+            0.3862764611840248,
+            0.38814312405884266,
+            0.3934225086122751
+          ],
+          "decode_samples": [
+            0.07513134740293026,
+            0.07559202238917351,
+            0.0758917536586523
+          ],
+          "compressed_sha256": "d1769723cfb34abcae07a4aa2ee18291fe542ca964e80e1c9b399529efb29aad",
+          "roundtrip": true,
+          "grep": true,
+          "choices": []
+        },
+        {
+          "mode": "adaptive-fast",
+          "bytes": 159063,
+          "encode_seconds": 0.4407015200704336,
+          "decode_seconds": 0.07323367893695831,
+          "encode_samples": [
+            0.44240581430494785,
+            0.4407015200704336,
+            0.4384319521486759
+          ],
+          "decode_samples": [
+            0.07308771647512913,
+            0.07554334029555321,
+            0.07323367893695831
+          ],
+          "compressed_sha256": "840b59f8b61735a9934171303b6bdb973ebfb9689bfa388782c1a003e34f9f7a",
+          "roundtrip": true,
+          "grep": true,
+          "choices": [
+            "split $int._: estimated 40519 -> 14226 bytes, 4 groups",
+            "split $int._#1: estimated 49802 -> 14088 bytes, 5 groups",
+            "split $int._#2: estimated 10232 -> 3001 bytes, 3 groups"
+          ]
+        }
+      ]
+    },
+    {
+      "source": "/tmp/zform-gains/health-tail.log",
+      "raw_bytes": 8388523,
+      "raw_sha256": "87991e81c26c8f30cd703e70955c13bc58f35d8dc3fbed945d0e9246fdabbf8c",
+      "variants": [
+        {
+          "mode": "baseline",
+          "bytes": 201595,
+          "encode_seconds": 0.3914579413831234,
+          "decode_seconds": 0.07819927483797073,
+          "encode_samples": [
+            0.39307967759668827,
+            0.3914579413831234,
+            0.38770871609449387
+          ],
+          "decode_samples": [
+            0.0779736265540123,
+            0.07819927483797073,
+            0.07872343249619007
+          ],
+          "compressed_sha256": "72440d13844f2b61ef9de6d51422fd5a3f4c0570323df64730496f6272969324",
+          "roundtrip": true,
+          "grep": true,
+          "choices": []
+        },
+        {
+          "mode": "none",
+          "bytes": 201595,
+          "encode_seconds": 0.39548507146537304,
+          "decode_seconds": 0.07730876095592976,
+          "encode_samples": [
+            0.39548507146537304,
+            0.397689089179039,
+            0.39462608844041824
+          ],
+          "decode_samples": [
+            0.07730876095592976,
+            0.07689440436661243,
+            0.07877597212791443
+          ],
+          "compressed_sha256": "72440d13844f2b61ef9de6d51422fd5a3f4c0570323df64730496f6272969324",
+          "roundtrip": true,
+          "grep": true,
+          "choices": []
+        },
+        {
+          "mode": "adaptive-fast",
+          "bytes": 167559,
+          "encode_seconds": 0.44671750627458096,
+          "decode_seconds": 0.07079970464110374,
+          "encode_samples": [
+            0.44574956595897675,
+            0.44671750627458096,
+            0.450750432908535
+          ],
+          "decode_samples": [
+            0.07079970464110374,
+            0.06982441805303097,
+            0.0709611214697361
+          ],
+          "compressed_sha256": "d5d7700efb24b8529f3f186db0873950b94e213c6b02ce7bf7895d2b2fd3437a",
+          "roundtrip": true,
+          "grep": true,
+          "choices": [
+            "split $int._: estimated 40385 -> 14752 bytes, 4 groups",
+            "split $int._#1: estimated 45721 -> 13504 bytes, 5 groups",
+            "split $int._#2: estimated 12187 -> 4212 bytes, 3 groups"
+          ]
+        }
+      ]
+    },
+    {
+      "source": "/tmp/zform-corpus-candidates/HPC-8MiB.log",
+      "raw_bytes": 8388574,
+      "raw_sha256": "a2a5aeca261f9c9e51d66e93c487b978c5c75cb904d946e17b9c5504d4f5a65f",
+      "variants": [
+        {
+          "mode": "baseline",
+          "bytes": 202602,
+          "encode_seconds": 0.25720368698239326,
+          "decode_seconds": 0.05247494950890541,
+          "encode_samples": [
+            0.25466220267117023,
+            0.25720368698239326,
+            0.25751829519867897
+          ],
+          "decode_samples": [
+            0.05247494950890541,
+            0.05180409178137779,
+            0.05347750335931778
+          ],
+          "compressed_sha256": "5527dc800562a4821ff665b958679fdb50e243ece6fdcfe32783b90567adb97e",
+          "roundtrip": true,
+          "grep": true,
+          "choices": []
+        },
+        {
+          "mode": "none",
+          "bytes": 202602,
+          "encode_seconds": 0.26100304536521435,
+          "decode_seconds": 0.05300691910088062,
+          "encode_samples": [
+            0.26015179604291916,
+            0.2618940435349941,
+            0.26100304536521435
+          ],
+          "decode_samples": [
+            0.05300691910088062,
+            0.05222039297223091,
+            0.053924595937132835
+          ],
+          "compressed_sha256": "5527dc800562a4821ff665b958679fdb50e243ece6fdcfe32783b90567adb97e",
+          "roundtrip": true,
+          "grep": true,
+          "choices": []
+        },
+        {
+          "mode": "adaptive-fast",
+          "bytes": 204358,
+          "encode_seconds": 0.2934742607176304,
+          "decode_seconds": 0.051846059039235115,
+          "encode_samples": [
+            0.2938777916133404,
+            0.29265196807682514,
+            0.2934742607176304
+          ],
+          "decode_samples": [
+            0.05198364332318306,
+            0.05048109218478203,
+            0.051846059039235115
+          ],
+          "compressed_sha256": "6440e4ab6174ff70a0b057c8d57f62e7b15f827e7c1c7753a978a15fb96c9c4c",
+          "roundtrip": true,
+          "grep": true,
+          "choices": [
+            "split $int._: estimated 9659 -> 8306 bytes, 11 groups"
+          ]
+        }
+      ]
+    },
+    {
+      "source": "/tmp/zform-corpus-candidates/BGL-8MiB.log",
+      "raw_bytes": 8388493,
+      "raw_sha256": "b7c69b9aa1b1de2eb89f66a6bb8645df9615313ce01b192a0fd481df6eb8e4c1",
+      "variants": [
+        {
+          "mode": "baseline",
+          "bytes": 191568,
+          "encode_seconds": 0.22192785516381264,
+          "decode_seconds": 0.05306766368448734,
+          "encode_samples": [
+            0.22192785516381264,
+            0.2210752945393324,
+            0.22545271180570126
+          ],
+          "decode_samples": [
+            0.05306766368448734,
+            0.051240235567092896,
+            0.05396127514541149
+          ],
+          "compressed_sha256": "27a3725559437f3803b62ee760a83717190f4fc2e537b4d58c5cf66c12430011",
+          "roundtrip": true,
+          "grep": true,
+          "choices": []
+        },
+        {
+          "mode": "none",
+          "bytes": 191568,
+          "encode_seconds": 0.22891631163656712,
+          "decode_seconds": 0.05303308926522732,
+          "encode_samples": [
+            0.22862484864890575,
+            0.2318355068564415,
+            0.22891631163656712
+          ],
+          "decode_samples": [
+            0.0515783317387104,
+            0.05303308926522732,
+            0.05338680371642113
+          ],
+          "compressed_sha256": "27a3725559437f3803b62ee760a83717190f4fc2e537b4d58c5cf66c12430011",
+          "roundtrip": true,
+          "grep": true,
+          "choices": []
+        },
+        {
+          "mode": "adaptive-fast",
+          "bytes": 191568,
+          "encode_seconds": 0.2530009113252163,
+          "decode_seconds": 0.052044669166207314,
+          "encode_samples": [
+            0.25293523631989956,
+            0.2530009113252163,
+            0.2536944467574358
+          ],
+          "decode_samples": [
+            0.052049025893211365,
+            0.05116414278745651,
+            0.052044669166207314
+          ],
+          "compressed_sha256": "27a3725559437f3803b62ee760a83717190f4fc2e537b4d58c5cf66c12430011",
+          "roundtrip": true,
+          "grep": true,
+          "choices": []
+        }
+      ]
+    },
+    {
+      "source": "/tmp/zform-corpus-candidates/Zookeeper-8MiB.log",
+      "raw_bytes": 8388536,
+      "raw_sha256": "075b66335e44fa90a69c478b6c95c0a27bf7ab630407ae3793b978d30fd5b322",
+      "variants": [
+        {
+          "mode": "baseline",
+          "bytes": 84173,
+          "encode_seconds": 0.15372594259679317,
+          "decode_seconds": 0.03668038360774517,
+          "encode_samples": [
+            0.15372594259679317,
+            0.15315055660903454,
+            0.15687359496951103
+          ],
+          "decode_samples": [
+            0.03733873553574085,
+            0.03668038360774517,
+            0.03611830435693264
+          ],
+          "compressed_sha256": "2d1acdaa9002c91ba609f10ad5ccda222a8b67d3934d90d73e23aab044c16b17",
+          "roundtrip": true,
+          "grep": true,
+          "choices": []
+        },
+        {
+          "mode": "none",
+          "bytes": 84173,
+          "encode_seconds": 0.16271578148007393,
+          "decode_seconds": 0.03698218800127506,
+          "encode_samples": [
+            0.16289590485394,
+            0.16271578148007393,
+            0.16053890623152256
+          ],
+          "decode_samples": [
+            0.03698218800127506,
+            0.03604686073958874,
+            0.03894435241818428
+          ],
+          "compressed_sha256": "2d1acdaa9002c91ba609f10ad5ccda222a8b67d3934d90d73e23aab044c16b17",
+          "roundtrip": true,
+          "grep": true,
+          "choices": []
+        },
+        {
+          "mode": "adaptive-fast",
+          "bytes": 84173,
+          "encode_seconds": 0.19119573943316936,
+          "decode_seconds": 0.03673112206161022,
+          "encode_samples": [
+            0.1922498755156994,
+            0.19119573943316936,
+            0.1903139129281044
+          ],
+          "decode_samples": [
+            0.036157017573714256,
+            0.03673112206161022,
+            0.036967869848012924
+          ],
+          "compressed_sha256": "2d1acdaa9002c91ba609f10ad5ccda222a8b67d3934d90d73e23aab044c16b17",
+          "roundtrip": true,
+          "grep": true,
+          "choices": []
+        }
+      ]
+    },
+    {
+      "source": "/tmp/claude-1000/-home-will-Code-zform/0ad4e2e0-48a0-41e9-aad4-4d627843368c/scratchpad/q/hdfs.log",
+      "raw_bytes": 8388502,
+      "raw_sha256": "beebcd35092a99be06945338fd719c6f277d7c7fa3dcb892af479c58d305cf60",
+      "variants": [
+        {
+          "mode": "baseline",
+          "bytes": 146714,
+          "encode_seconds": 0.2372292224317789,
+          "decode_seconds": 0.051113586872816086,
+          "encode_samples": [
+            0.23744255676865578,
+            0.23583444580435753,
+            0.2372292224317789
+          ],
+          "decode_samples": [
+            0.051113586872816086,
+            0.05060504004359245,
+            0.0519266240298748
+          ],
+          "compressed_sha256": "abb55fe962afcb33596a357a3946ccc653edd2237987d795209013a4c904d449",
+          "roundtrip": true,
+          "grep": true,
+          "choices": []
+        },
+        {
+          "mode": "none",
+          "bytes": 146714,
+          "encode_seconds": 0.24330810643732548,
+          "decode_seconds": 0.05098711512982845,
+          "encode_samples": [
+            0.24330810643732548,
+            0.24319034442305565,
+            0.24386554770171642
+          ],
+          "decode_samples": [
+            0.049929870292544365,
+            0.05098711512982845,
+            0.05193437077105045
+          ],
+          "compressed_sha256": "abb55fe962afcb33596a357a3946ccc653edd2237987d795209013a4c904d449",
+          "roundtrip": true,
+          "grep": true,
+          "choices": []
+        },
+        {
+          "mode": "adaptive-fast",
+          "bytes": 146714,
+          "encode_seconds": 0.2631408926099539,
+          "decode_seconds": 0.050596004351973534,
+          "encode_samples": [
+            0.2631408926099539,
+            0.26103686168789864,
+            0.26388787664473057
+          ],
+          "decode_samples": [
+            0.05240657739341259,
+            0.050596004351973534,
+            0.05006302520632744
+          ],
+          "compressed_sha256": "abb55fe962afcb33596a357a3946ccc653edd2237987d795209013a4c904d449",
+          "roundtrip": true,
+          "grep": true,
+          "choices": []
+        }
+      ]
+    }
+  ],
+  "screening": {
+    "unconditional_partitioning": [
+      {
+        "name": "hdfs",
+        "source": "/tmp/claude-1000/-home-will-Code-zform/0ad4e2e0-48a0-41e9-aad4-4d627843368c/scratchpad/q/hdfs.log",
+        "mode": "block",
+        "bytes": 159496,
+        "seconds": 0.2539314329624176,
+        "roundtrip": true
+      },
+      {
+        "name": "hdfs",
+        "source": "/tmp/claude-1000/-home-will-Code-zform/0ad4e2e0-48a0-41e9-aad4-4d627843368c/scratchpad/q/hdfs.log",
+        "mode": "numbers",
+        "bytes": 167776,
+        "seconds": 0.2311196569353342,
+        "roundtrip": true
+      },
+      {
+        "name": "health",
+        "source": "/tmp/zform-corpus-candidates/HealthApp-8MiB.log",
+        "mode": "body",
+        "bytes": 172193,
+        "seconds": 0.3738037906587124,
+        "roundtrip": true
+      },
+      {
+        "name": "health",
+        "source": "/tmp/zform-corpus-candidates/HealthApp-8MiB.log",
+        "mode": "numbers",
+        "bytes": 275541,
+        "seconds": 0.3669168744236231,
+        "roundtrip": true
+      },
+      {
+        "name": "health",
+        "source": "/tmp/zform-corpus-candidates/HealthApp-8MiB.log",
+        "mode": "all",
+        "bytes": 275541,
+        "seconds": 0.368321156129241,
+        "roundtrip": true
+      },
+      {
+        "name": "hpc",
+        "source": "/tmp/zform-corpus-candidates/HPC-8MiB.log",
+        "mode": "numbers",
+        "bytes": 244200,
+        "seconds": 0.22071839310228825,
+        "roundtrip": true
+      },
+      {
+        "name": "hpc",
+        "source": "/tmp/zform-corpus-candidates/HPC-8MiB.log",
+        "mode": "all",
+        "bytes": 244314,
+        "seconds": 0.21976712346076965,
+        "roundtrip": true
+      },
+      {
+        "name": "zoo",
+        "source": "/tmp/zform-corpus-candidates/Zookeeper-8MiB.log",
+        "mode": "clock",
+        "bytes": 131049,
+        "seconds": 0.15990350767970085,
+        "roundtrip": true
+      },
+      {
+        "name": "zoo",
+        "source": "/tmp/zform-corpus-candidates/Zookeeper-8MiB.log",
+        "mode": "numbers",
+        "bytes": 143819,
+        "seconds": 0.16352755576372147,
+        "roundtrip": true
+      },
+      {
+        "name": "zoo",
+        "source": "/tmp/zform-corpus-candidates/Zookeeper-8MiB.log",
+        "mode": "all",
+        "bytes": 145947,
+        "seconds": 0.15966639667749405,
+        "roundtrip": true
+      },
+      {
+        "name": "bgl",
+        "source": "/tmp/zform-corpus-candidates/BGL-8MiB.log",
+        "mode": "clock",
+        "bytes": 203015,
+        "seconds": 0.22039759159088135,
+        "roundtrip": true
+      },
+      {
+        "name": "bgl",
+        "source": "/tmp/zform-corpus-candidates/BGL-8MiB.log",
+        "mode": "numbers",
+        "bytes": 238016,
+        "seconds": 0.2466681394726038,
+        "roundtrip": true
+      }
+    ],
+    "exhaustive_partition_search": [
+      {
+        "sample": "health-head",
+        "source": "/tmp/zform-corpus-candidates/HealthApp-8MiB.log",
+        "raw_sha256": "3a68d9702898c428f57a1a32fd5ca3c6805b896b6ed99c5b5b3b8dd834b1ca28",
+        "bytes": 153992,
+        "encode_seconds": 2.340946802869439,
+        "decode_seconds": 0.07438233308494091,
+        "choices": [
+          "split $int._: 20021 -> 7256 bytes, 5 groups",
+          "split $int._#1: 22639 -> 5277 bytes, 4 groups",
+          "split $int._#2: 4037 -> 1711 bytes, 3 groups"
+        ],
+        "exact": true
+      },
+      {
+        "sample": "health-middle",
+        "source": "/tmp/zform-gains/health-middle.log",
+        "raw_sha256": "34009263080f4fdde7a0fdca3cdec3c755998dad156109e05438aebed3059f02",
+        "bytes": 159002,
+        "encode_seconds": 2.735582150518894,
+        "decode_seconds": 0.07440380193293095,
+        "choices": [
+          "split $int._: 21536 -> 7013 bytes, 4 groups",
+          "split $int._#1: 22688 -> 5295 bytes, 4 groups",
+          "split $int._#2: 4607 -> 1734 bytes, 3 groups"
+        ],
+        "exact": true
+      },
+      {
+        "sample": "health-tail",
+        "source": "/tmp/zform-gains/health-tail.log",
+        "raw_sha256": "87991e81c26c8f30cd703e70955c13bc58f35d8dc3fbed945d0e9246fdabbf8c",
+        "bytes": 167528,
+        "encode_seconds": 2.5574499182403088,
+        "decode_seconds": 0.07014331594109535,
+        "choices": [
+          "split $int._: 20591 -> 7714 bytes, 4 groups",
+          "split $int._#1: 21955 -> 5512 bytes, 4 groups",
+          "split $int._#2: 4909 -> 1962 bytes, 3 groups"
+        ],
+        "exact": true
+      },
+      {
+        "sample": "health-full",
+        "source": "/tmp/zform-corpus-candidates/HealthApp-full.log",
+        "raw_sha256": "d9d76ad2fb8f34ebba9ceda27d4ec9577ad7d5a3ec711f3396680e41d3f0d29c",
+        "bytes": 420947,
+        "encode_seconds": 8.501569600775838,
+        "decode_seconds": 0.21883160434663296,
+        "choices": [
+          "split $int._: 57091 -> 16708 bytes, 4 groups",
+          "split $int._#1: 56204 -> 11209 bytes, 4 groups",
+          "split $int._#2: 11229 -> 3384 bytes, 3 groups"
+        ],
+        "exact": true
+      },
+      {
+        "sample": "hdfs",
+        "source": "/tmp/claude-1000/-home-will-Code-zform/0ad4e2e0-48a0-41e9-aad4-4d627843368c/scratchpad/q/hdfs.log",
+        "raw_sha256": "beebcd35092a99be06945338fd719c6f277d7c7fa3dcb892af479c58d305cf60",
+        "bytes": 143100,
+        "encode_seconds": 0.5873102117329836,
+        "decode_seconds": 0.049445321783423424,
+        "choices": [
+          "split $int._lvl: 16384 -> 12841 bytes, 3 groups"
+        ],
+        "exact": true
+      },
+      {
+        "sample": "hpc",
+        "source": "/tmp/zform-corpus-candidates/HPC-8MiB.log",
+        "raw_sha256": "a2a5aeca261f9c9e51d66e93c487b978c5c75cb904d946e17b9c5504d4f5a65f",
+        "bytes": 200069,
+        "encode_seconds": 0.5445883721113205,
+        "decode_seconds": 0.0490182600915432,
+        "choices": [
+          "split $int._#2: 3176 -> 1878 bytes, 2 groups",
+          "split $int._#3: 1331 -> 179 bytes, 2 groups"
+        ],
+        "exact": true
+      },
+      {
+        "sample": "zoo",
+        "source": "/tmp/zform-corpus-candidates/Zookeeper-8MiB.log",
+        "raw_sha256": "075b66335e44fa90a69c478b6c95c0a27bf7ab630407ae3793b978d30fd5b322",
+        "bytes": 84173,
+        "encode_seconds": 0.347525155171752,
+        "decode_seconds": 0.035223811864852905,
+        "choices": [],
+        "exact": true
+      },
+      {
+        "sample": "bgl",
+        "source": "/tmp/zform-corpus-candidates/BGL-8MiB.log",
+        "raw_sha256": "b7c69b9aa1b1de2eb89f66a6bb8645df9615313ce01b192a0fd481df6eb8e4c1",
+        "bytes": 196964,
+        "encode_seconds": 1.2238019742071629,
+        "decode_seconds": 0.05691636726260185,
+        "choices": [
+          "split $int._c_j__u: 7311 -> 6394 bytes, 2 groups",
+          "split $int._c_j__u#1: 7311 -> 6398 bytes, 2 groups"
+        ],
+        "exact": true
+      }
+    ],
+    "clock_registration": [
+      {
+        "name": "BGL-8MiB.log",
+        "baseline": 191568,
+        "clock": 180530,
+        "report": "bytes=180530 seconds=0.250939\n"
+      },
+      {
+        "name": "BGL-middle-8MiB.log",
+        "baseline": 146273,
+        "clock": 136353,
+        "report": "bytes=136353 seconds=0.199301\n"
+      },
+      {
+        "name": "BGL-tail-8MiB.log",
+        "baseline": 231010,
+        "clock": 227937,
+        "report": "bytes=227937 seconds=0.186952\n"
+      }
+    ],
+    "health_header_and_clock": [
+      {
+        "sample": "head",
+        "source": "/tmp/zform-corpus-candidates/HealthApp-8MiB.log",
+        "mode": "base",
+        "raw_bytes": 8388486,
+        "raw_sha256": "3a68d9702898c428f57a1a32fd5ca3c6805b896b6ed99c5b5b3b8dd834b1ca28",
+        "bytes": 188864,
+        "encode_seconds": 0.4066907651722431,
+        "decode_seconds": 0.07825155556201935,
+        "exact": true
+      },
+      {
+        "sample": "head",
+        "source": "/tmp/zform-corpus-candidates/HealthApp-8MiB.log",
+        "mode": "split",
+        "raw_bytes": 8388486,
+        "raw_sha256": "3a68d9702898c428f57a1a32fd5ca3c6805b896b6ed99c5b5b3b8dd834b1ca28",
+        "bytes": 172193,
+        "encode_seconds": 0.37116379849612713,
+        "decode_seconds": 0.07302572019398212,
+        "exact": true
+      },
+      {
+        "sample": "head",
+        "source": "/tmp/zform-corpus-candidates/HealthApp-8MiB.log",
+        "mode": "clock_split",
+        "raw_bytes": 8388486,
+        "raw_sha256": "3a68d9702898c428f57a1a32fd5ca3c6805b896b6ed99c5b5b3b8dd834b1ca28",
+        "bytes": 163742,
+        "encode_seconds": 0.36343033984303474,
+        "decode_seconds": 0.07888876833021641,
+        "exact": true
+      },
+      {
+        "sample": "middle",
+        "source": "/tmp/zform-gains/health-middle.log",
+        "mode": "base",
+        "raw_bytes": 8388551,
+        "raw_sha256": "34009263080f4fdde7a0fdca3cdec3c755998dad156109e05438aebed3059f02",
+        "bytes": 194318,
+        "encode_seconds": 0.3928986433893442,
+        "decode_seconds": 0.07641378790140152,
+        "exact": true
+      },
+      {
+        "sample": "middle",
+        "source": "/tmp/zform-gains/health-middle.log",
+        "mode": "split",
+        "raw_bytes": 8388551,
+        "raw_sha256": "34009263080f4fdde7a0fdca3cdec3c755998dad156109e05438aebed3059f02",
+        "bytes": 178379,
+        "encode_seconds": 0.3671356923878193,
+        "decode_seconds": 0.07248164340853691,
+        "exact": true
+      },
+      {
+        "sample": "middle",
+        "source": "/tmp/zform-gains/health-middle.log",
+        "mode": "clock_split",
+        "raw_bytes": 8388551,
+        "raw_sha256": "34009263080f4fdde7a0fdca3cdec3c755998dad156109e05438aebed3059f02",
+        "bytes": 174104,
+        "encode_seconds": 0.36041702702641487,
+        "decode_seconds": 0.08175407722592354,
+        "exact": true
+      },
+      {
+        "sample": "tail",
+        "source": "/tmp/zform-gains/health-tail.log",
+        "mode": "base",
+        "raw_bytes": 8388523,
+        "raw_sha256": "87991e81c26c8f30cd703e70955c13bc58f35d8dc3fbed945d0e9246fdabbf8c",
+        "bytes": 201595,
+        "encode_seconds": 0.39331607706844807,
+        "decode_seconds": 0.07819324359297752,
+        "exact": true
+      },
+      {
+        "sample": "tail",
+        "source": "/tmp/zform-gains/health-tail.log",
+        "mode": "split",
+        "raw_bytes": 8388523,
+        "raw_sha256": "87991e81c26c8f30cd703e70955c13bc58f35d8dc3fbed945d0e9246fdabbf8c",
+        "bytes": 186843,
+        "encode_seconds": 0.3689521085470915,
+        "decode_seconds": 0.0699288584291935,
+        "exact": true
+      },
+      {
+        "sample": "tail",
+        "source": "/tmp/zform-gains/health-tail.log",
+        "mode": "clock_split",
+        "raw_bytes": 8388523,
+        "raw_sha256": "87991e81c26c8f30cd703e70955c13bc58f35d8dc3fbed945d0e9246fdabbf8c",
+        "bytes": 189307,
+        "encode_seconds": 0.36740509420633316,
+        "decode_seconds": 0.0857423972338438,
+        "exact": true
+      },
+      {
+        "sample": "full",
+        "source": "/tmp/zform-corpus-candidates/HealthApp-full.log",
+        "mode": "base",
+        "raw_bytes": 23529930,
+        "raw_sha256": "d9d76ad2fb8f34ebba9ceda27d4ec9577ad7d5a3ec711f3396680e41d3f0d29c",
+        "bytes": 520781,
+        "encode_seconds": 0.8935277629643679,
+        "decode_seconds": 0.22357218340039253,
+        "exact": true
+      },
+      {
+        "sample": "full",
+        "source": "/tmp/zform-corpus-candidates/HealthApp-full.log",
+        "mode": "split",
+        "raw_bytes": 23529930,
+        "raw_sha256": "d9d76ad2fb8f34ebba9ceda27d4ec9577ad7d5a3ec711f3396680e41d3f0d29c",
+        "bytes": 469326,
+        "encode_seconds": 0.9536031801253557,
+        "decode_seconds": 0.2132711447775364,
+        "exact": true
+      },
+      {
+        "sample": "full",
+        "source": "/tmp/zform-corpus-candidates/HealthApp-full.log",
+        "mode": "clock_split",
+        "raw_bytes": 23529930,
+        "raw_sha256": "d9d76ad2fb8f34ebba9ceda27d4ec9577ad7d5a3ec711f3396680e41d3f0d29c",
+        "bytes": 471955,
+        "encode_seconds": 0.9554241839796305,
+        "decode_seconds": 0.2292019985616207,
+        "exact": true
+      }
+    ]
+  },
+  "limitations": [
+    "Prototype reads and splits the whole input before encoding with a fixed profile; not integrated into the streaming trainer.",
+    "Sampled column costs omit existing peer derivation savings and approximate metadata. HPC grew 0.87%; production selection must compare complete block graphs.",
+    "Clock/header and exhaustive-search screening used single-run timings; final sampled partition results use three-run medians."
+  ],
+  "source_sha256": {
+    "crates/zform-core/examples/partition_probe.rs": "c68845e47e44de251db4284f69b3d26b47183a9d78a3311b2f935ea4efa48d7d",
+    "bench/model_search.py": "0edd13ed163c7a59db704c2b4eeb8a17870910deb85e503f7b54a122a124822c"
+  },
+  "older_reader_full_health_roundtrip": true,
+  "health_gzip_comparison": {
+    "command": "gzip -6 -c HealthApp-full.log",
+    "bytes": 2296537,
+    "encode_seconds": 0.1862212624400854,
+    "encode_samples": [
+      0.20216835476458073,
+      0.1862212624400854,
+      0.18450134061276913
+    ],
+    "raw_bytes": 23529930,
+    "raw_sha256": "d9d76ad2fb8f34ebba9ceda27d4ec9577ad7d5a3ec711f3396680e41d3f0d29c",
+    "roundtrip": true,
+    "prototype_bytes": 420947,
+    "prototype_encode_seconds": 1.127028152346611,
+    "gzip_compression_ratio": 10.245831005553145,
+    "prototype_compression_ratio": 55.89760706217172,
+    "size_gain_over_gzip": 5.455644059703478,
+    "prior_size_gain_over_gzip": 4.4097941361147965,
+    "size_reduction_from_gzip_percent": 81.67035845710302,
+    "standard_weissman_alpha1_milliseconds": 4.057908388829677
+  }
+}

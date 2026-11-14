@@ -1,0 +1,154 @@
+{
+  "dataset": {
+    "name": "Loghub BGL, full original file",
+    "source": "https://zenodo.org/records/8196385/files/BGL.zip",
+    "archive_md5": "4452953c470f2d95fcb32d5f6e733f7a",
+    "raw_bytes": 743185031,
+    "raw_sha256": "666130b15ef44eb32fd02bd053e6c6e007c37696b5e7e8b9d8e45b729876a5d2",
+    "records": 4747963,
+    "reference": "https://github.com/logpai/loghub/tree/master/BGL"
+  },
+  "goal": {
+    "target_bytes": 10590000,
+    "encoding": "medium/fast; zstd level 9 used for the joint prototype",
+    "target_met": false,
+    "remaining_bytes": 1075048
+  },
+  "measurements": [
+    {
+      "encoder": "bgl baseline",
+      "level": 9,
+      "block_mib": 32,
+      "bytes": 14005946,
+      "encode_seconds": 22.711674880236387,
+      "provenance": "existing bench/bgl-results.json"
+    },
+    {
+      "encoder": "bgl --combined-clock",
+      "level": 3,
+      "block_mib": 8,
+      "bytes": 14144055,
+      "encode_seconds": 13.834,
+      "roundtrip_verified_with_existing_reader": true
+    },
+    {
+      "encoder": "bgl --combined-clock",
+      "level": 9,
+      "block_mib": 32,
+      "bytes": 13410839,
+      "encode_seconds": 24.212,
+      "roundtrip_verified_with_existing_reader": true
+    },
+    {
+      "encoder": "bgl_joint.py",
+      "level": 9,
+      "scope": "whole file, with 200000-row context-clock blocks",
+      "bytes": 11665048,
+      "encode_seconds": 33.7955535966903,
+      "decode_seconds": 12.274583980441093,
+      "encode_mb_per_second": 21.99061568480365,
+      "roundtrip_sha256": "666130b15ef44eb32fd02bd053e6c6e007c37696b5e7e8b9d8e45b729876a5d2",
+      "relative_reduction_from_baseline": 0.16713601494679475
+    }
+  ],
+  "joint_archive_parts": {
+    "manifest": 54114,
+    "selector": 421893,
+    "numeric": 1250713,
+    "fallback": 381332,
+    "offsets": 1622,
+    "present": 2860,
+    "header": 1383550,
+    "clock": 8168222
+  },
+  "joint_models": [
+    "Message numeric lanes are specific to templates, with literal spelling and decimal/hex width preserved.",
+    "Parameters can be stably grouped by source node; the decoder derives the permutation from the header and template selector.",
+    "A parameter can store a residual of an earlier parameter or of its last value on the same source node.",
+    "Ordered microsecond clock gaps use 10 literal low bits, adaptive arithmetic coding of the high part conditioned on the previous gap and source equality, and a sparse overflow stream.",
+    "Epoch seconds and dotted dates are reconstructed from the clock; timezone offsets and the presence of an empty message separator are stored explicitly."
+  ],
+  "probes": {
+    "memory_error_parameters": {
+      "rows": 185266,
+      "plain_bytes": 354246,
+      "grouped_by_node_bytes": 78411,
+      "scope": "numeric lane buffers, zstd 9; excludes template/header costs"
+    },
+    "kernel_exception_parameters": {
+      "rows": 20896,
+      "plain_bytes": 223900,
+      "related_lane_bytes": 103176,
+      "scope": "numeric lane buffers, zstd 9; excludes template/header costs"
+    },
+    "larger_training_model": {
+      "templates_budget": 1024,
+      "training_rows": 65536,
+      "bytes": 14032523,
+      "result": "slightly larger than baseline"
+    },
+    "factored_nodes": {
+      "incremental_saving_bytes": 26749,
+      "result": "rejected: about six additional seconds for 0.2 percent overall"
+    },
+    "core_id_to_node_affine_bits": {
+      "plain_core_node_lane_bytes": 238202,
+      "residual_plus_models_bytes": 153395,
+      "result": "about 85 KB, insufficient for the target; not integrated"
+    },
+    "event_transition_predictor": {
+      "plain_selector_bytes": 422210,
+      "prediction_stream_and_table_bytes": 370788,
+      "result": "about 51 KB; not integrated"
+    },
+    "periodic_clock_predictors": {
+      "lags_tested": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        8,
+        12,
+        16,
+        24,
+        32,
+        64
+      ],
+      "result": "all larger than first-order clock gaps in the byte-plane probe"
+    },
+    "low_clock_bits": {
+      "bits": 10,
+      "empirical_entropy_bits_per_value": 9.999182938480995,
+      "qualification": "marginal entropy is not an information-theoretic lower bound; it does not rule out conditional predictors"
+    }
+  },
+  "limitations": [
+    "The .bgj wrapper is an experimental reference codec, not a supported zform format.",
+    "It buffers the full corpus, shares message models across the entire file, and has no message query index; the header subarchive retains its standard index.",
+    "Whole-file grouping changes random-access costs and memory use. These results do not establish the same gain for independently decodable 32 MiB blocks.",
+    "Timings are single runs including preprocessing and file I/O, excluding compilation. Baseline timing is the earlier measurement, not an interleaved speed benchmark."
+  ],
+  "checks": {
+    "core_release_tests_passed": 171,
+    "core_ignored_existing_benchmark": 1,
+    "bgl_example_tests_passed": 1,
+    "full_joint_roundtrip": true,
+    "fixture": "Empty messages with/without separator, zero padding, mixed-case/large hex literals, and unterminated final line roundtrip; each command under one second.",
+    "context_codec": "200003 rows cross a block boundary, with zero gaps and large jumps; truncated input rejected. Entire check under one second.",
+    "cpp_warnings": "-Wall -Wextra -Werror clean",
+    "python_lint": "ruff E4,E7,E9,F,I clean",
+    "diff_check": true
+  },
+  "artifacts": {
+    "archive": "/tmp/zform-bgl-structure/full-joint.bgj",
+    "work_directory": "/tmp/zform-bgl-structure"
+  },
+  "source_sha256": {
+    "bench/bgl_joint.py": "1f8335878e375d9cc961845c2d9e3228b5b5d23ef60e4e1e7b09bc01a130095b",
+    "bench/bgl_context.cpp": "368981fbc8950bc82e889caa630ecef7fbad2b32c2e05cddf88ee6ab141ed0db",
+    "crates/zform-core/examples/bgl.rs": "a2fe26439a9ee88ff610a3be08fe9c5e97d2659be37c8740f1af0fbf8179aab6",
+    "crates/zform-core/src/packs/bgl.rs": "fa0eb4e94b0799da987633ad4bf2c9e973274e91d8d86e939b2c13d7ecb02a78",
+    "crates/zform-core/src/packs.rs": "86ee995b4e0430df54da5c700cec448443d0c1bc66c6511a99cdd4c7be75b7dd"
+  }
+}

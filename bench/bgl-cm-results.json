@@ -1,0 +1,567 @@
+{
+  "dataset": {
+    "name": "Loghub BGL, full original file",
+    "source": "https://zenodo.org/records/8196385/files/BGL.zip",
+    "archive_md5": "4452953c470f2d95fcb32d5f6e733f7a",
+    "raw_bytes": 743185031,
+    "raw_sha256": "666130b15ef44eb32fd02bd053e6c6e007c37696b5e7e8b9d8e45b729876a5d2",
+    "records": 4747963,
+    "reference": "https://github.com/logpai/loghub/tree/master/BGL"
+  },
+  "environment": {
+    "compiler": "c++ (Ubuntu 15.2.0-4ubuntu4) 15.2.0",
+    "cpu": "AMD Ryzen 9 7900X 12-Core Processor"
+  },
+  "method": {
+    "build_flags": "-O2 -std=c++17",
+    "threads": 1,
+    "repeats": 1,
+    "scope": "C++ codec only; excludes Python parsing, packaging and text reconstruction. Includes process startup and array file I/O. Unpack timings additionally include comparing SHA-256 of all five decoded arrays.",
+    "timeout_seconds_per_codec": 45,
+    "comparison": "All variants use identical prepared input arrays reconstructed from the existing verified full3.bcm archive. Every candidate decoded all five arrays exactly. The retained variant also reproduced the original arithmetic stream byte for byte.",
+    "caveat": "Single-run full-file timings on one x86-64 machine; compression results have not been checked on other log types."
+  },
+  "measurements": [
+    {
+      "variant": "baseline",
+      "mode": "pack",
+      "seconds": 30.5085,
+      "rss_kib": 2590896,
+      "bytes": 9876328,
+      "description": "original"
+    },
+    {
+      "variant": "baseline",
+      "mode": "unpack",
+      "seconds": 31.6266,
+      "rss_kib": 2600376,
+      "arrays_match": true,
+      "description": "original"
+    },
+    {
+      "variant": "soa",
+      "mode": "pack",
+      "seconds": 36.8115,
+      "rss_kib": 1805032,
+      "bytes": 9876328,
+      "description": "separate arrays (rejected)"
+    },
+    {
+      "variant": "soa",
+      "mode": "unpack",
+      "seconds": 37.1062,
+      "rss_kib": 1814428,
+      "arrays_match": true,
+      "description": "separate arrays (rejected)"
+    },
+    {
+      "variant": "stretch",
+      "mode": "pack",
+      "seconds": 24.9073,
+      "rss_kib": 2592424,
+      "bytes": 9876237,
+      "description": "logit lookup prototype"
+    },
+    {
+      "variant": "stretch",
+      "mode": "unpack",
+      "seconds": 25.1637,
+      "rss_kib": 2601736,
+      "arrays_match": true,
+      "description": "logit lookup prototype"
+    },
+    {
+      "variant": "small",
+      "mode": "pack",
+      "seconds": 22.558,
+      "rss_kib": 1018772,
+      "bytes": 9882066,
+      "description": "logit lookup + 20-bit tables prototype"
+    },
+    {
+      "variant": "small",
+      "mode": "unpack",
+      "seconds": 22.9689,
+      "rss_kib": 1028268,
+      "arrays_match": true,
+      "description": "logit lookup + 20-bit tables prototype"
+    },
+    {
+      "variant": "packed",
+      "mode": "pack",
+      "seconds": 29.1061,
+      "rss_kib": 1804676,
+      "bytes": 9876328,
+      "description": "packed counters + cost lookup + insertion sort (retained)"
+    },
+    {
+      "variant": "packed",
+      "mode": "unpack",
+      "seconds": 29.5015,
+      "rss_kib": 1814508,
+      "arrays_match": true,
+      "description": "packed counters + cost lookup + insertion sort (retained)"
+    },
+    {
+      "variant": "sort",
+      "mode": "pack",
+      "seconds": 30.0992,
+      "rss_kib": 2591432,
+      "bytes": 9876328,
+      "description": "cost lookup + insertion sort control"
+    },
+    {
+      "variant": "sort",
+      "mode": "unpack",
+      "seconds": 30.4214,
+      "rss_kib": 2601348,
+      "arrays_match": true,
+      "description": "cost lookup + insertion sort control"
+    }
+  ],
+  "original_archive": {
+    "bytes": 10077966,
+    "arithmetic_stream_bytes": 9876328,
+    "saved_pack_seconds_including_python": 41.46,
+    "saved_parse_seconds": 9.55,
+    "saved_unpack_seconds_including_python": 36.02,
+    "saved_cpp_unpack_seconds": 31.92,
+    "timing_provenance": "Earlier /tmp/bglcm/full3.pack.json and full3.unpack.json; not part of this benchmark run."
+  },
+  "original_model_mb": {
+    "node.rank": 0.687509,
+    "node.within": 0.19669,
+    "node.escape": 0.207936,
+    "selector.flags": 0.040627,
+    "selector.cache": 0.011655,
+    "selector.raw": 0.004111,
+    "head": 0.003149,
+    "clock.cm": 3.934369,
+    "clock.raw": 3.76331,
+    "nums.flags": 0.212554,
+    "nums.cache": 0.10729,
+    "nums.value": 0.707107,
+    "total": 9.87631
+  },
+  "prototype_changes": {
+    "stretch": "Quantize each clamped counter probability to the nearest multiple of 1/65536 only for the logit input, then use a 65536-entry float logit table. Counter updates remain floating point. Includes the cost lookup and insertion-sort changes, with the original 8-byte counters.",
+    "small": "The stretch prototype with the per-counter hash table capped at 20 bits instead of 22.",
+    "format": "Both prototypes change probability predictions and require a versioned model before integration. They are not used by the retained implementation."
+  },
+  "retained_changes": [
+    "Pack float probability and byte count together into five bytes, avoiding padding without splitting their cache accesses.",
+    "Precompute diagnostic -log2 costs for all 16-bit arithmetic probabilities; model predictions do not change.",
+    "Use stable insertion sort for the 9- and 19-entry predictor lists, avoiding temporary merge-buffer allocation.",
+    "Pass a null numeric pointer for rows without numeric lanes instead of indexing at the end of the numeric vector."
+  ],
+  "checks": {
+    "warning_clean_build": "-Wall -Wextra -Werror",
+    "fast_roundtrips": "Three generated fixtures: one/three/sixteen midplanes, empty numeric stream, zero/large clock gaps, numeric/template/cache transitions.",
+    "reference_byte_compatibility": true,
+    "fast_tests_seconds": 0.029,
+    "asan_ubsan_tests_seconds": 0.123,
+    "retained_full_stream_identical": true,
+    "all_full_decoded_arrays_match": true,
+    "final_wrapper_sha256": "666130b15ef44eb32fd02bd053e6c6e007c37696b5e7e8b9d8e45b729876a5d2",
+    "final_wrapper_unpack_seconds": 34.01,
+    "final_wrapper_codec_seconds": 29.98
+  },
+  "artifacts": {
+    "directory": "/tmp/zform-cm-review",
+    "manual_full_benchmark": "/tmp/zform-cm-review/fullbench.py",
+    "manual_compatible_benchmark": "/tmp/zform-cm-review/compatiblebench.py",
+    "source_snapshots": {
+      "baseline": {
+        "path": "/tmp/zform-cm-review/baseline.cpp",
+        "sha256": "ac755804fab9c7e8815df663e24b8af14ecfc86d7c5d21bdebefca91b2a7c5b7"
+      },
+      "soa": {
+        "path": "/tmp/zform-cm-review/soa.cpp",
+        "sha256": "3ca41307cf12831c294b2825f340ba71ecb7e7b38c29d78203775949b549e09f"
+      },
+      "stretch": {
+        "path": "/tmp/zform-cm-review/stretch.cpp",
+        "sha256": "1f56e7411a587a3cf1c980bf83ea65d15ee985db1429a263b179d9e5a6a15771"
+      },
+      "small": {
+        "path": "/tmp/zform-cm-review/small.cpp",
+        "sha256": "f502a724f9597e69c3a2ec7dc1d2ba251a4e1d4bb85cb9b1e2032497f022b0c7"
+      },
+      "packed": {
+        "path": "/tmp/zform-cm-review/packed.cpp",
+        "sha256": "930b192d43faa8c6db69a65845f10a96d20de80ebce6d11138eea1085b3a53b6"
+      },
+      "sort": {
+        "path": "/tmp/zform-cm-review/sort.cpp",
+        "sha256": "612acd20004953790029ff718c105909d151eb14022d577b244d72e8b0d90465"
+      }
+    }
+  },
+  "retained_source_sha256": {
+    "bench/bgl_cm.cpp": "eb90898498d4453fce499d58c7437266842cb88c0097c91b3384a0653e960b9c",
+    "bench/bgl_cm.py": "89dd896b9045510c08e70d98fea110adf9b19dc33b555fa8bb1daf61bd48a65c",
+    "bench/bgl_cm_test.py": "323d4b26c9637cc6ff46f90b98130025f988cb66139b478134315771655f87dc"
+  },
+  "encoding_weissman": {
+    "input": "/tmp/zform-corpus-candidates/BGL-full.log",
+    "raw_bytes": 743185031,
+    "method": "Single-thread, single-run end-to-end wall time including Python parsing and packaging, startup and file I/O. Alpha=1; logarithms use milliseconds.",
+    "results": [
+      {
+        "variant": "gzip -6",
+        "bytes": 62933204,
+        "encode_ms": 6433.432595804334,
+        "details": null,
+        "encoding_weissman_ms_alpha_1": 1.0,
+        "encoding_weissman_infinity": 12.195359374359954,
+        "encoding_weissman_infinity_relative_to_gzip": 1.0
+      },
+      {
+        "variant": "BGL mixer retained",
+        "bytes": 10077966,
+        "encode_ms": 39974.79077242315,
+        "details": {
+          "total_bytes": 10077966,
+          "streams": {
+            "header": 174,
+            "cm": 9876332,
+            "nodes": 56260,
+            "heads": 620,
+            "shapes": 10196,
+            "fallback": 134384
+          },
+          "codec": {
+            "rows": 4747963,
+            "model_mb": {
+              "node.rank": 0.687509,
+              "node.within": 0.19669,
+              "node.escape": 0.207936,
+              "selector.flags": 0.040627,
+              "selector.cache": 0.011655,
+              "selector.raw": 0.004111,
+              "head": 0.003149,
+              "clock.cm": 3.934369,
+              "clock.raw": 3.76331,
+              "nums.flags": 0.212554,
+              "nums.cache": 0.10729,
+              "nums.value": 0.707107,
+              "total": 9.87631
+            },
+            "stream_bytes": 9876328
+          },
+          "selected_templates": 787,
+          "fallback_rows": 20997,
+          "parse_seconds": 9.65,
+          "seconds": 39.83
+        },
+        "encoding_weissman_ms_alpha_1": 5.16806477861877,
+        "encoding_weissman_infinity": 7.200453576968316,
+        "encoding_weissman_infinity_relative_to_gzip": 0.5904256984920722
+      }
+    ],
+    "weissman_infinity_method": {
+      "formula": "R * log10(1 + S / (D_lo * R))",
+      "R": "raw_bytes / compressed_bytes",
+      "S": "raw input MB/s, using decimal MB",
+      "D_lo_MBps": 1,
+      "speed": "encoding, including Python parsing and packaging",
+      "normalization": "Absolute score and score divided by the gzip -6 score are both recorded."
+    }
+  },
+  "encoder_speedup": {
+    "method": "Same -O2 -std=c++17 build flags and machine as the earlier measurements. Two C++ full-input runs each in before/after/after/before order. End-to-end timings are single sequential runs including Python parsing, packaging, process startup, and file I/O. All compressed streams and complete archives are byte-identical to the previously verified archive.",
+    "changes": [
+      "Prefetch all independently addressed probability counters before evaluating their logarithms.",
+      "Hoist clock predictor length contexts out of the six-bit loop.",
+      "Parse canonical timestamps with the native ISO parser and retain exact spelling validation.",
+      "Cache validated epoch spelling and offset alongside the wall-clock second; revalidate when the spelling changes."
+    ],
+    "cpp_full_file": [
+      {
+        "variant": "before",
+        "repeat": 0,
+        "seconds": 29.244067,
+        "peak_rss_kib": 1804616,
+        "bytes": 9876328,
+        "identical_stream": true
+      },
+      {
+        "variant": "hoist",
+        "repeat": 0,
+        "seconds": 24.019358,
+        "peak_rss_kib": 1804992,
+        "bytes": 9876328,
+        "identical_stream": true
+      },
+      {
+        "variant": "hoist",
+        "repeat": 1,
+        "seconds": 23.858627,
+        "peak_rss_kib": 1804888,
+        "bytes": 9876328,
+        "identical_stream": true
+      },
+      {
+        "variant": "before",
+        "repeat": 1,
+        "seconds": 29.07205,
+        "peak_rss_kib": 1805292,
+        "bytes": 9876328,
+        "identical_stream": true
+      }
+    ],
+    "end_to_end": [
+      {
+        "variant": "before",
+        "seconds": 39.90404214523733,
+        "bytes": 10077966,
+        "identical_archive": true,
+        "details": {
+          "total_bytes": 10077966,
+          "streams": {
+            "header": 174,
+            "cm": 9876332,
+            "nodes": 56260,
+            "heads": 620,
+            "shapes": 10196,
+            "fallback": 134384
+          },
+          "codec": {
+            "rows": 4747963,
+            "model_mb": {
+              "node.rank": 0.687509,
+              "node.within": 0.19669,
+              "node.escape": 0.207936,
+              "selector.flags": 0.040627,
+              "selector.cache": 0.011655,
+              "selector.raw": 0.004111,
+              "head": 0.003149,
+              "clock.cm": 3.934369,
+              "clock.raw": 3.76331,
+              "nums.flags": 0.212554,
+              "nums.cache": 0.10729,
+              "nums.value": 0.707107,
+              "total": 9.87631
+            },
+            "stream_bytes": 9876328
+          },
+          "selected_templates": 787,
+          "fallback_rows": 20997,
+          "parse_seconds": 9.66,
+          "seconds": 39.76
+        },
+        "encoding_weissman_infinity": 7.211884383737109,
+        "encoding_weissman_infinity_relative_to_gzip": 0.5927295501867719,
+        "encoding_weissman_ms_alpha_1": 5.172491691081719
+      },
+      {
+        "variant": "after",
+        "seconds": 33.56741855293512,
+        "bytes": 10077966,
+        "identical_archive": true,
+        "details": {
+          "total_bytes": 10077966,
+          "streams": {
+            "header": 174,
+            "cm": 9876332,
+            "nodes": 56260,
+            "heads": 620,
+            "shapes": 10196,
+            "fallback": 134384
+          },
+          "codec": {
+            "rows": 4747963,
+            "model_mb": {
+              "node.rank": 0.687509,
+              "node.within": 0.19669,
+              "node.escape": 0.207936,
+              "selector.flags": 0.040627,
+              "selector.cache": 0.011655,
+              "selector.raw": 0.004111,
+              "head": 0.003149,
+              "clock.cm": 3.934369,
+              "clock.raw": 3.76331,
+              "nums.flags": 0.212554,
+              "nums.cache": 0.10729,
+              "nums.value": 0.707107,
+              "total": 9.87631
+            },
+            "stream_bytes": 9876328
+          },
+          "selected_templates": 787,
+          "fallback_rows": 20997,
+          "parse_seconds": 7.98,
+          "seconds": 33.43
+        },
+        "encoding_weissman_infinity": 8.408268100011332,
+        "encoding_weissman_infinity_relative_to_gzip": 0.6910578017595648,
+        "encoding_weissman_ms_alpha_1": 5.2583192916709836
+      },
+      {
+        "variant": "after-decode",
+        "seconds": 29.20045175589621,
+        "details": {
+          "rows": 4747963,
+          "sha256": "ok",
+          "codec_seconds": 24.86,
+          "seconds": 28.98,
+          "codec": {
+            "rows": 4747963,
+            "model_mb": {
+              "node.rank": 0.687509,
+              "node.within": 0.19669,
+              "node.escape": 0.207936,
+              "selector.flags": 0.040627,
+              "selector.cache": 0.011655,
+              "selector.raw": 0.004111,
+              "head": 0.003149,
+              "clock.cm": 3.934369,
+              "clock.raw": 3.76331,
+              "nums.flags": 0.212554,
+              "nums.cache": 0.10729,
+              "nums.value": 0.707107,
+              "total": 9.87631
+            },
+            "stream_bytes": 9876328
+          }
+        }
+      },
+      {
+        "variant": "gzip -6",
+        "seconds": 6.4724365677684546,
+        "bytes": 62933204,
+        "encoding_weissman_infinity": 12.16724285378485,
+        "encoding_weissman_infinity_relative_to_gzip": 1.0,
+        "encoding_weissman_ms_alpha_1": 1.0
+      }
+    ],
+    "screening": [
+      {
+        "variant": "before",
+        "seconds": 5.588530793786049,
+        "same_bytes": true,
+        "bytes": 1920014
+      },
+      {
+        "variant": "edge",
+        "seconds": 5.630737936124206,
+        "same_bytes": true,
+        "bytes": 1920014
+      },
+      {
+        "variant": "memo",
+        "seconds": 5.712213279679418,
+        "same_bytes": true,
+        "bytes": 1920014
+      },
+      {
+        "variant": "template",
+        "seconds": 5.535455310717225,
+        "same_bytes": true,
+        "bytes": 1920014
+      },
+      {
+        "variant": "combined",
+        "seconds": 5.791357195004821,
+        "same_bytes": true,
+        "bytes": 1920014
+      },
+      {
+        "variant": "prefetch",
+        "seconds": 4.609829796478152,
+        "same_bytes": true,
+        "bytes": 1920014
+      },
+      {
+        "variant": "prefetch_memo",
+        "seconds": 4.820744302123785,
+        "same_bytes": true,
+        "bytes": 1920014
+      },
+      {
+        "variant": "native",
+        "seconds": 5.4308276027441025,
+        "same_bytes": true,
+        "bytes": 1920014
+      },
+      {
+        "variant": "prefetch_o3",
+        "seconds": 4.525997906923294,
+        "same_bytes": true,
+        "bytes": 1920014
+      },
+      {
+        "variant": "prefetch_l1",
+        "seconds": 4.6256447322666645,
+        "same_bytes": true,
+        "bytes": 1920014
+      },
+      {
+        "variant": "hoist",
+        "seconds": 4.617452181875706,
+        "same_bytes": true,
+        "bytes": 1920014
+      },
+      {
+        "variant": "dense",
+        "seconds": 4.584539946168661,
+        "same_bytes": true,
+        "bytes": 1920014
+      },
+      {
+        "variant": "before",
+        "seconds": 5.564972225576639,
+        "same_bytes": true,
+        "bytes": 1920014
+      }
+    ],
+    "parser_sample": [
+      {
+        "variant": "before",
+        "repeat": 0,
+        "seconds": 1.1421909388154745,
+        "parse_seconds": 0.85
+      },
+      {
+        "variant": "parser",
+        "repeat": 0,
+        "seconds": 0.962493235245347,
+        "parse_seconds": 0.66
+      },
+      {
+        "variant": "parser",
+        "repeat": 1,
+        "seconds": 0.9826261065900326,
+        "parse_seconds": 0.69
+      },
+      {
+        "variant": "before",
+        "repeat": 1,
+        "seconds": 1.1476155892014503,
+        "parse_seconds": 0.85
+      }
+    ],
+    "rejected": "Exact logit memoization, clamped-endpoint shortcuts, fixed-K specialization, native compiler flags, and dense selector maps gave no material improvement over the chosen prefetch variant in screening.",
+    "checks": {
+      "full_archive_identical": true,
+      "full_decode_sha256": "666130b15ef44eb32fd02bd053e6c6e007c37696b5e7e8b9d8e45b729876a5d2",
+      "warning_clean_build": "-Wall -Wextra -Werror",
+      "fast_tests_seconds": 0.156,
+      "asan_ubsan_tests_seconds": 0.268,
+      "test_command": "timeout 1s python3 bench/bgl_cm_test.py --bin /tmp/zform-cm-speed/final --reference-bin /tmp/zform-cm-speed/before --wrapper",
+      "coverage": "Byte compatibility, one/three/sixteen midplanes, numeric lanes, empty numeric streams, zero/large gaps, leap dates, negative epoch, malformed dates, epoch changes and malformed spellings within a cached second, absent/empty messages, unterminated final line."
+    },
+    "source_sha256": {
+      "bench/bgl_cm.cpp": "9e07740cccd18a461c9f97a8c6e38bf980530a2e307c0fc3ea8a16f38dc5cdd7",
+      "bench/bgl_cm.py": "a07ad1d58a2aed8bec6d7ded5cd625681f48ef6add4fd228bd40451145ce9136",
+      "bench/bgl_cm_test.py": "70f8631b43c26f2c161bed051495d780d0172c1ca5a810a5ceaf9c4f18f8717f"
+    },
+    "artifacts": {
+      "directory": "/tmp/zform-cm-speed",
+      "cpp_benchmark": "/tmp/zform-cm-speed/fullbench.py",
+      "end_to_end_benchmark": "/tmp/zform-cm-speed/endtoend.py",
+      "before_cpp": "/tmp/zform-cm-speed/before.cpp",
+      "before_python": "/tmp/zform-cm-speed/before.py"
+    }
+  }
+}

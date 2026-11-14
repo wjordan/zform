@@ -1,0 +1,463 @@
+{
+  "date": "2026-11-14",
+  "input": {
+    "name": "BGL-full.log",
+    "bytes": 743185031,
+    "rows": 4747963,
+    "sha256": "666130b15ef44eb32fd02bd053e6c6e007c37696b5e7e8b9d8e45b729876a5d2"
+  },
+  "environment": {
+    "cpu": "AMD Ryzen 9 7900X",
+    "rustc": "1.93.0",
+    "cpp": "GCC 15.2.0",
+    "git_head": "6579fbb7dc8f6e8a7f280ad1f94b8efdc28987df",
+    "workspace": "Includes existing uncommitted payload engine changes; source hashes recorded below."
+  },
+  "method": "Sequential local runs with warm filesystem cache, no CPU affinity. One end-to-end run per variant. End-to-end includes the shared Python parser, process startup, codec, dictionary compression, and file I/O. SIMD repeat timings cover codec process on prepared first-million-row arrays, three runs per mode, interleaved. Small SIMD differences are not conclusive.",
+  "build_commands": [
+    "c++ -O3 -std=c++17 bench/bgl_cm.cpp -o /tmp/bgl_cm_cpp",
+    "rustc --edition=2024 -C opt-level=3 bench/bgl_cm.rs -o /tmp/bgl_cm_rust",
+    "cargo build --offline --release -p zform-core --example bgl_payload_probe"
+  ],
+  "weissman": {
+    "source": "https://cbloomrants.blogspot.com/2018/01/05-17-16-weissman-score.html",
+    "infinity_formula": "R * log10(1 + S/(D*R)); R=raw/compressed, S=raw decimal MB per second, D=1 decimal MB/s",
+    "relative": "variant infinity score divided by same-run gzip -6 infinity score",
+    "original_formula": "alpha=1; gzip_bytes/codec_bytes * ln(gzip_ms)/ln(codec_ms); distinct from infinity"
+  },
+  "full_runs": [
+    {
+      "name": "cpp_o3",
+      "seconds": 32.93031482025981,
+      "bytes": 10077966,
+      "sha256": "26d02cb309d23c8070002744df07703e6622d079839ba9e763496299d8e7dde6",
+      "command": [
+        "python3",
+        "bench/bgl_cm.py",
+        "pack",
+        "/tmp/zform-corpus-candidates/BGL-full.log",
+        "/tmp/zform-cm-rust/cpp_o3.bcm",
+        "--bin",
+        "/tmp/zform-cm-rust/cpp_o3"
+      ],
+      "report": {
+        "total_bytes": 10077966,
+        "streams": {
+          "header": 174,
+          "cm": 9876332,
+          "nodes": 56260,
+          "heads": 620,
+          "shapes": 10196,
+          "fallback": 134384
+        },
+        "codec": {
+          "rows": 4747963,
+          "model_mb": {
+            "node.rank": 0.687509,
+            "node.within": 0.19669,
+            "node.escape": 0.207936,
+            "selector.flags": 0.040627,
+            "selector.cache": 0.011655,
+            "selector.raw": 0.004111,
+            "head": 0.003149,
+            "clock.cm": 3.934369,
+            "clock.raw": 3.76331,
+            "nums.flags": 0.212554,
+            "nums.cache": 0.10729,
+            "nums.value": 0.707107,
+            "total": 9.87631
+          },
+          "stream_bytes": 9876328
+        },
+        "selected_templates": 787,
+        "fallback_rows": 20997,
+        "parse_seconds": 7.97,
+        "seconds": 32.79
+      },
+      "encoding_ms": 32930.31482025981,
+      "encoding_weissman_infinity": 8.551022314340326,
+      "encoding_weissman_infinity_over_gzip6": 0.7007437513081375,
+      "original_weissman_alpha1_milliseconds": 5.263420758752988
+    },
+    {
+      "name": "rust",
+      "seconds": 29.55780142173171,
+      "bytes": 10077966,
+      "sha256": "26d02cb309d23c8070002744df07703e6622d079839ba9e763496299d8e7dde6",
+      "command": [
+        "python3",
+        "bench/bgl_cm.py",
+        "pack",
+        "/tmp/zform-corpus-candidates/BGL-full.log",
+        "/tmp/zform-cm-rust/rust.bcm",
+        "--bin",
+        "/tmp/zform-cm-rust/final"
+      ],
+      "report": {
+        "total_bytes": 10077966,
+        "streams": {
+          "header": 174,
+          "cm": 9876332,
+          "nodes": 56260,
+          "heads": 620,
+          "shapes": 10196,
+          "fallback": 134384
+        },
+        "codec": {
+          "rows": 4747963,
+          "model_mb": {
+            "node.rank": 0.687509,
+            "node.within": 0.19669,
+            "node.escape": 0.207936,
+            "selector.flags": 0.040627,
+            "selector.cache": 0.011655,
+            "selector.raw": 0.004111,
+            "head": 0.003149,
+            "clock.cm": 3.934369,
+            "clock.raw": 3.76331,
+            "nums.flags": 0.212554,
+            "nums.cache": 0.10729,
+            "nums.value": 0.707107,
+            "total": 9.87631
+          },
+          "stream_bytes": 9876328
+        },
+        "selected_templates": 787,
+        "fallback_rows": 20997,
+        "parse_seconds": 8.0,
+        "seconds": 29.42
+      },
+      "encoding_ms": 29557.80142173171,
+      "encoding_weissman_infinity": 9.396045585264824,
+      "encoding_weissman_infinity_over_gzip6": 0.7699921703909951,
+      "original_weissman_alpha1_milliseconds": 5.318665129667565
+    },
+    {
+      "name": "hybrid",
+      "seconds": 16.86822967417538,
+      "bytes": 11180337,
+      "sha256": "605074b4d61e187a2b8e4741c5931f919cba0e9d565bc748e7ce1cf9d8e2e777",
+      "command": [
+        "python3",
+        "bench/bgl_cm.py",
+        "pack",
+        "/tmp/zform-corpus-candidates/BGL-full.log",
+        "/tmp/zform-cm-rust/hybrid.bcm",
+        "--bin",
+        "/tmp/zform-cm-rust/final",
+        "--clock-bin",
+        "/home/will/Code/zform/target/release/examples/bgl_payload_probe"
+      ],
+      "report": {
+        "total_bytes": 11180337,
+        "streams": {
+          "header": 174,
+          "cm": 2178654,
+          "nodes": 56260,
+          "heads": 620,
+          "shapes": 10196,
+          "fallback": 134384,
+          "clock": 8800049
+        },
+        "codec": {
+          "rows": 4747963,
+          "model_mb": {
+            "node.rank": 0.687509,
+            "node.within": 0.19669,
+            "node.escape": 0.207936,
+            "selector.flags": 0.040627,
+            "selector.cache": 0.011655,
+            "selector.raw": 0.004111,
+            "head": 0.003149,
+            "clock.cm": 0.0,
+            "clock.raw": 0.0,
+            "nums.flags": 0.212554,
+            "nums.cache": 0.10729,
+            "nums.value": 0.707107,
+            "total": 2.178631
+          },
+          "stream_bytes": 2178650
+        },
+        "selected_templates": 787,
+        "fallback_rows": 20997,
+        "parse_seconds": 7.8,
+        "seconds": 16.72
+      },
+      "encoding_ms": 16868.22967417538,
+      "encoding_weissman_infinity": 14.679866074672903,
+      "encoding_weissman_infinity_over_gzip6": 1.2029935186364833,
+      "original_weissman_alpha1_milliseconds": 5.070538369243249
+    },
+    {
+      "name": "hybrid_decode",
+      "seconds": 12.353656204417348,
+      "bytes": 743185031,
+      "sha256": "666130b15ef44eb32fd02bd053e6c6e007c37696b5e7e8b9d8e45b729876a5d2",
+      "command": [
+        "python3",
+        "bench/bgl_cm.py",
+        "unpack",
+        "/tmp/zform-cm-rust/hybrid.bcm",
+        "/tmp/zform-cm-rust/hybrid.log",
+        "--bin",
+        "/tmp/zform-cm-rust/final",
+        "--clock-bin",
+        "/home/will/Code/zform/target/release/examples/bgl_payload_probe"
+      ],
+      "report": {
+        "rows": 4747963,
+        "sha256": "ok",
+        "codec_seconds": 8.07,
+        "seconds": 12.14,
+        "codec": {
+          "rows": 4747963,
+          "model_mb": {
+            "node.rank": 0.687509,
+            "node.within": 0.19669,
+            "node.escape": 0.207936,
+            "selector.flags": 0.040627,
+            "selector.cache": 0.011655,
+            "selector.raw": 0.004111,
+            "head": 0.003149,
+            "clock.cm": 0.0,
+            "clock.raw": 0.0,
+            "nums.flags": 0.212554,
+            "nums.cache": 0.10729,
+            "nums.value": 0.707107,
+            "total": 2.178631
+          },
+          "stream_bytes": 2178650
+        }
+      }
+    },
+    {
+      "name": "gzip_6",
+      "seconds": 6.423178305849433,
+      "bytes": 62933217,
+      "encoding_ms": 6423.178305849433,
+      "encoding_weissman_infinity": 12.202780686060219,
+      "encoding_weissman_infinity_over_gzip6": 1.0,
+      "original_weissman_alpha1_milliseconds": 1.0
+    }
+  ],
+  "simd_repeats": [
+    {
+      "scalar": true,
+      "seconds": 4.019902205094695,
+      "exact": true
+    },
+    {
+      "scalar": false,
+      "seconds": 4.00845586322248,
+      "exact": true
+    },
+    {
+      "scalar": false,
+      "seconds": 3.980304354801774,
+      "exact": true
+    },
+    {
+      "scalar": true,
+      "seconds": 4.055307863280177,
+      "exact": true
+    },
+    {
+      "scalar": true,
+      "seconds": 4.007305582985282,
+      "exact": true
+    },
+    {
+      "scalar": false,
+      "seconds": 4.054729091003537,
+      "exact": true
+    }
+  ],
+  "simd_median_seconds": {
+    "scalar": 4.019902205094695,
+    "avx2": 4.00845586322248
+  },
+  "simd_conclusion": "AVX2 weight updates retain exact bytes but improvement was within noise (about 0.3% median). The optional scalar comparison is BGL_CM_SCALAR=1. AVX-512 hashing was slower in screening and was not retained.",
+  "simd_screening": [
+    {
+      "variant": "avx512",
+      "seconds": 4.319562116637826,
+      "rss_kib": 1413812,
+      "bytes": 1920014,
+      "same_bytes": true,
+      "codec": {
+        "rows": 1000000,
+        "model_mb": {
+          "node.rank": 0.051452,
+          "node.within": 0.046929,
+          "node.escape": 0.027928,
+          "selector.flags": 0.003508,
+          "selector.cache": 0.000678,
+          "selector.raw": 0.000466,
+          "head": 0.000429,
+          "clock.cm": 0.867696,
+          "clock.raw": 0.800613,
+          "nums.flags": 0.017414,
+          "nums.cache": 0.005616,
+          "nums.value": 0.097265,
+          "total": 1.919995
+        },
+        "stream_bytes": 1920014
+      }
+    },
+    {
+      "variant": "avx2weights",
+      "seconds": 3.9759254716336727,
+      "rss_kib": 1414396,
+      "bytes": 1920014,
+      "same_bytes": true,
+      "codec": {
+        "rows": 1000000,
+        "model_mb": {
+          "node.rank": 0.051452,
+          "node.within": 0.046929,
+          "node.escape": 0.027928,
+          "selector.flags": 0.003508,
+          "selector.cache": 0.000678,
+          "selector.raw": 0.000466,
+          "head": 0.000429,
+          "clock.cm": 0.867696,
+          "clock.raw": 0.800613,
+          "nums.flags": 0.017414,
+          "nums.cache": 0.005616,
+          "nums.value": 0.097265,
+          "total": 1.919995
+        },
+        "stream_bytes": 1920014
+      }
+    },
+    {
+      "variant": "specialized",
+      "seconds": 4.06903931312263,
+      "rss_kib": 1414044,
+      "bytes": 1920014,
+      "same_bytes": true,
+      "codec": {
+        "rows": 1000000,
+        "model_mb": {
+          "node.rank": 0.051452,
+          "node.within": 0.046929,
+          "node.escape": 0.027928,
+          "selector.flags": 0.003508,
+          "selector.cache": 0.000678,
+          "selector.raw": 0.000466,
+          "head": 0.000429,
+          "clock.cm": 0.867696,
+          "clock.raw": 0.800613,
+          "nums.flags": 0.017414,
+          "nums.cache": 0.005616,
+          "nums.value": 0.097265,
+          "total": 1.919995
+        },
+        "stream_bytes": 1920014
+      }
+    }
+  ],
+  "payload_clock_only": [
+    {
+      "rows": 4747963,
+      "level": 3,
+      "split_bits": 0,
+      "bytes": 9182593,
+      "encode_seconds": 0.272585,
+      "decode_seconds": 0.089855,
+      "exact": true
+    },
+    {
+      "rows": 4747963,
+      "level": 3,
+      "split_bits": 8,
+      "bytes": 8877206,
+      "encode_seconds": 0.204686,
+      "decode_seconds": 0.07242,
+      "exact": true
+    },
+    {
+      "rows": 4747963,
+      "level": 3,
+      "split_bits": 10,
+      "bytes": 8800045,
+      "encode_seconds": 0.191061,
+      "decode_seconds": 0.074093,
+      "exact": true
+    },
+    {
+      "rows": 4747963,
+      "level": 9,
+      "split_bits": 0,
+      "bytes": 9090366,
+      "encode_seconds": 0.538534,
+      "decode_seconds": 0.094338,
+      "exact": true
+    },
+    {
+      "rows": 4747963,
+      "level": 9,
+      "split_bits": 8,
+      "bytes": 8791946,
+      "encode_seconds": 0.280371,
+      "decode_seconds": 0.075488,
+      "exact": true
+    },
+    {
+      "rows": 4747963,
+      "level": 9,
+      "split_bits": 10,
+      "bytes": 8735427,
+      "encode_seconds": 0.248558,
+      "decode_seconds": 0.073799,
+      "exact": true
+    }
+  ],
+  "payload_method": "GraphBuilder::add_ints_fast stores low 10 bits and signed high bits of adjacent timestamp deltas with Zstd level 3. The graph reconstructs (high << 10) + low and ScanAdd with the first timestamp. CoreDecoder unchanged; isolated payload timings exclude input file I/O.",
+  "validation": [
+    "Rust BGLCM1 archive equals original C++ archive byte-for-byte on all 4,747,963 rows.",
+    "BGLCM2 hybrid full-log decode SHA256 equals input.",
+    "Fast differential roundtrips, scalar fallback, wrapper timestamps, hybrid archives, missing-helper rejection and signed/wrapping payload deltas passed under one-second test deadlines.",
+    "Rust decoder restored the full reference-compatible archive with the original input SHA256."
+  ],
+  "source_sha256": {
+    "bench/bgl_cm.rs": "187d600114ffa643f2b669e053d12c152e0ed11e97a155bed9a71f65a86f86fe",
+    "bench/bgl_cm.cpp": "9e07740cccd18a461c9f97a8c6e38bf980530a2e307c0fc3ea8a16f38dc5cdd7",
+    "bench/bgl_cm.py": "0b39178108a425fbe99a7240cff33c3d66e31bff2dee3d1fc43ccff02f4b8b09",
+    "bench/bgl_cm_test.py": "f623c824107e10e6500a5f1fbb28feabbc62cabcac26022306f089198cbfe124",
+    "crates/zform-core/examples/bgl_payload_probe.rs": "65a16360aa9e955aebb6736724be2ee8ff4b85f4ce1cb7766e9180c8746474e2",
+    "crates/zform-core/src/payload/graph.rs": "e945a6198e10bf64081237cd559f0e8a0d902d08879756394f80dfb838c72318",
+    "crates/zform-core/src/payload/engine.rs": "46110653328920240495a159248459734722d142276452d0761c7663906c9563",
+    "crates/zform-core/src/payload/ir.rs": "cedf890d362416b61e60be88ff5f30c57fde2b2047abe9a69596a44612990632"
+  },
+  "rust_decode": {
+    "seconds": 25.664159446954727,
+    "sha256": "666130b15ef44eb32fd02bd053e6c6e007c37696b5e7e8b9d8e45b729876a5d2",
+    "report": {
+      "rows": 4747963,
+      "sha256": "ok",
+      "codec_seconds": 21.02,
+      "seconds": 25.08,
+      "codec": {
+        "rows": 4747963,
+        "model_mb": {
+          "node.rank": 0.687509,
+          "node.within": 0.19669,
+          "node.escape": 0.207936,
+          "selector.flags": 0.040627,
+          "selector.cache": 0.011655,
+          "selector.raw": 0.004111,
+          "head": 0.003149,
+          "clock.cm": 3.934369,
+          "clock.raw": 3.76331,
+          "nums.flags": 0.212554,
+          "nums.cache": 0.10729,
+          "nums.value": 0.707107,
+          "total": 9.87631
+        },
+        "stream_bytes": 9876328
+      }
+    },
+    "timing_scope": "Process elapsed time plus subsequent full-output SHA256 validation; report.seconds is wrapper time only."
+  }
+}

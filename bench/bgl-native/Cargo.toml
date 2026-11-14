@@ -1,0 +1,16 @@
+[package]
+name = "bgl-native"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Keep experiment-only dependencies out of the library and its workspace lockfile.
+[workspace]
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+memchr = "2.8"
+serde_json = "1"
+sha2 = "0.10"
+xz2 = "0.1"
+zform-core = { path = "../../crates/zform-core" }

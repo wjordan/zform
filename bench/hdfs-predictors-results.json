@@ -1,0 +1,839 @@
+{
+  "method": "Sequential warm-cache process timings, including training, index writing and I/O. Median encode/decode timings. SHA256 roundtrip, deterministic repeated encode, and grep output checked for every variant.",
+  "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.42",
+  "binary_sha256": "3adb08dcfe59ae161a8fce75460e31742b8a2d65b12da67e0fa463cb2ad1eca5",
+  "preset": "default",
+  "datasets": [
+    {
+      "source": "/tmp/claude-1000/-home-will-Code-zform/0ad4e2e0-48a0-41e9-aad4-4d627843368c/scratchpad/q/hdfs.log",
+      "raw_bytes": 8388502,
+      "raw_sha256": "beebcd35092a99be06945338fd719c6f277d7c7fa3dcb892af479c58d305cf60",
+      "variants": [
+        {
+          "hdfs_predictors": false,
+          "context_mixing": false,
+          "bytes": 156157,
+          "compressed_sha256": "c08f81c5ced15489136894ea0e8ab20887aa7576c33236c15f6248602851d897",
+          "encode_seconds": 0.19818376190960407,
+          "encode_samples": [
+            0.20177808217704296,
+            0.19818376190960407,
+            0.19804446771740913
+          ],
+          "decode_seconds": 0.019618116319179535,
+          "decode_samples": [
+            0.019523488357663155,
+            0.019618116319179535,
+            0.019782941788434982
+          ],
+          "roundtrip": true,
+          "grep": true,
+          "same_as_disabled": true,
+          "older_reader_roundtrip": true,
+          "unchanged_default": true
+        },
+        {
+          "hdfs_predictors": true,
+          "context_mixing": false,
+          "bytes": 150092,
+          "compressed_sha256": "ed5da3e07f8b74b822a0853f30869aa4adc5d89842bda74ff25788aad3757319",
+          "encode_seconds": 0.2043644618242979,
+          "encode_samples": [
+            0.2043644618242979,
+            0.20569446496665478,
+            0.20262906700372696
+          ],
+          "decode_seconds": 0.019492777064442635,
+          "decode_samples": [
+            0.02090270258486271,
+            0.019492777064442635,
+            0.01908443309366703
+          ],
+          "roundtrip": true,
+          "grep": true,
+          "same_as_disabled": false,
+          "older_reader_roundtrip": true
+        },
+        {
+          "hdfs_predictors": false,
+          "context_mixing": true,
+          "bytes": 146714,
+          "compressed_sha256": "abb55fe962afcb33596a357a3946ccc653edd2237987d795209013a4c904d449",
+          "encode_seconds": 0.23108883015811443,
+          "encode_samples": [
+            0.23108883015811443,
+            0.23065010644495487,
+            0.2329776156693697
+          ],
+          "decode_seconds": 0.050921108573675156,
+          "decode_samples": [
+            0.05086497217416763,
+            0.050921108573675156,
+            0.051937222480773926
+          ],
+          "roundtrip": true,
+          "grep": true,
+          "same_as_disabled": true,
+          "older_reader_roundtrip": true,
+          "unchanged_default": true
+        },
+        {
+          "hdfs_predictors": true,
+          "context_mixing": true,
+          "bytes": 141242,
+          "compressed_sha256": "1d9d57c884756fffbb698d6a542beaee510a91c8b85628e0ddb17faec86944cf",
+          "encode_seconds": 0.24320529587566853,
+          "encode_samples": [
+            0.24870862811803818,
+            0.24320529587566853,
+            0.23861788772046566
+          ],
+          "decode_seconds": 0.05083038844168186,
+          "decode_samples": [
+            0.050063787028193474,
+            0.05083038844168186,
+            0.05099929869174957
+          ],
+          "roundtrip": true,
+          "grep": true,
+          "same_as_disabled": false,
+          "older_reader_roundtrip": true
+        }
+      ]
+    },
+    {
+      "source": "/tmp/zform-hdfs/middle.log",
+      "raw_bytes": 8388573,
+      "raw_sha256": "6d327362f11331f75f9764e2ec8bd335b864adf99718a96cb39df1103ace9375",
+      "variants": [
+        {
+          "hdfs_predictors": false,
+          "context_mixing": false,
+          "bytes": 160013,
+          "compressed_sha256": "44057fea51d3a332abd2a50a6efae92732a7ee433e6e45becda140d8c7e5d340",
+          "encode_seconds": 0.19878817349672318,
+          "encode_samples": [
+            0.20246903598308563,
+            0.19862484000623226,
+            0.19878817349672318
+          ],
+          "decode_seconds": 0.019071858376264572,
+          "decode_samples": [
+            0.019071858376264572,
+            0.0173957496881485,
+            0.019245481118559837
+          ],
+          "roundtrip": true,
+          "grep": true,
+          "same_as_disabled": true,
+          "older_reader_roundtrip": true,
+          "unchanged_default": true
+        },
+        {
+          "hdfs_predictors": true,
+          "context_mixing": false,
+          "bytes": 154407,
+          "compressed_sha256": "ed61e0669c903f899ea540d0393a9ddf29cfaf4962d24f7e4220c2932e90068a",
+          "encode_seconds": 0.21839943528175354,
+          "encode_samples": [
+            0.21661931090056896,
+            0.21885443292558193,
+            0.21839943528175354
+          ],
+          "decode_seconds": 0.01980053447186947,
+          "decode_samples": [
+            0.02059883251786232,
+            0.019219739362597466,
+            0.01980053447186947
+          ],
+          "roundtrip": true,
+          "grep": true,
+          "same_as_disabled": false,
+          "older_reader_roundtrip": true
+        },
+        {
+          "hdfs_predictors": false,
+          "context_mixing": true,
+          "bytes": 150797,
+          "compressed_sha256": "ed7ac2354f8fff7a878a2222a1fd5b10feabb9a4e7f0256d17ce4944a3f0d0f0",
+          "encode_seconds": 0.2340155802667141,
+          "encode_samples": [
+            0.23533054441213608,
+            0.23233584314584732,
+            0.2340155802667141
+          ],
+          "decode_seconds": 0.05204639956355095,
+          "decode_samples": [
+            0.0535409040749073,
+            0.05083021707832813,
+            0.05204639956355095
+          ],
+          "roundtrip": true,
+          "grep": true,
+          "same_as_disabled": true,
+          "older_reader_roundtrip": true,
+          "unchanged_default": true
+        },
+        {
+          "hdfs_predictors": true,
+          "context_mixing": true,
+          "bytes": 145381,
+          "compressed_sha256": "6913a7668e3536bb88eda6d622a1f85e5757a172bc8ece73fd8a69c0cac3e3d3",
+          "encode_seconds": 0.2507244646549225,
+          "encode_samples": [
+            0.2556830681860447,
+            0.2507244646549225,
+            0.25041667744517326
+          ],
+          "decode_seconds": 0.05204537883400917,
+          "decode_samples": [
+            0.05204537883400917,
+            0.052894776687026024,
+            0.051952069625258446
+          ],
+          "roundtrip": true,
+          "grep": true,
+          "same_as_disabled": false,
+          "older_reader_roundtrip": true
+        }
+      ]
+    },
+    {
+      "source": "/tmp/zform-hdfs/tail.log",
+      "raw_bytes": 8388494,
+      "raw_sha256": "9197c71ae0dc5371e0bbb9f4aed8e31eac613f7046465a4f7107c2c1faad2b84",
+      "variants": [
+        {
+          "hdfs_predictors": false,
+          "context_mixing": false,
+          "bytes": 301574,
+          "compressed_sha256": "1e247b75b4ad0f1d21e6d3f14fc8ac8b8ccf0b38fb897891ed4c63aed8d6b9e1",
+          "encode_seconds": 0.2720212657004595,
+          "encode_samples": [
+            0.27515098825097084,
+            0.26882451213896275,
+            0.2720212657004595
+          ],
+          "decode_seconds": 0.021300196647644043,
+          "decode_samples": [
+            0.021300196647644043,
+            0.02076893486082554,
+            0.022242069244384766
+          ],
+          "roundtrip": true,
+          "grep": true,
+          "same_as_disabled": true,
+          "older_reader_roundtrip": true,
+          "unchanged_default": true
+        },
+        {
+          "hdfs_predictors": true,
+          "context_mixing": false,
+          "bytes": 301574,
+          "compressed_sha256": "1e247b75b4ad0f1d21e6d3f14fc8ac8b8ccf0b38fb897891ed4c63aed8d6b9e1",
+          "encode_seconds": 0.2778411787003279,
+          "encode_samples": [
+            0.26933586597442627,
+            0.2837142329663038,
+            0.2778411787003279
+          ],
+          "decode_seconds": 0.021279526874423027,
+          "decode_samples": [
+            0.021279526874423027,
+            0.020728791132569313,
+            0.02294226363301277
+          ],
+          "roundtrip": true,
+          "grep": true,
+          "same_as_disabled": true,
+          "older_reader_roundtrip": true
+        },
+        {
+          "hdfs_predictors": false,
+          "context_mixing": true,
+          "bytes": 289181,
+          "compressed_sha256": "97ad565180245465f495356aa4c391a6b3e5d4363858da1e3388df6217961bb2",
+          "encode_seconds": 0.31936576776206493,
+          "encode_samples": [
+            0.32428947649896145,
+            0.31936576776206493,
+            0.31889146752655506
+          ],
+          "decode_seconds": 0.06820364482700825,
+          "decode_samples": [
+            0.06820364482700825,
+            0.06827034056186676,
+            0.06664884649217129
+          ],
+          "roundtrip": true,
+          "grep": true,
+          "same_as_disabled": true,
+          "older_reader_roundtrip": true,
+          "unchanged_default": true
+        },
+        {
+          "hdfs_predictors": true,
+          "context_mixing": true,
+          "bytes": 289181,
+          "compressed_sha256": "97ad565180245465f495356aa4c391a6b3e5d4363858da1e3388df6217961bb2",
+          "encode_seconds": 0.3183911330997944,
+          "encode_samples": [
+            0.3204728774726391,
+            0.3183911330997944,
+            0.3157293200492859
+          ],
+          "decode_seconds": 0.06792590394616127,
+          "decode_samples": [
+            0.06795774772763252,
+            0.0674461331218481,
+            0.06792590394616127
+          ],
+          "roundtrip": true,
+          "grep": true,
+          "same_as_disabled": true,
+          "older_reader_roundtrip": true
+        }
+      ]
+    },
+    {
+      "source": "/tmp/zform-corpus-candidates/BGL-8MiB.log",
+      "raw_bytes": 8388493,
+      "raw_sha256": "b7c69b9aa1b1de2eb89f66a6bb8645df9615313ce01b192a0fd481df6eb8e4c1",
+      "variants": [
+        {
+          "hdfs_predictors": false,
+          "context_mixing": false,
+          "bytes": 193373,
+          "compressed_sha256": "6329e030276767868059ba86a208c800f72834f162e4bff5e89e0bd276921c04",
+          "encode_seconds": 0.1887076199054718,
+          "encode_samples": [
+            0.188752556219697,
+            0.18640737235546112,
+            0.1887076199054718
+          ],
+          "decode_seconds": 0.02576385997235775,
+          "decode_samples": [
+            0.02576385997235775,
+            0.025885483250021935,
+            0.025620469823479652
+          ],
+          "roundtrip": true,
+          "grep": true,
+          "same_as_disabled": true,
+          "older_reader_roundtrip": true,
+          "unchanged_default": true
+        },
+        {
+          "hdfs_predictors": true,
+          "context_mixing": false,
+          "bytes": 193373,
+          "compressed_sha256": "6329e030276767868059ba86a208c800f72834f162e4bff5e89e0bd276921c04",
+          "encode_seconds": 0.18757084757089615,
+          "encode_samples": [
+            0.188879007473588,
+            0.1871778704226017,
+            0.18757084757089615
+          ],
+          "decode_seconds": 0.02628522366285324,
+          "decode_samples": [
+            0.02583564817905426,
+            0.02628522366285324,
+            0.027878155931830406
+          ],
+          "roundtrip": true,
+          "grep": true,
+          "same_as_disabled": true,
+          "older_reader_roundtrip": true
+        },
+        {
+          "hdfs_predictors": false,
+          "context_mixing": true,
+          "bytes": 191568,
+          "compressed_sha256": "27a3725559437f3803b62ee760a83717190f4fc2e537b4d58c5cf66c12430011",
+          "encode_seconds": 0.22206440940499306,
+          "encode_samples": [
+            0.22378049604594707,
+            0.2208365947008133,
+            0.22206440940499306
+          ],
+          "decode_seconds": 0.052065085619688034,
+          "decode_samples": [
+            0.052065085619688034,
+            0.05095811001956463,
+            0.0534686055034399
+          ],
+          "roundtrip": true,
+          "grep": true,
+          "same_as_disabled": true,
+          "older_reader_roundtrip": true,
+          "unchanged_default": true
+        },
+        {
+          "hdfs_predictors": true,
+          "context_mixing": true,
+          "bytes": 191568,
+          "compressed_sha256": "27a3725559437f3803b62ee760a83717190f4fc2e537b4d58c5cf66c12430011",
+          "encode_seconds": 0.22719664685428143,
+          "encode_samples": [
+            0.22378257662057877,
+            0.22719664685428143,
+            0.2273566797375679
+          ],
+          "decode_seconds": 0.05308056063950062,
+          "decode_samples": [
+            0.05305118300020695,
+            0.05308056063950062,
+            0.05310828238725662
+          ],
+          "roundtrip": true,
+          "grep": true,
+          "same_as_disabled": true,
+          "older_reader_roundtrip": true
+        }
+      ]
+    },
+    {
+      "source": "/tmp/zform-corpus-candidates/HPC-8MiB.log",
+      "raw_bytes": 8388574,
+      "raw_sha256": "a2a5aeca261f9c9e51d66e93c487b978c5c75cb904d946e17b9c5504d4f5a65f",
+      "variants": [
+        {
+          "hdfs_predictors": false,
+          "context_mixing": false,
+          "bytes": 213732,
+          "compressed_sha256": "4ea15ff5555d5c4b7d50842ab61013d46c733141653818d31e542f23d5ba6c10",
+          "encode_seconds": 0.22947886772453785,
+          "encode_samples": [
+            0.2280985303223133,
+            0.2340092584490776,
+            0.22947886772453785
+          ],
+          "decode_seconds": 0.023640040308237076,
+          "decode_samples": [
+            0.023640040308237076,
+            0.022267339751124382,
+            0.023847457021474838
+          ],
+          "roundtrip": true,
+          "grep": true,
+          "same_as_disabled": true,
+          "older_reader_roundtrip": true,
+          "unchanged_default": true
+        },
+        {
+          "hdfs_predictors": true,
+          "context_mixing": false,
+          "bytes": 213732,
+          "compressed_sha256": "4ea15ff5555d5c4b7d50842ab61013d46c733141653818d31e542f23d5ba6c10",
+          "encode_seconds": 0.22911792062222958,
+          "encode_samples": [
+            0.22911792062222958,
+            0.23012716136872768,
+            0.22807898372411728
+          ],
+          "decode_seconds": 0.02230418659746647,
+          "decode_samples": [
+            0.02210705354809761,
+            0.022924549877643585,
+            0.02230418659746647
+          ],
+          "roundtrip": true,
+          "grep": true,
+          "same_as_disabled": true,
+          "older_reader_roundtrip": true
+        },
+        {
+          "hdfs_predictors": false,
+          "context_mixing": true,
+          "bytes": 202602,
+          "compressed_sha256": "5527dc800562a4821ff665b958679fdb50e243ece6fdcfe32783b90567adb97e",
+          "encode_seconds": 0.25570803694427013,
+          "encode_samples": [
+            0.2540211156010628,
+            0.25570803694427013,
+            0.2563667166978121
+          ],
+          "decode_seconds": 0.05245023034512997,
+          "decode_samples": [
+            0.05245023034512997,
+            0.05198534391820431,
+            0.054090047255158424
+          ],
+          "roundtrip": true,
+          "grep": true,
+          "same_as_disabled": true,
+          "older_reader_roundtrip": true,
+          "unchanged_default": true
+        },
+        {
+          "hdfs_predictors": true,
+          "context_mixing": true,
+          "bytes": 202602,
+          "compressed_sha256": "5527dc800562a4821ff665b958679fdb50e243ece6fdcfe32783b90567adb97e",
+          "encode_seconds": 0.2546819746494293,
+          "encode_samples": [
+            0.2546819746494293,
+            0.25641411915421486,
+            0.253549175336957
+          ],
+          "decode_seconds": 0.052401699125766754,
+          "decode_samples": [
+            0.05106567405164242,
+            0.052401699125766754,
+            0.053443361073732376
+          ],
+          "roundtrip": true,
+          "grep": true,
+          "same_as_disabled": true,
+          "older_reader_roundtrip": true
+        }
+      ]
+    },
+    {
+      "source": "/tmp/zform-corpus-candidates/Zookeeper-8MiB.log",
+      "raw_bytes": 8388536,
+      "raw_sha256": "075b66335e44fa90a69c478b6c95c0a27bf7ab630407ae3793b978d30fd5b322",
+      "variants": [
+        {
+          "hdfs_predictors": false,
+          "context_mixing": false,
+          "bytes": 89471,
+          "compressed_sha256": "fc5a23019774d3ec36768017ce3d1f7323200ca6b7941dbb30e2bfd06333adc6",
+          "encode_seconds": 0.14225462265312672,
+          "encode_samples": [
+            0.14225462265312672,
+            0.14076236449182034,
+            0.14383052289485931
+          ],
+          "decode_seconds": 0.016653506085276604,
+          "decode_samples": [
+            0.017927682027220726,
+            0.016653506085276604,
+            0.016403499990701675
+          ],
+          "roundtrip": true,
+          "grep": true,
+          "same_as_disabled": true,
+          "older_reader_roundtrip": true,
+          "unchanged_default": true
+        },
+        {
+          "hdfs_predictors": true,
+          "context_mixing": false,
+          "bytes": 89471,
+          "compressed_sha256": "fc5a23019774d3ec36768017ce3d1f7323200ca6b7941dbb30e2bfd06333adc6",
+          "encode_seconds": 0.14103987254202366,
+          "encode_samples": [
+            0.13996507599949837,
+            0.14161162078380585,
+            0.14103987254202366
+          ],
+          "decode_seconds": 0.01709740422666073,
+          "decode_samples": [
+            0.016492079943418503,
+            0.01709740422666073,
+            0.017125125974416733
+          ],
+          "roundtrip": true,
+          "grep": true,
+          "same_as_disabled": true,
+          "older_reader_roundtrip": true
+        },
+        {
+          "hdfs_predictors": false,
+          "context_mixing": true,
+          "bytes": 84173,
+          "compressed_sha256": "2d1acdaa9002c91ba609f10ad5ccda222a8b67d3934d90d73e23aab044c16b17",
+          "encode_seconds": 0.1564206089824438,
+          "encode_samples": [
+            0.1564206089824438,
+            0.1531369797885418,
+            0.1574674602597952
+          ],
+          "decode_seconds": 0.03670593909919262,
+          "decode_samples": [
+            0.0362571869045496,
+            0.03670593909919262,
+            0.03709464147686958
+          ],
+          "roundtrip": true,
+          "grep": true,
+          "same_as_disabled": true,
+          "older_reader_roundtrip": true,
+          "unchanged_default": true
+        },
+        {
+          "hdfs_predictors": true,
+          "context_mixing": true,
+          "bytes": 84173,
+          "compressed_sha256": "2d1acdaa9002c91ba609f10ad5ccda222a8b67d3934d90d73e23aab044c16b17",
+          "encode_seconds": 0.1544727198779583,
+          "encode_samples": [
+            0.1544727198779583,
+            0.15258191339671612,
+            0.15773537755012512
+          ],
+          "decode_seconds": 0.035925958305597305,
+          "decode_samples": [
+            0.036702435463666916,
+            0.035925958305597305,
+            0.035562166944146156
+          ],
+          "roundtrip": true,
+          "grep": true,
+          "same_as_disabled": true,
+          "older_reader_roundtrip": true
+        }
+      ]
+    }
+  ],
+  "baseline_binary_sha256": "e018685c2c16dcd08d190b7de1cf77af4b00dca848ef7b7cbb875203e8726440",
+  "full_prefix_validation": {
+    "method": "Sequential warm-cache process timings, including training, index writing and I/O. Median encode/decode timings. SHA256 roundtrip, deterministic repeated encode, and grep output checked for every variant. Single-run full-prefix validation; initial baseline encode overlapped a test build, so these timings are not an isolated performance comparison.",
+    "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.42",
+    "binary_sha256": "3adb08dcfe59ae161a8fce75460e31742b8a2d65b12da67e0fa463cb2ad1eca5",
+    "preset": "default",
+    "datasets": [
+      {
+        "source": "/tmp/pc/hdfs256.log",
+        "raw_bytes": 268435456,
+        "raw_sha256": "1db04322a5bd5182eff3a3521a7310ad8446b352c076138006b60a938221c71c",
+        "variants": [
+          {
+            "hdfs_predictors": false,
+            "context_mixing": false,
+            "bytes": 6160118,
+            "compressed_sha256": "455b13a7afec28e8ee16c03335ef2e7be4ec5757b807e01b46526e8655334ee8",
+            "encode_seconds": 7.124906783923507,
+            "encode_samples": [
+              7.124906783923507
+            ],
+            "decode_seconds": 0.42049426957964897,
+            "decode_samples": [
+              0.42049426957964897
+            ],
+            "roundtrip": true,
+            "grep": true,
+            "same_as_disabled": true,
+            "older_reader_roundtrip": true,
+            "unchanged_default": true
+          },
+          {
+            "hdfs_predictors": true,
+            "context_mixing": false,
+            "bytes": 6043849,
+            "compressed_sha256": "8bf42706a9b55d39208fd4c18b4dff3d692bcde7fedf10bdc0d13587ec1bb187",
+            "encode_seconds": 6.792940877377987,
+            "encode_samples": [
+              6.792940877377987
+            ],
+            "decode_seconds": 0.4881398808211088,
+            "decode_samples": [
+              0.4881398808211088
+            ],
+            "roundtrip": true,
+            "grep": true,
+            "same_as_disabled": false,
+            "older_reader_roundtrip": true
+          },
+          {
+            "hdfs_predictors": false,
+            "context_mixing": true,
+            "bytes": 5770436,
+            "compressed_sha256": "4890a1cd4d0c193e0ae31ab416ba07c0d7e2194fc07659d5480bd35de2a06000",
+            "encode_seconds": 7.56326075643301,
+            "encode_samples": [
+              7.56326075643301
+            ],
+            "decode_seconds": 1.4726470205932856,
+            "decode_samples": [
+              1.4726470205932856
+            ],
+            "roundtrip": true,
+            "grep": true,
+            "same_as_disabled": true,
+            "older_reader_roundtrip": true,
+            "unchanged_default": true
+          },
+          {
+            "hdfs_predictors": true,
+            "context_mixing": true,
+            "bytes": 5663072,
+            "compressed_sha256": "ec3f5fcecd90b05d3ce6fb130b85598bef0aaa01f5a0db0866f988227090caf4",
+            "encode_seconds": 8.053987735882401,
+            "encode_samples": [
+              8.053987735882401
+            ],
+            "decode_seconds": 1.5229278728365898,
+            "decode_samples": [
+              1.5229278728365898
+            ],
+            "roundtrip": true,
+            "grep": true,
+            "same_as_disabled": false,
+            "older_reader_roundtrip": true
+          }
+        ]
+      }
+    ],
+    "baseline_binary_sha256": "e018685c2c16dcd08d190b7de1cf77af4b00dca848ef7b7cbb875203e8726440"
+  },
+  "selective_validation": {
+    "unit_tests": "task/partition patches, sparse alignment, block size changes, missing attribute rows, selective column reads, and relation registry dependency/standalone guards",
+    "cli": "grep part- checked against raw lines for every benchmark variant"
+  },
+  "screening": {
+    "command": "cargo run --release -p zform-core --example hdfs_predict_probe -- FILE...",
+    "note": "Raw first-block-ID per line. Grouping graphs roundtripped. Cache/delta sizes omit proposed stateful node and context wiring; these are optimistic estimates, not shipped encodings.",
+    "results": [
+      "hdfs emitter-keyed-1 bytes=52287 cm_bytes=50317 (plus node framing)",
+      "hdfs emitter-keyed-4 bytes=53936 cm_bytes=50539 (plus node framing)",
+      "hdfs emitter-keyed-16 bytes=55509 cm_bytes=50722 (plus node framing)",
+      "hdfs emitter-keyed-256 bytes=57981 cm_bytes=53354 (plus node framing)",
+      "hdfs emitter-keyed-4096 bytes=58027 cm_bytes=53487 (plus node framing)",
+      "hdfs operation-keyed-1 bytes=52942 cm_bytes=50851 (plus node framing)",
+      "hdfs operation-keyed-4 bytes=55173 cm_bytes=51734 (plus node framing)",
+      "hdfs operation-keyed-16 bytes=56672 cm_bytes=51430 (plus node framing)",
+      "hdfs operation-keyed-256 bytes=55523 cm_bytes=51073 (plus node framing)",
+      "hdfs operation-keyed-4096 bytes=55505 cm_bytes=51310 (plus node framing)",
+      "hdfs baseline cm=false rows=59428 bytes=51659",
+      "hdfs baseline cm=true rows=59428 bytes=49985",
+      "hdfs by_block cm=false rows=59428 bytes=71732",
+      "hdfs by_block cm=true rows=59428 bytes=71593",
+      "hdfs by_emitter cm=false rows=59428 bytes=115208",
+      "hdfs by_emitter cm=true rows=59428 bytes=109822",
+      "middle emitter-keyed-1 bytes=48135 cm_bytes=46932 (plus node framing)",
+      "middle emitter-keyed-4 bytes=50571 cm_bytes=47191 (plus node framing)",
+      "middle emitter-keyed-16 bytes=52057 cm_bytes=47330 (plus node framing)",
+      "middle emitter-keyed-256 bytes=53939 cm_bytes=48924 (plus node framing)",
+      "middle emitter-keyed-4096 bytes=53950 cm_bytes=49060 (plus node framing)",
+      "middle operation-keyed-1 bytes=50076 cm_bytes=46887 (plus node framing)",
+      "middle operation-keyed-4 bytes=51179 cm_bytes=46832 (plus node framing)",
+      "middle operation-keyed-16 bytes=51933 cm_bytes=46072 (plus node framing)",
+      "middle operation-keyed-256 bytes=52011 cm_bytes=46279 (plus node framing)",
+      "middle operation-keyed-4096 bytes=51992 cm_bytes=46460 (plus node framing)",
+      "middle baseline cm=false rows=59183 bytes=48641",
+      "middle baseline cm=true rows=59183 bytes=46260",
+      "middle by_block cm=false rows=59183 bytes=66739",
+      "middle by_block cm=true rows=59183 bytes=66739",
+      "middle by_emitter cm=false rows=59183 bytes=137190",
+      "middle by_emitter cm=true rows=59183 bytes=137190",
+      "tail emitter-keyed-1 bytes=132711 cm_bytes=127032 (plus node framing)",
+      "tail emitter-keyed-4 bytes=132684 cm_bytes=127084 (plus node framing)",
+      "tail emitter-keyed-16 bytes=132696 cm_bytes=127096 (plus node framing)",
+      "tail emitter-keyed-256 bytes=132773 cm_bytes=127008 (plus node framing)",
+      "tail emitter-keyed-4096 bytes=132598 cm_bytes=126747 (plus node framing)",
+      "tail operation-keyed-1 bytes=132013 cm_bytes=125758 (plus node framing)",
+      "tail operation-keyed-4 bytes=131673 cm_bytes=124778 (plus node framing)",
+      "tail operation-keyed-16 bytes=132168 cm_bytes=124543 (plus node framing)",
+      "tail operation-keyed-256 bytes=132693 cm_bytes=125020 (plus node framing)",
+      "tail operation-keyed-4096 bytes=132517 cm_bytes=124838 (plus node framing)",
+      "tail baseline cm=false rows=65467 bytes=125971",
+      "tail baseline cm=true rows=65467 bytes=120378",
+      "tail by_block cm=false rows=65467 bytes=166960",
+      "tail by_block cm=true rows=65467 bytes=165905",
+      "tail by_emitter cm=false rows=65467 bytes=231746",
+      "tail by_emitter cm=true rows=65467 bytes=231746"
+    ]
+  },
+  "final_binary_validation": {
+    "binary_sha256": "3d35947c10014ae3790ec0a3b430aeef8a0a5399c1c5973d70875bcd26d4ccfb",
+    "unchanged_archive_sha256_after_allocation_cleanup": [
+      "/tmp/claude-1000/-home-will-Code-zform/0ad4e2e0-48a0-41e9-aad4-4d627843368c/scratchpad/q/hdfs.log",
+      "/tmp/zform-hdfs/middle.log",
+      "/tmp/zform-hdfs/tail.log"
+    ],
+    "full_prefix_repeated_encode_sha256": "ec3f5fcecd90b05d3ce6fb130b85598bef0aaa01f5a0db0866f988227090caf4",
+    "current_and_previous_reader_grep_part_00079_matches": 126
+  },
+  "best_preset_validation": {
+    "method": "Sequential warm-cache process timings, including training, index writing and I/O. Median encode/decode timings. SHA256 roundtrip, deterministic repeated encode, and grep output checked for every variant.",
+    "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.42",
+    "binary_sha256": "3adb08dcfe59ae161a8fce75460e31742b8a2d65b12da67e0fa463cb2ad1eca5",
+    "preset": "best",
+    "datasets": [
+      {
+        "source": "/tmp/claude-1000/-home-will-Code-zform/0ad4e2e0-48a0-41e9-aad4-4d627843368c/scratchpad/q/hdfs.log",
+        "raw_bytes": 8388502,
+        "raw_sha256": "beebcd35092a99be06945338fd719c6f277d7c7fa3dcb892af479c58d305cf60",
+        "variants": [
+          {
+            "hdfs_predictors": false,
+            "context_mixing": false,
+            "bytes": 159319,
+            "compressed_sha256": "95feacd60c541b5fe33f0aa94541066a3edd6c331ae80dbcf7f07cd3eaa1f032",
+            "encode_seconds": 2.302011562511325,
+            "encode_samples": [
+              2.302011562511325
+            ],
+            "decode_seconds": 0.020791692659258842,
+            "decode_samples": [
+              0.020791692659258842
+            ],
+            "roundtrip": true,
+            "grep": true,
+            "same_as_disabled": true,
+            "older_reader_roundtrip": true,
+            "unchanged_default": true
+          },
+          {
+            "hdfs_predictors": true,
+            "context_mixing": false,
+            "bytes": 153597,
+            "compressed_sha256": "c867533db074b36758eeac412353854e32fc551ad2686e193f3ac2f293ab6350",
+            "encode_seconds": 2.279822112992406,
+            "encode_samples": [
+              2.279822112992406
+            ],
+            "decode_seconds": 0.021376613527536392,
+            "decode_samples": [
+              0.021376613527536392
+            ],
+            "roundtrip": true,
+            "grep": true,
+            "same_as_disabled": false,
+            "older_reader_roundtrip": true
+          },
+          {
+            "hdfs_predictors": false,
+            "context_mixing": true,
+            "bytes": 156113,
+            "compressed_sha256": "d0f61a978c93873f61b3574d1f7fcf05ec55172339ab8fb98d560ea8fd66f036",
+            "encode_seconds": 2.3220253717154264,
+            "encode_samples": [
+              2.3220253717154264
+            ],
+            "decode_seconds": 0.039934976026415825,
+            "decode_samples": [
+              0.039934976026415825
+            ],
+            "roundtrip": true,
+            "grep": true,
+            "same_as_disabled": true,
+            "older_reader_roundtrip": true,
+            "unchanged_default": true
+          },
+          {
+            "hdfs_predictors": true,
+            "context_mixing": true,
+            "bytes": 150731,
+            "compressed_sha256": "479bf5dbb18751dc086dbc6981684e5f4e4a489d01a7778c2b354bd76acb6a2f",
+            "encode_seconds": 2.327654404565692,
+            "encode_samples": [
+              2.327654404565692
+            ],
+            "decode_seconds": 0.039131807163357735,
+            "decode_samples": [
+              0.039131807163357735
+            ],
+            "roundtrip": true,
+            "grep": true,
+            "same_as_disabled": false,
+            "older_reader_roundtrip": true
+          }
+        ]
+      }
+    ],
+    "baseline_binary_sha256": "e018685c2c16dcd08d190b7de1cf77af4b00dca848ef7b7cbb875203e8726440"
+  }
+}

@@ -1,0 +1,162 @@
+{
+  "dataset": {
+    "name": "Loghub BGL, full original file",
+    "source": "https://zenodo.org/records/8196385/files/BGL.zip",
+    "archive_md5": "4452953c470f2d95fcb32d5f6e733f7a",
+    "raw_bytes": 743185031,
+    "raw_sha256": "666130b15ef44eb32fd02bd053e6c6e007c37696b5e7e8b9d8e45b729876a5d2",
+    "records": 4747963,
+    "reference": "https://github.com/logpai/loghub/tree/master/BGL"
+  },
+  "methodology": {
+    "sizes_include": [
+      "data",
+      "model",
+      "query index",
+      "dictionary if enabled"
+    ],
+    "fidelity": "SHA-256 of every restored file equals the original input; verified using an unmodified reader.",
+    "timings": "Single-run, single-thread wall times; smoke measurements, including training and file I/O.",
+    "size_units": "Bytes; divide by 1000000 for decimal MB."
+  },
+  "measurements": [
+    {
+      "encoder": "zform",
+      "options": [
+        "pack"
+      ],
+      "level": 3,
+      "block_mib": 8,
+      "bytes": 17361548,
+      "encode_seconds": 12.69256205111742,
+      "roundtrip_verified": true,
+      "ratio": 42.80638057159419
+    },
+    {
+      "encoder": "bgl",
+      "options": [
+        "--level",
+        "3"
+      ],
+      "level": 3,
+      "block_mib": 8,
+      "bytes": 15143741,
+      "encode_seconds": 14.045703675597906,
+      "roundtrip_verified": true,
+      "ratio": 49.07539233535492
+    },
+    {
+      "encoder": "bgl",
+      "options": [
+        "--level",
+        "9"
+      ],
+      "level": 9,
+      "block_mib": 8,
+      "bytes": 14638239,
+      "encode_seconds": 22.278690483421087,
+      "roundtrip_verified": true,
+      "ratio": 50.770111828342195
+    },
+    {
+      "encoder": "bgl",
+      "options": [
+        "--level",
+        "19"
+      ],
+      "level": 19,
+      "block_mib": 8,
+      "bytes": 13387154,
+      "encode_seconds": 236.38875554688275,
+      "roundtrip_verified": true,
+      "ratio": 55.5147891030461
+    },
+    {
+      "encoder": "zform",
+      "options": [
+        "pack",
+        "--best"
+      ],
+      "level": 19,
+      "block_mib": 8,
+      "bytes": 14795535,
+      "encode_seconds": 240.7462283913046,
+      "roundtrip_verified": true,
+      "ratio": 50.23035875350232
+    },
+    {
+      "encoder": "bgl",
+      "options": [
+        "--level",
+        "9",
+        "--block-bytes",
+        "33554432",
+        "--block-rows",
+        "1048576"
+      ],
+      "level": 9,
+      "block_mib": 32,
+      "bytes": 14005946,
+      "encode_seconds": 22.711674880236387,
+      "roundtrip_verified": true,
+      "ratio": 53.06210883577589
+    },
+    {
+      "encoder": "bgl",
+      "options": [
+        "--level",
+        "9",
+        "--block-bytes",
+        "134217728",
+        "--block-rows",
+        "1048576"
+      ],
+      "level": 9,
+      "block_mib": 128,
+      "bytes": 14020082,
+      "encode_seconds": 25.642700580880046,
+      "roundtrip_verified": true,
+      "ratio": 53.00860800956799
+    },
+    {
+      "encoder": "bgl",
+      "options": [
+        "--level",
+        "19",
+        "--block-bytes",
+        "33554432",
+        "--block-rows",
+        "1048576"
+      ],
+      "level": 19,
+      "block_mib": 32,
+      "bytes": 12971789,
+      "encode_seconds": 209.9862979594618,
+      "roundtrip_verified": true,
+      "ratio": 57.29240824068292
+    }
+  ],
+  "source_sha256": {
+    "crates/zform-core/examples/bgl.rs": "0558b0d1ed7d07c9b6374ff8fe598a1df3d3133a9e58e562f75c100f1e65949b",
+    "crates/zform-core/src/packs/bgl.rs": "1736a45e3f6420287e070e5059889218ef1e7ca1b8576f4467ea856f4227e396",
+    "crates/zform-core/src/packs.rs": "bffb3f2fd6d1271f362bafed860cfb1cf1015aab615680584a5532b4b7df3ac2",
+    "crates/zform-core/src/container.rs": "7cbad34bc6a0f6ab64d998d16d0a8f3585b5a58b5750968d8246eb973877cea7",
+    "crates/zform-core/src/grammar.rs": "c161a621d28123e438fb0626d3877cc41a2b16200c0620fb1656e99b6593f409",
+    "crates/zform-core/src/plan.rs": "56c0c430a8f9ded7b0440592065b156c539ea9815c867005d70c0b57f6f0dae6",
+    "crates/zform-core/src/lex.rs": "c0675d8bf3df85af76c0f9413f78f257f88555c3efbbd0a3af8e702eb162c433"
+  },
+  "integrated_verification": {
+    "binary_sha256": "419c32146b817fb057c973e786506ebf23ec71dfd2176d126f56a19b64bc293f",
+    "level": 9,
+    "block_mib": 32,
+    "bytes": 14005946,
+    "old_reader_verified": true
+  },
+  "checks": {
+    "debug_tests_passed": 194,
+    "release_tests_passed": 194,
+    "existing_ignored_benchmark": 1,
+    "clippy": "Passes with the seven pre-existing lint categories allowed; the strict check is blocked by those existing warnings.",
+    "format": "Repository-wide check fails on pre-existing formatting; new files and changed code are formatted."
+  }
+}

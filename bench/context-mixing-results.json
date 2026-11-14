@@ -1,0 +1,998 @@
+{
+  "method": "Sequential warm-cache process timings, including training, archive/index writing and I/O; medians over encode repeats, one decode per variant. All inputs kept in their original order and spelling. Size includes the query index. Decode SHA256 checked and repeated encodes checked for deterministic bytes.",
+  "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.42",
+  "binary_sha256": "e018685c2c16dcd08d190b7de1cf77af4b00dca848ef7b7cbb875203e8726440",
+  "preset": "default",
+  "datasets": [
+    {
+      "source": "/tmp/zform-corpus-candidates/BGL-8MiB.log",
+      "raw_bytes": 8388493,
+      "raw_sha256": "b7c69b9aa1b1de2eb89f66a6bb8645df9615313ce01b192a0fd481df6eb8e4c1",
+      "variants": [
+        {
+          "context_mixing": false,
+          "bytes": 193373,
+          "encode_seconds": 0.18745750281959772,
+          "encode_samples": [
+            0.18766169250011444,
+            0.187253313139081
+          ],
+          "decode_seconds": 0.02638193964958191,
+          "compressed_sha256": "6329e030276767868059ba86a208c800f72834f162e4bff5e89e0bd276921c04",
+          "roundtrip": true
+        },
+        {
+          "context_mixing": true,
+          "bytes": 191568,
+          "encode_seconds": 0.22186775412410498,
+          "encode_samples": [
+            0.22173153050243855,
+            0.2220039777457714
+          ],
+          "decode_seconds": 0.052828481420874596,
+          "compressed_sha256": "27a3725559437f3803b62ee760a83717190f4fc2e537b4d58c5cf66c12430011",
+          "roundtrip": true
+        }
+      ],
+      "size_reduction_percent": 0.9334291757380764,
+      "encode_time_factor": 1.1835629451312089,
+      "decode_time_factor": 2.0024487252479863
+    },
+    {
+      "source": "/tmp/zform-corpus-candidates/BGL-middle-8MiB.log",
+      "raw_bytes": 8388530,
+      "raw_sha256": "8732e11d5412bab5fa8229304401cd585fe0cc94823c7cca9dfc65a75154cb25",
+      "variants": [
+        {
+          "context_mixing": false,
+          "bytes": 146349,
+          "encode_seconds": 0.17463269270956516,
+          "encode_samples": [
+            0.174027094617486,
+            0.17523829080164433
+          ],
+          "decode_seconds": 0.027428720146417618,
+          "compressed_sha256": "4fb1689412df5d02503ae5c1589ab8d170a085454ea1ff2c56b1d69a4ad7addf",
+          "roundtrip": true
+        },
+        {
+          "context_mixing": true,
+          "bytes": 146273,
+          "encode_seconds": 0.18859198689460754,
+          "encode_samples": [
+            0.18882107734680176,
+            0.18836289644241333
+          ],
+          "decode_seconds": 0.029656432569026947,
+          "compressed_sha256": "76a0ddc9bc07f25e9d2d77daa0532960e2ad664acc857c85d0a676da1e3c40f0",
+          "roundtrip": true
+        }
+      ],
+      "size_reduction_percent": 0.05193065890439774,
+      "encode_time_factor": 1.0799351711781615,
+      "decode_time_factor": 1.0812182417086014
+    },
+    {
+      "source": "/tmp/zform-corpus-candidates/BGL-tail-8MiB.log",
+      "raw_bytes": 8388465,
+      "raw_sha256": "7f59c422020910026709c6a7f6d5c0fbd2a9ec55ac0e710800ff76c51e018f44",
+      "variants": [
+        {
+          "context_mixing": false,
+          "bytes": 237615,
+          "encode_seconds": 0.16724468674510717,
+          "encode_samples": [
+            0.16642759554088116,
+            0.1680617779493332
+          ],
+          "decode_seconds": 0.020809415727853775,
+          "compressed_sha256": "2a30d67696a7ed9296c0f82549d79db61317ef26542f9da6f269df8dfd4175bd",
+          "roundtrip": true
+        },
+        {
+          "context_mixing": true,
+          "bytes": 231010,
+          "encode_seconds": 0.18907837569713593,
+          "encode_samples": [
+            0.1901149284094572,
+            0.18804182298481464
+          ],
+          "decode_seconds": 0.0439921785145998,
+          "compressed_sha256": "fa1a26a7f0820077d0c92c1c02e2c47eb3b4734070b818539adb24ec05b6fe90",
+          "roundtrip": true
+        }
+      ],
+      "size_reduction_percent": 2.779706668350057,
+      "encode_time_factor": 1.1305493727600737,
+      "decode_time_factor": 2.114051595197624
+    },
+    {
+      "source": "/tmp/zform-corpus-candidates/HPC-8MiB.log",
+      "raw_bytes": 8388574,
+      "raw_sha256": "a2a5aeca261f9c9e51d66e93c487b978c5c75cb904d946e17b9c5504d4f5a65f",
+      "variants": [
+        {
+          "context_mixing": false,
+          "bytes": 213732,
+          "encode_seconds": 0.2284241784363985,
+          "encode_samples": [
+            0.22714601270854473,
+            0.22970234416425228
+          ],
+          "decode_seconds": 0.022597499191761017,
+          "compressed_sha256": "4ea15ff5555d5c4b7d50842ab61013d46c733141653818d31e542f23d5ba6c10",
+          "roundtrip": true
+        },
+        {
+          "context_mixing": true,
+          "bytes": 202602,
+          "encode_seconds": 0.25876834709197283,
+          "encode_samples": [
+            0.2642145548015833,
+            0.25332213938236237
+          ],
+          "decode_seconds": 0.05115017667412758,
+          "compressed_sha256": "5527dc800562a4821ff665b958679fdb50e243ece6fdcfe32783b90567adb97e",
+          "roundtrip": true
+        }
+      ],
+      "size_reduction_percent": 5.2074560664757685,
+      "encode_time_factor": 1.1328413168136806,
+      "decode_time_factor": 2.263532625449846
+    },
+    {
+      "source": "/tmp/zform-corpus-candidates/Zookeeper-8MiB.log",
+      "raw_bytes": 8388536,
+      "raw_sha256": "075b66335e44fa90a69c478b6c95c0a27bf7ab630407ae3793b978d30fd5b322",
+      "variants": [
+        {
+          "context_mixing": false,
+          "bytes": 89471,
+          "encode_seconds": 0.14254436176270247,
+          "encode_samples": [
+            0.14642926305532455,
+            0.13865946047008038
+          ],
+          "decode_seconds": 0.016369378194212914,
+          "compressed_sha256": "fc5a23019774d3ec36768017ce3d1f7323200ca6b7941dbb30e2bfd06333adc6",
+          "roundtrip": true
+        },
+        {
+          "context_mixing": true,
+          "bytes": 84173,
+          "encode_seconds": 0.16389682702720165,
+          "encode_samples": [
+            0.16038314625620842,
+            0.16741050779819489
+          ],
+          "decode_seconds": 0.036640437319874763,
+          "compressed_sha256": "2d1acdaa9002c91ba609f10ad5ccda222a8b67d3934d90d73e23aab044c16b17",
+          "roundtrip": true
+        }
+      ],
+      "size_reduction_percent": 5.921471761799912,
+      "encode_time_factor": 1.1497952286604307,
+      "decode_time_factor": 2.238352421524985
+    },
+    {
+      "source": "/tmp/zform-corpus-candidates/HealthApp-8MiB.log",
+      "raw_bytes": 8388486,
+      "raw_sha256": "3a68d9702898c428f57a1a32fd5ca3c6805b896b6ed99c5b5b3b8dd834b1ca28",
+      "variants": [
+        {
+          "context_mixing": false,
+          "bytes": 202490,
+          "encode_seconds": 0.32591890543699265,
+          "encode_samples": [
+            0.3266878481954336,
+            0.3251499626785517
+          ],
+          "decode_seconds": 0.027512632310390472,
+          "compressed_sha256": "7405f93c94fd493adb3d72be66acf61a54b45ecb9df645bd1193e51d2a3b02af",
+          "roundtrip": true
+        },
+        {
+          "context_mixing": true,
+          "bytes": 188864,
+          "encode_seconds": 0.3845619624480605,
+          "encode_samples": [
+            0.3842407204210758,
+            0.3848832044750452
+          ],
+          "decode_seconds": 0.07993248663842678,
+          "compressed_sha256": "6a06a97a2dadf17d1e3d9c1ca1de31fdacbb3d172c37e68a8f85564fb5ef5acc",
+          "roundtrip": true
+        }
+      ],
+      "size_reduction_percent": 6.729221196108448,
+      "encode_time_factor": 1.1799314370316725,
+      "decode_time_factor": 2.9053013080191286
+    },
+    {
+      "source": "/tmp/zform-compression-study-s1ypmuas/base_a.zip.ndjson",
+      "raw_bytes": 8387014,
+      "raw_sha256": "68129f27d82bf7ddd6869d3f789433ddea24d3406eae53119d6d6087c18511b2",
+      "variants": [
+        {
+          "context_mixing": false,
+          "bytes": 637596,
+          "encode_seconds": 0.14947658218443394,
+          "encode_samples": [
+            0.15223760716617107,
+            0.1467155572026968
+          ],
+          "decode_seconds": 0.017023863270878792,
+          "compressed_sha256": "ab3e5401ed7b955d13c4080ce1626b609a7d3d08fca9f1c7d83c3fed79d6f7b2",
+          "roundtrip": true
+        },
+        {
+          "context_mixing": true,
+          "bytes": 628883,
+          "encode_seconds": 0.1621550377458334,
+          "encode_samples": [
+            0.16009702160954475,
+            0.16421305388212204
+          ],
+          "decode_seconds": 0.023513972759246826,
+          "compressed_sha256": "cf4c30746ff1cde7bcc47fe39a69857f16b26a3d134af53212bba7da870f1e8c",
+          "roundtrip": true
+        }
+      ],
+      "size_reduction_percent": 1.3665393132955672,
+      "encode_time_factor": 1.0848190089452003,
+      "decode_time_factor": 1.3812359970882806
+    },
+    {
+      "source": "/tmp/claude-1000/-home-will-Code-zform/0ad4e2e0-48a0-41e9-aad4-4d627843368c/scratchpad/q/hdfs.log",
+      "raw_bytes": 8388502,
+      "raw_sha256": "beebcd35092a99be06945338fd719c6f277d7c7fa3dcb892af479c58d305cf60",
+      "variants": [
+        {
+          "context_mixing": false,
+          "bytes": 156157,
+          "encode_seconds": 0.2010892489925027,
+          "encode_samples": [
+            0.19977325573563576,
+            0.20240524224936962
+          ],
+          "decode_seconds": 0.019296446815133095,
+          "compressed_sha256": "c08f81c5ced15489136894ea0e8ab20887aa7576c33236c15f6248602851d897",
+          "roundtrip": true
+        },
+        {
+          "context_mixing": true,
+          "bytes": 146714,
+          "encode_seconds": 0.23644694034010172,
+          "encode_samples": [
+            0.23806949704885483,
+            0.2348243836313486
+          ],
+          "decode_seconds": 0.0507492758333683,
+          "compressed_sha256": "abb55fe962afcb33596a357a3946ccc653edd2237987d795209013a4c904d449",
+          "roundtrip": true
+        }
+      ],
+      "size_reduction_percent": 6.0471192453748435,
+      "encode_time_factor": 1.1758308389172873,
+      "decode_time_factor": 2.6299803440273033
+    },
+    {
+      "source": "/tmp/claude-1000/-home-will-Code-zform/0ad4e2e0-48a0-41e9-aad4-4d627843368c/scratchpad/d/gh8.ndjson",
+      "raw_bytes": 8388148,
+      "raw_sha256": "083cfacce2816c0350a556a5465a93b27c01ea224adf6758d8c7b603fd6d33d0",
+      "variants": [
+        {
+          "context_mixing": false,
+          "bytes": 578430,
+          "encode_seconds": 0.33103902731090784,
+          "encode_samples": [
+            0.3345883097499609,
+            0.3274897448718548
+          ],
+          "decode_seconds": 0.016188262030482292,
+          "compressed_sha256": "756bb1eafb445b0aeb74a8e29777b3ad58b96815cd225ef8b9422c2fb71ae14b",
+          "roundtrip": true
+        },
+        {
+          "context_mixing": true,
+          "bytes": 576167,
+          "encode_seconds": 0.33851001784205437,
+          "encode_samples": [
+            0.3393667917698622,
+            0.33765324391424656
+          ],
+          "decode_seconds": 0.018925121054053307,
+          "compressed_sha256": "f455cebc4fc1aa8006ee5d7a0a8bf52a3316c54b6aa4e319b4466bfdacf6f2ff",
+          "roundtrip": true
+        }
+      ],
+      "size_reduction_percent": 0.39123143682036066,
+      "encode_time_factor": 1.02256830740422,
+      "decode_time_factor": 1.1690644133642971
+    }
+  ],
+  "cpu": "AMD Ryzen 9 7900X",
+  "date": "2026-11-14",
+  "rustc": "1.93.0",
+  "scope": "General zform record compressor with its normal block boundaries and query index; these are not the whole-file BGL experiment archives.",
+  "best_preset": {
+    "method": "Sequential warm-cache process timings, including training, archive/index writing and I/O; medians over encode repeats, one decode per variant. All inputs kept in their original order and spelling. Size includes the query index. Decode SHA256 checked and repeated encodes checked for deterministic bytes.",
+    "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.42",
+    "binary_sha256": "e018685c2c16dcd08d190b7de1cf77af4b00dca848ef7b7cbb875203e8726440",
+    "preset": "best",
+    "datasets": [
+      {
+        "source": "/tmp/zform-corpus-candidates/HPC-8MiB.log",
+        "raw_bytes": 8388574,
+        "raw_sha256": "a2a5aeca261f9c9e51d66e93c487b978c5c75cb904d946e17b9c5504d4f5a65f",
+        "variants": [
+          {
+            "context_mixing": false,
+            "bytes": 202342,
+            "encode_seconds": 3.736190350726247,
+            "encode_samples": [
+              3.736190350726247
+            ],
+            "decode_seconds": 0.019810575991868973,
+            "compressed_sha256": "cf19eced8f5dc7ff4d9676a0232d1df2150e5845a51d6c6977591a8d82fbf515",
+            "roundtrip": true
+          },
+          {
+            "context_mixing": true,
+            "bytes": 197328,
+            "encode_seconds": 3.7413579747080803,
+            "encode_samples": [
+              3.7413579747080803
+            ],
+            "decode_seconds": 0.04776868410408497,
+            "compressed_sha256": "d587c0db49691eb54cdb5c23b3341a047fe2923fe661d81e425792e7923636b7",
+            "roundtrip": true
+          }
+        ],
+        "size_reduction_percent": 2.477982821164171,
+        "encode_time_factor": 1.0013831265264173,
+        "decode_time_factor": 2.4112718440741494
+      },
+      {
+        "source": "/tmp/zform-corpus-candidates/Zookeeper-8MiB.log",
+        "raw_bytes": 8388536,
+        "raw_sha256": "075b66335e44fa90a69c478b6c95c0a27bf7ab630407ae3793b978d30fd5b322",
+        "variants": [
+          {
+            "context_mixing": false,
+            "bytes": 71455,
+            "encode_seconds": 0.8969745859503746,
+            "encode_samples": [
+              0.8969745859503746
+            ],
+            "decode_seconds": 0.015021182596683502,
+            "compressed_sha256": "371ead4664810a39d357ba9081a9101535ac42e0f3dc285418f7f187ecd6c385",
+            "roundtrip": true
+          },
+          {
+            "context_mixing": true,
+            "bytes": 70986,
+            "encode_seconds": 0.9097412582486868,
+            "encode_samples": [
+              0.9097412582486868
+            ],
+            "decode_seconds": 0.01650887168943882,
+            "compressed_sha256": "24ab6baee897d5192c9e1bcf8dded58ca7cedef0263784d91911d0748162d2f1",
+            "roundtrip": true
+          }
+        ],
+        "size_reduction_percent": 0.656357147855291,
+        "encode_time_factor": 1.0142330368087134,
+        "decode_time_factor": 1.0990394120555982
+      },
+      {
+        "source": "/tmp/zform-compression-study-s1ypmuas/base_a.zip.ndjson",
+        "raw_bytes": 8387014,
+        "raw_sha256": "68129f27d82bf7ddd6869d3f789433ddea24d3406eae53119d6d6087c18511b2",
+        "variants": [
+          {
+            "context_mixing": false,
+            "bytes": 606615,
+            "encode_seconds": 0.9762013386934996,
+            "encode_samples": [
+              0.9762013386934996
+            ],
+            "decode_seconds": 0.01695750281214714,
+            "compressed_sha256": "bed163ed0f52e6d9a99e3dfcd97b90883d6a0cca5c709bb3d004b5c8f48cef8f",
+            "roundtrip": true
+          },
+          {
+            "context_mixing": true,
+            "bytes": 601144,
+            "encode_seconds": 1.0039431322366,
+            "encode_samples": [
+              1.0039431322366
+            ],
+            "decode_seconds": 0.023496586829423904,
+            "compressed_sha256": "364bf7227b60301495df985f10b47905144e2f540666bc54b4bd62fa593250c3",
+            "roundtrip": true
+          }
+        ],
+        "size_reduction_percent": 0.9018899961260485,
+        "encode_time_factor": 1.028418106433073,
+        "decode_time_factor": 1.3856159771704495
+      }
+    ]
+  },
+  "initial_integer_screen": [
+    {
+      "path": "/tmp/zform-corpus-candidates/BGL-middle-8MiB.log",
+      "field": 0,
+      "rows": 64427,
+      "distinct": 5,
+      "bits": 3,
+      "base_bytes": 38,
+      "cm_bytes": 37,
+      "base_ms": 0.641,
+      "cm_ms": 2.557,
+      "decode_ms": 2.883
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/BGL-middle-8MiB.log",
+      "field": 1,
+      "rows": 64427,
+      "distinct": 2025,
+      "bits": 11,
+      "base_bytes": 3656,
+      "cm_bytes": 8617,
+      "base_ms": 0.882,
+      "cm_ms": 8.704,
+      "decode_ms": 9.93
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/BGL-middle-8MiB.log",
+      "field": 2,
+      "rows": 64427,
+      "distinct": 3,
+      "bits": 2,
+      "base_bytes": 20,
+      "cm_bytes": 33,
+      "base_ms": 0.458,
+      "cm_ms": 1.625,
+      "decode_ms": 1.842
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/BGL-middle-8MiB.log",
+      "field": 3,
+      "rows": 64427,
+      "distinct": 23776,
+      "bits": 15,
+      "base_bytes": 5118,
+      "cm_bytes": 59097,
+      "base_ms": 0.86,
+      "cm_ms": 14.438,
+      "decode_ms": 16.803
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/BGL-middle-8MiB.log",
+      "field": 4,
+      "rows": 64427,
+      "distinct": 64427,
+      "bits": 16,
+      "base_bytes": 790,
+      "cm_bytes": 64055,
+      "base_ms": 0.711,
+      "cm_ms": 15.851,
+      "decode_ms": 18.445
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/BGL-middle-8MiB.log",
+      "field": 5,
+      "rows": 64427,
+      "distinct": 23776,
+      "bits": 15,
+      "base_bytes": 5118,
+      "cm_bytes": 59097,
+      "base_ms": 0.907,
+      "cm_ms": 13.837,
+      "decode_ms": 15.359
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/BGL-middle-8MiB.log",
+      "field": 6,
+      "rows": 64427,
+      "distinct": 2,
+      "bits": 1,
+      "base_bytes": 42,
+      "cm_bytes": 31,
+      "base_ms": 0.413,
+      "cm_ms": 0.772,
+      "decode_ms": 0.936
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/BGL-middle-8MiB.log",
+      "field": 7,
+      "rows": 64427,
+      "distinct": 6,
+      "bits": 3,
+      "base_bytes": 124,
+      "cm_bytes": 77,
+      "base_ms": 0.44,
+      "cm_ms": 2.174,
+      "decode_ms": 2.401
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/BGL-middle-8MiB.log",
+      "field": 8,
+      "rows": 64427,
+      "distinct": 4,
+      "bits": 2,
+      "base_bytes": 74,
+      "cm_bytes": 55,
+      "base_ms": 0.416,
+      "cm_ms": 1.468,
+      "decode_ms": 1.682
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/BGL-middle-8MiB.log",
+      "field": 9,
+      "rows": 64387,
+      "distinct": 90,
+      "bits": 7,
+      "base_bytes": 775,
+      "cm_bytes": 566,
+      "base_ms": 0.554,
+      "cm_ms": 4.943,
+      "decode_ms": 5.487
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/BGL-middle-8MiB.log",
+      "field": 10,
+      "rows": 64377,
+      "distinct": 39289,
+      "bits": 16,
+      "base_bytes": 10066,
+      "cm_bytes": 68733,
+      "base_ms": 0.79,
+      "cm_ms": 14.28,
+      "decode_ms": 16.485
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/BGL-middle-8MiB.log",
+      "field": 11,
+      "rows": 2518,
+      "distinct": 99,
+      "bits": 7,
+      "base_bytes": 822,
+      "cm_bytes": 805,
+      "base_ms": 0.04,
+      "cm_ms": 0.225,
+      "decode_ms": 0.256
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/HPC-8MiB.log",
+      "field": 0,
+      "rows": 65536,
+      "distinct": 62310,
+      "bits": 16,
+      "base_bytes": 10515,
+      "cm_bytes": 68081,
+      "base_ms": 0.755,
+      "cm_ms": 14.642,
+      "decode_ms": 16.976
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/HPC-8MiB.log",
+      "field": 1,
+      "rows": 65536,
+      "distinct": 2359,
+      "bits": 12,
+      "base_bytes": 35394,
+      "cm_bytes": 34604,
+      "base_ms": 0.895,
+      "cm_ms": 9.933,
+      "decode_ms": 11.389
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/HPC-8MiB.log",
+      "field": 2,
+      "rows": 65536,
+      "distinct": 11,
+      "bits": 4,
+      "base_bytes": 545,
+      "cm_bytes": 342,
+      "base_ms": 0.475,
+      "cm_ms": 2.932,
+      "decode_ms": 3.263
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/HPC-8MiB.log",
+      "field": 3,
+      "rows": 65536,
+      "distinct": 14,
+      "bits": 4,
+      "base_bytes": 51,
+      "cm_bytes": 92,
+      "base_ms": 0.459,
+      "cm_ms": 2.89,
+      "decode_ms": 3.243
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/HPC-8MiB.log",
+      "field": 4,
+      "rows": 65536,
+      "distinct": 42088,
+      "bits": 16,
+      "base_bytes": 14963,
+      "cm_bytes": 57200,
+      "base_ms": 0.95,
+      "cm_ms": 13.864,
+      "decode_ms": 15.955
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/HPC-8MiB.log",
+      "field": 5,
+      "rows": 65536,
+      "distinct": 52,
+      "bits": 6,
+      "base_bytes": 81,
+      "cm_bytes": 98,
+      "base_ms": 0.492,
+      "cm_ms": 4.417,
+      "decode_ms": 5.541
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/HPC-8MiB.log",
+      "field": 6,
+      "rows": 65536,
+      "distinct": 30,
+      "bits": 5,
+      "base_bytes": 3164,
+      "cm_bytes": 2234,
+      "base_ms": 0.643,
+      "cm_ms": 3.629,
+      "decode_ms": 4.12
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/HPC-8MiB.log",
+      "field": 7,
+      "rows": 65536,
+      "distinct": 43,
+      "bits": 6,
+      "base_bytes": 1058,
+      "cm_bytes": 1024,
+      "base_ms": 0.577,
+      "cm_ms": 4.366,
+      "decode_ms": 4.821
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/HPC-8MiB.log",
+      "field": 8,
+      "rows": 64723,
+      "distinct": 1865,
+      "bits": 11,
+      "base_bytes": 15745,
+      "cm_bytes": 11371,
+      "base_ms": 0.976,
+      "cm_ms": 8.068,
+      "decode_ms": 9.049
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/HPC-8MiB.log",
+      "field": 9,
+      "rows": 36233,
+      "distinct": 377,
+      "bits": 9,
+      "base_bytes": 1606,
+      "cm_bytes": 1460,
+      "base_ms": 0.399,
+      "cm_ms": 3.628,
+      "decode_ms": 4.011
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/HPC-8MiB.log",
+      "field": 10,
+      "rows": 33478,
+      "distinct": 241,
+      "bits": 8,
+      "base_bytes": 849,
+      "cm_bytes": 605,
+      "base_ms": 0.27,
+      "cm_ms": 2.967,
+      "decode_ms": 3.292
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/HPC-8MiB.log",
+      "field": 11,
+      "rows": 32518,
+      "distinct": 68,
+      "bits": 7,
+      "base_bytes": 242,
+      "cm_bytes": 205,
+      "base_ms": 0.271,
+      "cm_ms": 2.484,
+      "decode_ms": 2.803
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/Zookeeper-8MiB.log",
+      "field": 0,
+      "rows": 60150,
+      "distinct": 11,
+      "bits": 4,
+      "base_bytes": 69,
+      "cm_bytes": 88,
+      "base_ms": 0.424,
+      "cm_ms": 2.754,
+      "decode_ms": 2.981
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/Zookeeper-8MiB.log",
+      "field": 1,
+      "rows": 60150,
+      "distinct": 27196,
+      "bits": 15,
+      "base_bytes": 21238,
+      "cm_bytes": 48210,
+      "base_ms": 1.137,
+      "cm_ms": 11.958,
+      "decode_ms": 13.415
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/Zookeeper-8MiB.log",
+      "field": 3,
+      "rows": 60150,
+      "distinct": 3,
+      "bits": 2,
+      "base_bytes": 3664,
+      "cm_bytes": 4759,
+      "base_ms": 0.482,
+      "cm_ms": 1.457,
+      "decode_ms": 1.597
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/Zookeeper-8MiB.log",
+      "field": 4,
+      "rows": 60150,
+      "distinct": 1420,
+      "bits": 11,
+      "base_bytes": 7566,
+      "cm_bytes": 7154,
+      "base_ms": 0.911,
+      "cm_ms": 7.839,
+      "decode_ms": 8.875
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/Zookeeper-8MiB.log",
+      "field": 5,
+      "rows": 60150,
+      "distinct": 4,
+      "bits": 2,
+      "base_bytes": 642,
+      "cm_bytes": 432,
+      "base_ms": 0.412,
+      "cm_ms": 1.369,
+      "decode_ms": 1.56
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/Zookeeper-8MiB.log",
+      "field": 6,
+      "rows": 60150,
+      "distinct": 59,
+      "bits": 6,
+      "base_bytes": 6527,
+      "cm_bytes": 4869,
+      "base_ms": 0.586,
+      "cm_ms": 4.119,
+      "decode_ms": 4.696
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/Zookeeper-8MiB.log",
+      "field": 7,
+      "rows": 60082,
+      "distinct": 86,
+      "bits": 7,
+      "base_bytes": 6658,
+      "cm_bytes": 5092,
+      "base_ms": 0.601,
+      "cm_ms": 4.781,
+      "decode_ms": 5.346
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/Zookeeper-8MiB.log",
+      "field": 8,
+      "rows": 51141,
+      "distinct": 3506,
+      "bits": 12,
+      "base_bytes": 9398,
+      "cm_bytes": 9865,
+      "base_ms": 0.824,
+      "cm_ms": 7.344,
+      "decode_ms": 8.272
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/Zookeeper-8MiB.log",
+      "field": 9,
+      "rows": 50976,
+      "distinct": 8271,
+      "bits": 14,
+      "base_bytes": 9965,
+      "cm_bytes": 20031,
+      "base_ms": 1.115,
+      "cm_ms": 9.077,
+      "decode_ms": 10.644
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/Zookeeper-8MiB.log",
+      "field": 10,
+      "rows": 31760,
+      "distinct": 1373,
+      "bits": 11,
+      "base_bytes": 4114,
+      "cm_bytes": 4364,
+      "base_ms": 0.489,
+      "cm_ms": 4.021,
+      "decode_ms": 4.523
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/Zookeeper-8MiB.log",
+      "field": 11,
+      "rows": 29178,
+      "distinct": 2584,
+      "bits": 12,
+      "base_bytes": 4068,
+      "cm_bytes": 5224,
+      "base_ms": 0.471,
+      "cm_ms": 4.029,
+      "decode_ms": 4.52
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/HealthApp-8MiB.log",
+      "field": 0,
+      "rows": 65536,
+      "distinct": 54497,
+      "bits": 16,
+      "base_bytes": 14575,
+      "cm_bytes": 61925,
+      "base_ms": 0.998,
+      "cm_ms": 14.707,
+      "decode_ms": 16.924
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/HealthApp-8MiB.log",
+      "field": 1,
+      "rows": 65536,
+      "distinct": 32,
+      "bits": 5,
+      "base_bytes": 5961,
+      "cm_bytes": 5369,
+      "base_ms": 0.623,
+      "cm_ms": 3.73,
+      "decode_ms": 4.182
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/HealthApp-8MiB.log",
+      "field": 3,
+      "rows": 65536,
+      "distinct": 14435,
+      "bits": 14,
+      "base_bytes": 13241,
+      "cm_bytes": 37101,
+      "base_ms": 1.304,
+      "cm_ms": 12.4,
+      "decode_ms": 15.107
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/HealthApp-8MiB.log",
+      "field": 4,
+      "rows": 57895,
+      "distinct": 12390,
+      "bits": 14,
+      "base_bytes": 22322,
+      "cm_bytes": 35490,
+      "base_ms": 1.566,
+      "cm_ms": 10.723,
+      "decode_ms": 12.385
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/HealthApp-8MiB.log",
+      "field": 5,
+      "rows": 33057,
+      "distinct": 13228,
+      "bits": 14,
+      "base_bytes": 9620,
+      "cm_bytes": 24629,
+      "base_ms": 0.797,
+      "cm_ms": 6.35,
+      "decode_ms": 7.326
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/HealthApp-8MiB.log",
+      "field": 6,
+      "rows": 24295,
+      "distinct": 5906,
+      "bits": 13,
+      "base_bytes": 9211,
+      "cm_bytes": 15203,
+      "base_ms": 0.599,
+      "cm_ms": 4.33,
+      "decode_ms": 4.888
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/HealthApp-8MiB.log",
+      "field": 7,
+      "rows": 10952,
+      "distinct": 5962,
+      "bits": 13,
+      "base_bytes": 3352,
+      "cm_bytes": 8173,
+      "base_ms": 0.193,
+      "cm_ms": 1.986,
+      "decode_ms": 2.278
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/HealthApp-8MiB.log",
+      "field": 8,
+      "rows": 10036,
+      "distinct": 106,
+      "bits": 7,
+      "base_bytes": 1592,
+      "cm_bytes": 1424,
+      "base_ms": 0.139,
+      "cm_ms": 0.838,
+      "decode_ms": 0.96
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/HealthApp-8MiB.log",
+      "field": 9,
+      "rows": 2239,
+      "distinct": 14,
+      "bits": 4,
+      "base_bytes": 377,
+      "cm_bytes": 294,
+      "base_ms": 0.031,
+      "cm_ms": 0.113,
+      "decode_ms": 0.125
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/HealthApp-8MiB.log",
+      "field": 10,
+      "rows": 1808,
+      "distinct": 11,
+      "bits": 4,
+      "base_bytes": 319,
+      "cm_bytes": 261,
+      "base_ms": 0.023,
+      "cm_ms": 0.093,
+      "decode_ms": 0.103
+    },
+    {
+      "path": "/tmp/zform-corpus-candidates/HealthApp-8MiB.log",
+      "field": 11,
+      "rows": 1440,
+      "distinct": 6,
+      "bits": 3,
+      "base_bytes": 254,
+      "cm_bytes": 172,
+      "base_ms": 0.018,
+      "cm_ms": 0.06,
+      "decode_ms": 0.066
+    }
+  ],
+  "initial_integer_screen_method": "First 65536 rows, first-use dictionary IDs of whitespace/pipe-delimited fields. Three integer-only experts with fixed 14-bit tables; prototype cm_bytes includes a conservative 16-byte framing allowance. This screen is not a whole-file size comparison.",
+  "integration_decision": "Run mixing only after selecting column graphs, shared dictionaries and text pools; do not try it inside every pack candidate. Row-structure streams may also select it. Opt-in, including under --best, because decoding is slower.",
+  "validation": {
+    "default_archive_compatibility": "All nine tested default archives matched the pre-feature binary byte for byte.",
+    "selected_archive_determinism": "Repeated opt-in encodes matched byte for byte on all nine samples.",
+    "roundtrip": "Every A/B archive and all --best archives decoded to the original SHA256.",
+    "queries": "ZooKeeper ERROR grep and CloudTrail eventName projection filtered on eventSource produced identical results with and without mixing.",
+    "core_tests": "176 passed, 1 ignored, 0 failed in 0.12 seconds; one-second deadline.",
+    "new_tests": "Wire fixture, extreme signed values, parameter/byte/allocation limits, truncation and trailing bytes, scoped selection, noise/constant fallback, and lazy dictionary reads.",
+    "public_library_tests": "23 passed, 0 failed in 0.17 seconds; one-second deadline.",
+    "build": "Release CLI, core examples, and both libraries built; default output compatibility also checked against the pre-feature executable."
+  },
+  "source_sha256": {
+    "crates/zform-core/src/payload/context_mix.rs": "c4210aeb19d07032516f464379597bc9e51730d6d51151e18e2513c584db56ed",
+    "crates/zform-core/src/payload/graph.rs": "ced9c0342dbebca2eaea9aaa92b157b418678d492b1560e9e8bf55192b378702",
+    "crates/zform-core/src/payload/mod.rs": "9fdcca77bf0f40d175048b6ba8f003e9e0efe6cb2695c91e5eecb793557c4ec8",
+    "crates/zform-core/src/packs.rs": "adb2319385a888bee21465ccb39cad46474af66097714b5a1673eba3d7c4c51f",
+    "crates/zform-core/src/container.rs": "f3d0b05b48876ace595a923a3827fc8bc77e130e24b5208ce260bb66011f97e8",
+    "crates/zform-core/src/inspect.rs": "005e250fadd772946523c8f42a51ca08a1ad606222ff1c55006be49a61a7aeb9",
+    "crates/zform-cli/src/main.rs": "dd961720cb9ca8dbb548ce28d3ccd9b0179c6a2a71a07796a8b7de80575f1d7e",
+    "bench/context_mixing.py": "7f38e140e4ea612c21a7e5aa189743b3967e53d1001cbc3ccea21a4fdbe70c69"
+  }
+}
