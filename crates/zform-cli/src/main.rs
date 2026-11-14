@@ -307,7 +307,7 @@ fn cmd_pack(args: &[String]) -> Result<(), String> {
     check_not_same_file(input, output)?;
     if let Some(p) = input.filter(|p| *p != "-") {
         let budget = dict_bytes.unwrap_or(if best { 8 << 20 } else { 0 });
-        file_dictionary(p, &mut opts, budget)?;
+        file_profile(p, &mut opts, budget)?;
     }
     let rdr = open_input(input)?;
     let mut wtr = open_output(output)?;
@@ -315,26 +315,41 @@ fn cmd_pack(args: &[String]) -> Result<(), String> {
     wtr.flush().map_err(|e| e.to_string())
 }
 
-/// Gives `opts` a dictionary for packing the file at `path`, chosen in a pass over it, unless the
-/// file is one block or less or no text value recurs across its blocks. The profile trained to
-/// choose it is kept for the write, which then does not train its own.
-fn file_dictionary(path: &str, opts: &mut PackOptions, max_bytes: usize) -> Result<(), String> {
+/// Gives `opts` a profile for the file at `path` when it is more than one chunk or a dictionary
+/// is asked for, trained on samples from across the file, which hold the key layouts that turn up
+/// later; for text, it extends the profile a stream would train on its head. Then a dictionary,
+/// chosen in a pass over the file, unless the file is one block or less or no text value recurs
+/// across its blocks.
+fn file_profile(path: &str, opts: &mut PackOptions, max_bytes: usize) -> Result<(), String> {
     let io_err = |e: io::Error| format!("{path}: {e}");
     let err = |e: zform::Error| format!("{path}: {e}");
     let mut f = File::open(path).map_err(io_err)?;
     let meta = f.metadata().map_err(io_err)?;
-    if max_bytes == 0 || !meta.is_file() || meta.len() <= opts.block_bytes as u64 {
+    if !meta.is_file() {
         return Ok(());
     }
-    let mut trained = opts.clone();
-    if opts.profile.is_none() {
-        trained.profile = Some(train_seekable(&mut f, &opts.train, None).map_err(err)?);
+    let dict = max_bytes > 0 && meta.len() > opts.block_bytes as u64;
+    if opts.profile.is_none() && (dict || meta.len() > opts.chunk_bytes as u64) {
+        // A JSON tree is trained afresh from any sample: the head's plan helps text alone.
+        let mut lead = [0u8; 256];
+        let n = f.read(&mut lead).map_err(io_err)?;
+        let json = lead[..n].iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'{');
+        f.seek(SeekFrom::Start(0)).map_err(io_err)?;
+        let head = if json {
+            None
+        } else {
+            Some(train(&mut f, &opts.train, None).map_err(err)?)
+        };
+        let prof = train_seekable(&mut f, &opts.train, head.as_ref()).map_err(err)?;
+        opts.profile = Some(prof);
         f.seek(SeekFrom::Start(0)).map_err(io_err)?;
     }
+    if !dict {
+        return Ok(());
+    }
     let rdr = BufReader::with_capacity(256 << 10, f);
-    if let Some(dict) = build_dictionary(rdr, &trained, max_bytes).map_err(err)? {
-        opts.profile = trained.profile;
-        opts.dictionary = Some(Arc::new(dict));
+    if let Some(d) = build_dictionary(rdr, opts, max_bytes).map_err(err)? {
+        opts.dictionary = Some(Arc::new(d));
     }
     Ok(())
 }

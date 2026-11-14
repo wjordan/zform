@@ -928,6 +928,8 @@ pub struct JsonTreeBlockSplitter {
     key_buf: Vec<u8>,
     child_slots: Vec<ChildSlot>,
     scope: Vec<Option<(usize, usize)>>,
+    /// Bytes of objects whose key layout no kept shape matched, stored whole.
+    pub unshaped_bytes: usize,
 }
 
 impl JsonTreeBlockSplitter {
@@ -938,6 +940,7 @@ impl JsonTreeBlockSplitter {
             key_buf: Vec::with_capacity(256),
             child_slots: Vec::with_capacity(64),
             scope: vec![None; jt.paths.len()],
+            unshaped_bytes: 0,
         }
     }
 
@@ -1015,6 +1018,9 @@ impl JsonTreeBlockSplitter {
 
         if shape_id == 0 {
             self.child_slots.truncate(mark);
+            if v.kind == J_OBJECT {
+                self.unshaped_bytes += (v.end - v.start) as usize;
+            }
             if pdef.value_col != u16::MAX {
                 let raw_sub = &line[v.start as usize..v.end as usize];
                 push_json_val_occ(

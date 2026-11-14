@@ -1196,6 +1196,8 @@ pub struct SplitResult<'a> {
     pub scratch: RowScratch,
     pub residual_rows: usize,
     pub residual_bytes: usize,
+    /// JSON objects stored whole because their key layout is not in the plan.
+    pub unshaped_bytes: usize,
 }
 
 /// Routes every record in `records` through `plan`, appending only present occurrences to `col_occs[cid]`!
@@ -1316,8 +1318,8 @@ pub fn split_records_with_plan<'a>(records: &[&'a [u8]], plan: &ModelPlan) -> Sp
         residual_bytes += line.len();
     }
 
-    let json_struct_streams = json_splitter
-        .map(|js| js.struct_streams)
+    let (json_struct_streams, unshaped_bytes) = json_splitter
+        .map(|js| (js.struct_streams, js.unshaped_bytes))
         .unwrap_or_default();
 
     let mut per_row = vec![false; n_cols];
@@ -1336,6 +1338,7 @@ pub fn split_records_with_plan<'a>(records: &[&'a [u8]], plan: &ModelPlan) -> Sp
         scratch,
         residual_rows,
         residual_bytes,
+        unshaped_bytes,
     }
 }
 

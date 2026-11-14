@@ -785,6 +785,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_new_key_layout_extends_the_plan_once() {
+        let rec = |i: usize, coc: bool| {
+            let coc = if coc { format!(",\"coc\":\"k{}\"", i % 3) } else { String::new() };
+            let (name, size, stars) = (i * 7 % 101, i * 13 % 997, i % 50);
+            format!("{{\"id\":{i},\"repo\":{{\"name\":\"r{name}\",\"size\":{size}{coc},\"stars\":{stars}}}}}\n")
+        };
+        let chunk = |coc: bool, from: usize| (from..from + 200).map(|i| rec(i, coc)).collect::<String>();
+        let shapes = |enc: &StreamEncoder| {
+            let jt = enc.active_plan().unwrap().json_tree.as_ref().unwrap();
+            jt.paths.iter().find(|p| p.name == "$.repo").unwrap().shapes.len()
+        };
+        let mut enc = StreamEncoder::new(PackOptions::default());
+        let (mut out, mut raw) = (Vec::new(), String::new());
+        for (coc, from, want) in [(true, 0, 1), (false, 200, 2), (true, 400, 2), (false, 600, 2)] {
+            let c = chunk(coc, from);
+            enc.encode_frame(c.as_bytes(), &mut out).unwrap();
+            raw.push_str(&c);
+            assert_eq!(shapes(&enc), want, "after the chunk from row {from}");
+        }
+        enc.finish(&mut out).unwrap();
+        // One sync frame to start, one for the new layout; the old one coming back reuses it.
+        let rep = inspect_stream(&out[..], &DecodeBudget::default()).unwrap();
+        assert_eq!((rep.frames, rep.sync_frames), (4, 2));
+        let mut restored = Vec::new();
+        unpack(&out[..], &mut restored).unwrap();
+        assert_eq!(raw.as_bytes(), &restored[..]);
+    }
+
     fn mixed_record(i: usize) -> String {
         let svc = ["auth", "cart", "search", "billing", "gateway", "ledger"][(i / 700) % 6];
         let ts = format!(

@@ -11,7 +11,9 @@ use crate::codecs::{
 use crate::framing::{
     FramedChunk, FramingSpec, ResolvedFraming, emit_framed_record, split_chunk, split_json_array,
 };
-use crate::grammar::{BlockReconstructor, ModelPlan, OccRef, PlanVariant, split_records_with_plan};
+use crate::grammar::{
+    BlockReconstructor, ModelPlan, OccRef, PlanVariant, SplitResult, split_records_with_plan,
+};
 use crate::index::{
     BlockDir, BlockKind, ColEntry, FilterBuilder, INDEX_MAGIC, IndexBuilder, KIND_JSON, KIND_RESIDUAL,
     KIND_SHAPE, KIND_SHAPE_CELL, tokens,
@@ -114,6 +116,11 @@ pub struct FrameFit {
     pub residual_bytes: usize,
 }
 
+/// About 256 KiB of `samples`: a layout of a few percent there still clears the trainer's floor.
+fn keep_rows(samples: &[&[u8]]) -> Vec<Vec<u8>> {
+    sample_strided(samples, 4096, 256 << 10).iter().map(|r| r.to_vec()).collect()
+}
+
 // ============================================================================
 // 1. Stateful Multi-Frame Stream Encoder
 // ============================================================================
@@ -128,6 +135,9 @@ pub struct StreamEncoder {
     frames: usize,
     comp_offset: u64,
     seeds: Seeds,
+    /// A slice of the rows the plan was trained on: a retrain sees them too, so it keeps the
+    /// layouts that the new chunk lacks.
+    trained_rows: Vec<Vec<u8>>,
 }
 
 impl StreamEncoder {
@@ -143,6 +153,7 @@ impl StreamEncoder {
             frames: 0,
             comp_offset: 0,
             seeds: Seeds::default(),
+            trained_rows: Vec::new(),
         }
     }
 
@@ -222,9 +233,11 @@ impl StreamEncoder {
         if let Some(cur_plan) = &self.active_plan {
             if self.opts.allow_drift_retrain && !pilot.is_empty() {
                 let ps = split_records_with_plan(&pilot, cur_plan);
+                // A JSON object in a key layout the plan lacks is stored whole: drift as well.
+                let missed = |ps: &SplitResult| ps.residual_bytes + ps.unshaped_bytes;
                 let pilot_bytes: usize = pilot.iter().map(|r| r.len()).sum();
                 let row_ratio = ps.residual_rows as f64 / pilot.len().max(1) as f64;
-                let byte_ratio = ps.residual_bytes as f64 / pilot_bytes.max(1) as f64;
+                let byte_ratio = missed(&ps) as f64 / pilot_bytes.max(1) as f64;
                 if (row_ratio > self.opts.drift_residual_ratio
                     || byte_ratio > self.opts.drift_residual_ratio)
                     && self.backoff.should_probe()
@@ -234,11 +247,14 @@ impl StreamEncoder {
                         self.opts.train.max_sample_rows,
                         self.opts.train.max_sample_bytes,
                     );
+                    let mut both = samples.clone();
+                    both.extend(self.trained_rows.iter().map(|r| r.as_slice()));
                     let extended =
-                        train_from_records(&samples, fc.framing, &self.opts.train, Some(cur_plan));
+                        train_from_records(&both, fc.framing, &self.opts.train, Some(cur_plan));
                     let new_ps = split_records_with_plan(&pilot, &extended);
-                    if new_ps.residual_bytes + 64 < ps.residual_bytes {
+                    if missed(&new_ps) + 64 < missed(&ps) {
                         self.active_plan = Some(extended);
+                        self.trained_rows = keep_rows(&samples);
                         plan_changed = true;
                         self.backoff.record_success();
                     } else {
@@ -256,6 +272,7 @@ impl StreamEncoder {
             let ps = split_records_with_plan(&pilot, &trained);
             if coded || trained.variants.len() > 1 && ps.residual_rows * 10 < pilot.len() * 9 {
                 self.active_plan = Some(trained);
+                self.trained_rows = keep_rows(&samples);
                 plan_changed = true;
                 self.backoff.record_success();
             } else {
