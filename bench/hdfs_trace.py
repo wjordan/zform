@@ -192,10 +192,28 @@ for _n, _m in list(globals().items()):
     if isinstance(_m, IntM): INTM.add(_n); _m.m.name = None
     if isinstance(_m, (Cat, IntM)): _m.name = _n
 WIN = int(os.environ.get("WIN", 0)) or len(rows)
-allrows = rows
-for w0 in range(0, len(allrows), WIN):
-    rows = allrows[w0:w0 + WIN]; WI[0] = w0
-    nodehist.clear(); offset.clear(); ctr.clear(); THRT.clear(); RT.clear(); NH.clear(); prev_state = None; prev_t0 = None; subh = defaultdict(list)
+KEEP = set(filter(None, os.environ.get("KEEP", "").split(",")))  # state carried across windows: blk, node, del
+allrows = rows; INV_CARRY = []; ENT = {}; _o0 = None; subh = defaultdict(list)
+if os.environ.get('WINB'):  # windows of whole block lifecycles, blocks in generator order
+    _bk = lambda r: next((v for t, v in r[3] if t == 'B'), None)
+    _cnt = defaultdict(int)
+    for r in allrows: _cnt[_bk(r)] += 1
+    _a = next(state_of(k) for k in _cnt if k is not None and state_of(k) is not None)
+    _ord = sorted(_cnt, key=lambda k: (0, dist(_a, state_of(k))) if k is not None and state_of(k) is not None else (1, 0))
+    _win = {}; _w = _n = 0
+    for k in _ord:
+        if _n >= WIN: _w += 1; _n = 0
+        _win[k] = _w; _n += _cnt[k]
+    _wins = defaultdict(list)
+    for r in allrows: _wins[_win[_bk(r)]].append(r)
+    WINDOWS = [_wins[w] for w in sorted(_wins)]
+else:
+    WINDOWS = [allrows[w0:w0 + WIN] for w0 in range(0, len(allrows), WIN)]
+for w0, rows in enumerate(WINDOWS):
+    WI[0] = w0
+    if 'node' not in KEEP: nodehist.clear(); offset.clear(); ctr.clear(); THRT.clear(); RT.clear(); NH.clear()
+    if 'blk' not in KEEP: prev_state = None; prev_t0 = None
+    if 'del' not in KEEP: subh = defaultdict(list)
     groups = {}; DELROWS = []
     for r in rows:
         k = next((v for t, v in r[3] if t == 'B'), None)
@@ -206,8 +224,9 @@ for w0 in range(0, len(allrows), WIN):
     for k in groups:
         st = state_of(k)
         if st is None: continue
-        if _o is None: _o = st
+        if _o is None: _o = _o0 if 'blk' in KEEP and _o0 is not None else st
         _idx[k] = dist(_o, st)
+    _o0 = _o
     groups = dict(sorted(groups.items(), key=lambda kv: (0, _idx[kv[0]]) if kv[0] in _idx else (1, 0)))
     for key, g in groups.items():
         st = state_of(key)
@@ -223,6 +242,8 @@ for w0 in range(0, len(allrows), WIN):
         dn_all = [n for n in nodes if n not in (None, 'NN')]
         hist = []; vals = defaultdict(list); pt = t0; dprev = 0
         vals['B'] = [key]; seen_tn = []; samenode = {}; upst = {}
+        if 'ent' in KEEP and key in ENT:
+            for t_, l_ in ENT[key].items(): vals[t_] = list(l_)
         lastthr = {}  # node -> (thread, tid) within block
         for (ts, th, tid, slots), node in zip(g, nodes):
             CUR[0] = tid
@@ -384,10 +405,11 @@ for w0 in range(0, len(allrows), WIN):
                     vv = [v for t2, v in slots if t2 == ty_]
                     if vv: samenode[(node, ty_)] = (tid, vv)
         add('tpl', tplM.cost(tuple(hist[-2:]), END, 8))
+        if 'ent' in KEEP: ENT[key] = {t_: l_[:8] for t_, l_ in vals.items()}
     pend = defaultdict(list); pipe = defaultdict(set)
     ev = []
-    for r in rows:
-        if r[2] in INV_T: ev.append((r[0], 0, r))
+    winv = [r for r in rows if r[2] in INV_T] + (INV_CARRY if 'del' in KEEP else [])
+    for r in winv: ev.append((r[0], 0, r))
     for r in DELROWS: ev.append((r[0], 1, r))
     ev.sort(key=lambda e: (e[0], e[1]))
     # encoder: assign nodes
@@ -404,7 +426,9 @@ for w0 in range(0, len(allrows), WIN):
             i, X = best; pend[X].pop(i); pipe[b].discard(X); assigned.append((r, X, i))
     # coding: per second, per node (sorted), blocks ascending; ranks over replayed pending sets
     pend2 = defaultdict(list)
-    invs = sorted(((r[0], r[3][0][1], r[3][1][1]) for r in rows if r[2] in INV_T))
+    invs = sorted(((r[0], r[3][0][1], r[3][1][1]) for r in winv))
+    left = {(b, X) for X, p in pend.items() for b in p}
+    INV_CARRY = [r for r in winv if (r[3][0][1], r[3][1][1]) in left]
     grp = defaultdict(list); esc = []
     for r, X, i in assigned:
         if X is None: esc.append(r)

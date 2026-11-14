@@ -39,7 +39,7 @@ pub const FLAG_REUSE_PREV_MODEL: u16 = 1 << 2;
 pub const FLAG_SYNC_POINT: u16 = 1 << 3;
 pub const FLAG_DICTIONARY: u16 = 1 << 4;
 /// Each block stores its rows in any order; the reader restores them by sorting on
-/// [`collation_key`].
+/// [`collation_key`]. The frame's records are its blocks' records in block order.
 pub const FLAG_SORTED_ROWS: u16 = 1 << 5;
 
 /// The key a sorted-rows block's records ascend by: ASCII letters and digits only, letters folded
@@ -366,8 +366,7 @@ impl StreamEncoder {
             };
             let mut body = Vec::new();
             let plan = self.active_plan.as_ref().unwrap();
-            sorted = self.opts.packs.orders_rows() && collation_sorted(&all_recs);
-            let (frame_blocks, library) = {
+            let (frame_blocks, library, frame_sorted) = {
                 let _dict = Scope::enter(self.opts.dictionary.clone());
                 with_seeds(&mut self.seeds, || {
                     encode_structural_blocks(
@@ -386,12 +385,13 @@ impl StreamEncoder {
                             0
                         },
                         code,
-                        sorted,
+                        self.opts.packs.orders_rows(),
                         &mut body,
                     )
                 })
             };
             blocks = frame_blocks;
+            sorted = frame_sorted;
             self.active_plan.as_mut().unwrap().library = library;
             let plan = self.active_plan.as_ref().unwrap();
             if !reuse_prev {
@@ -598,9 +598,9 @@ fn encode_structural_blocks(
     filter_bits: Option<usize>,
     page_bytes: usize,
     code: CodeSharing,
-    sorted: bool,
+    reorder: bool,
     out: &mut Vec<u8>,
-) -> (Vec<FrameBlock>, Arc<Library>) {
+) -> (Vec<FrameBlock>, Arc<Library>, bool) {
     let mut bounds = Vec::new();
     let mut s = 0usize;
     while s < all_recs.len() {
@@ -617,6 +617,8 @@ fn encode_structural_blocks(
         bounds.push((s, e));
         s = e;
     }
+    // Every block of the frame must sort back into its records for any to be stored reordered.
+    let sorted = reorder && bounds.iter().all(|&(s, e)| collation_sorted(&all_recs[s..e]));
     // A library this frame makes is shared by its blocks and, when the stream goes on, by the
     // frames that reuse the model: code is priced as that many uses.
     let (keep_single, share) = match code {
@@ -675,7 +677,7 @@ fn encode_structural_blocks(
         });
         out.extend_from_slice(&eb.bytes);
     }
-    (blocks, library)
+    (blocks, library, sorted)
 }
 
 /// Where a frame's blocks get their library.

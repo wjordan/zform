@@ -94,6 +94,8 @@ python3 bench/hdfs_trace.py HDFS.log            # whole file
 WIN=60000 python3 bench/hdfs_trace.py HDFS.log  # reset per-block and per-node state every 60k rows
 RESID=1 python3 bench/hdfs_trace.py HDFS.log    # also size the residual streams under plain LZMA2
 SL=1 python3 bench/hdfs_trace.py HDFS.log       # keyed previous-row predictors only
+WIN=60000 KEEP=del python3 bench/hdfs_trace.py HDFS.log  # carry state across windows: blk,node,del,ent
+WIN=60000 WINB=1 python3 bench/hdfs_trace.py HDFS.log  # windows of whole block lifecycles
 ```
 
 | Input | `--hdfs-predictors --context-mixing`, file order | The same, rows by block | Trace model, whole input | 60k-row windows |
@@ -136,6 +138,15 @@ the hidden logging node. Without it, keyed deltas do not pay. On the reordered p
 keyed by the Receiving line's node cost 1.28 MB, against 1.22 MB for the current coding. Ports
 keyed by source IP cost 625 KB, against 602 KB raw: the line prints the destination IP as the
 source. The 0.4 MB gap to the full predictors is all thread ids.
+
+Across 60k-row windows, the state worth carrying is the pending deletes. Carrying them gives
+18,432,367 B; carrying everything else gives nothing (21,070,123). The pending set at a
+window boundary averages 23.5k entries (max 280k), so snapshotting it per block costs more than
+it saves. Windows of whole block lifecycles, blocks in generator order, give 16,034,397 B at
+60k rows and 15,461,397 at 240k. Because the file is collation-sorted, such blocks are sorted
+runs that a reader merges, but a point in time then falls in a median of 30 of them. zform
+itself gains nothing from either: 32 to 512 MiB blocks give 25.0 to 28.9 MB, and lifecycle
+blocks give 25,410,777 B, as time and thread costs rise by more than block ids fall.
 
 ## field partition search
 

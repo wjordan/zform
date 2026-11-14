@@ -71,7 +71,7 @@ A `.zfm` file is one or more `ZFM1` frames, optionally followed by a `ZFIX` inde
 | `0x0004` | `FLAG_REUSE_PREV_MODEL` | The frame uses the `ModelPlan` of the preceding structured frame of the stream. |
 | `0x0008` | `FLAG_SYNC_POINT` | The frame decodes without any frame before it: it carries its `ModelPlan` or is passthrough. |
 | `0x0010` | `FLAG_DICTIONARY` | The frame is the stream's dictionary and holds no records. |
-| `0x0020` | `FLAG_SORTED_ROWS` | Each block stores its rows in any order. The reader restores a block by sorting its records on their collation key: the ASCII letters and digits, letters lowercased, compared bytewise. The writer sets it only when that sort gives the input back, so records with equal keys are equal. |
+| `0x0020` | `FLAG_SORTED_ROWS` | Each block stores its rows in any order. The reader restores a block by sorting its records on their collation key: the ASCII letters and digits, letters lowercased, compared bytewise. The writer sets it only when sorting each block gives its records back, so records with equal keys are equal; the frame's records are its blocks' records in block order. |
 
 A dictionary frame comes first in its stream. Its payload is one entropy leaf holding the dictionary's content, `raw_len` is the content's length, and `content_xxh64`, which is required, is the dictionary's id. The `ZstdDict` leaves of the frames after it, up to the next index region, decode against that content. Content that begins with Zstandard's dictionary magic `37 A4 30 EC` is not valid; a writer puts a zero byte before it.
 
