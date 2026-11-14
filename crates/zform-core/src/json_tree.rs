@@ -2726,7 +2726,8 @@ fn discover_json_derivations(json_rows: &[&[u8]], jt: &mut JsonTreePlan) {
     let mut scope: Vec<Option<&[u8]>> = vec![None; n_paths];
 
     // Collect up to `DERIV_MAX_OCC` occurrences with active in-scope predecessors!
-    for &row in json_rows.iter().take(1024) {
+    // Strided, not the head: rows sorted by kind would show one kind's paths only.
+    for &row in json_rows.iter().step_by(json_rows.len().div_ceil(2048).max(1)) {
         if !doc.parse_root_object(row) {
             continue;
         }
@@ -3080,7 +3081,7 @@ fn discover_nested_json_strings(
     let mut doc = JsonDoc::default();
     let mut string_samples: HashMap<u16, Vec<Vec<u8>>> = HashMap::new();
 
-    for &row in json_rows.iter().take(512) {
+    for &row in json_rows.iter().step_by(json_rows.len().div_ceil(512).max(1)) {
         if !doc.parse_root_object(row) {
             continue;
         }

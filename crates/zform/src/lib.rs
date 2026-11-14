@@ -65,8 +65,8 @@ pub fn train<R: Read>(
     Ok(Profile::from_plan(plan))
 }
 
-/// Trains a [`Profile`] by sampling strided 64 KiB windows evenly across an entire seekable file/archive,
-/// avoiding head-of-file schema bias without reading multi-GB files into RAM!
+/// Trains a [`Profile`] on a few records from each of many windows spread evenly over a seekable
+/// file, so neither the head of the file nor its order decides the schema.
 pub fn train_seekable<R: Read + Seek>(
     reader: &mut R,
     opts: &TrainOptions,
@@ -85,7 +85,11 @@ pub fn train_seekable<R: Read + Seek>(
         return train(reader, opts, prior);
     }
     const WIN_BYTES: usize = 64 << 10;
-    let n_wins = (opts.max_sample_bytes / WIN_BYTES).clamp(4, 256);
+    // Many windows with a small quota each: a file sorted by record kind keeps each kind in one
+    // stretch, and a cap on the whole sample would stop before the file's end.
+    let n_wins = (opts.max_sample_bytes / (16 << 10)).clamp(4, 4096);
+    let row_quota = (opts.max_sample_rows / n_wins).max(1);
+    let byte_quota = opts.max_sample_bytes / n_wins;
     let max_off = total_len.saturating_sub(WIN_BYTES as u64);
     let mut collected = Vec::<Vec<u8>>::new();
     let mut win_buf = vec![0u8; WIN_BYTES];
@@ -108,17 +112,17 @@ pub fn train_seekable<R: Read + Seek>(
             Some(p) => start + p,
             None => continue,
         };
+        let (mut rows, mut bytes) = (0, 0);
         for line in slice[start..end].split(|&b| b == b'\n') {
             let clean = line.strip_suffix(b"\r").unwrap_or(line);
             if !clean.is_empty() {
                 collected.push(clean.to_vec());
-                if collected.len() >= opts.max_sample_rows {
+                rows += 1;
+                bytes += clean.len();
+                if rows >= row_quota || bytes >= byte_quota {
                     break;
                 }
             }
-        }
-        if collected.len() >= opts.max_sample_rows {
-            break;
         }
     }
     if collected.is_empty() {
