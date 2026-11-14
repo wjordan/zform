@@ -5119,6 +5119,10 @@ impl PackRegistry {
                 }
                 let col_bytes: usize = vals.iter().map(|b| b.len()).sum();
                 let mean_len = col_bytes / vals.len().max(1);
+                // Cells of one length are ids, not text: pages would split what repeats in them.
+                if vals.iter().all(|b| b.len() == mean_len) {
+                    continue;
+                }
                 if (mean_len >= 40 || dict_groups.get(cid).copied().unwrap_or("") == "text")
                     && col_bytes >= 256
                     && total_prose_bytes + col_bytes <= (16 << 20)

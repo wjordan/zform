@@ -2576,3 +2576,46 @@ fn recency_codes_out_of_range_are_refused() {
         );
     }
 }
+
+#[test]
+fn text_pool_leaves_out_cells_of_one_length() {
+    // Two prose columns that share words, and commit ids that reached the pool as raw text.
+    let mut r = Rng::new(7);
+    let letters = b"aenrstol";
+    let words: Vec<String> = (0..300)
+        .map(|_| (0..r.range(3, 9)).map(|_| r.pick(letters) as char).collect())
+        .collect();
+    let prose = |r: &mut Rng| {
+        let n = r.range(20, 40);
+        let s: Vec<&str> = (0..n).map(|_| words[r.below(300) as usize].as_str()).collect();
+        format!("\"{}\"", s.join(" "))
+    };
+    let hex = |r: &mut Rng| {
+        let id: String = r.bytes(20).iter().map(|b| format!("{b:02x}")).collect();
+        format!("\"{id}\"")
+    };
+    let cols: Vec<Vec<String>> = vec![
+        (0..1000).map(|_| prose(&mut r)).collect(),
+        (0..1000).map(|_| prose(&mut r)).collect(),
+        (0..1000).map(|_| hex(&mut r)).collect(),
+    ];
+    let occ: Vec<Vec<&[u8]>> =
+        cols.iter().map(|c| c.iter().map(|v| v.as_bytes()).collect()).collect();
+    let enc = PackRegistry::default().encode_dense_block(
+        &occ,
+        &["text"; 3],
+        &[Vec::new(), Vec::new(), Vec::new()],
+        &mut [None, None, None],
+        &[false; 3],
+        None,
+        None,
+        EntropyBackend::Zstd,
+        3,
+    );
+    let budget = DecodeBudget::default();
+    let pooled = |c: usize| {
+        let g = PayloadGraph::decode(&enc.col_blobs[c], &budget).unwrap();
+        g.nodes.iter().any(|n| matches!(n, GraphNode::ExtPool))
+    };
+    assert!(pooled(0) && pooled(1) && !pooled(2));
+}
