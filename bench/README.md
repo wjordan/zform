@@ -96,10 +96,16 @@ RESID=1 python3 bench/hdfs_trace.py HDFS.log    # also size the residual streams
 SL=1 python3 bench/hdfs_trace.py HDFS.log       # keyed previous-row predictors only
 ```
 
-| Input | `--hdfs-predictors --context-mixing` | Trace model, whole input | 60k-row windows |
-|---|---:|---:|---:|
-| First 256 MiB (LF line ends) | 5,755,995 | 3,495,157 | 3,939,185 |
-| HDFS.log | 32,709,019 | 15,192,577 | 21,053,965 |
+| Input | `--hdfs-predictors --context-mixing`, file order | The same, rows by block | Trace model, whole input | 60k-row windows |
+|---|---:|---:|---:|---:|
+| First 256 MiB (LF line ends) | 5,755,995 | 5,189,860 | 3,495,157 | 3,939,185 |
+| HDFS.log | 32,709,019 | 25,499,260 | 15,192,577 | 21,053,965 |
+
+"Rows by block" is what `--hdfs-predictors` now writes when the input is collation-sorted
+(`FLAG_SORTED_ROWS`). Each block stores rows grouped by block id: write-pipeline rows by
+thread, then the block's other rows. Groups follow `java.util.Random` order. That cut `$blk_id`
+on the prefix from 1,128 KB to 130 KB, below the trace model's 166 KB. The other rows' times
+and threads lost about 0.7 MB of that back.
 
 Estimates omit the template text (about 5 KB). Most of the gain comes from relations the
 column codecs cannot see:
@@ -125,11 +131,11 @@ models on the 256 MiB prefix:
 | All | 3,495,157 | 3,939,185 | 3,596,817 | 4,159,820 |
 | Keyed previous-row references only (`SL=1`) | 3,907,209 | 4,043,811 | 3,996,595 | 4,345,081 |
 
-The `SL=1` predictors avoid per-node thread bracketing and port counters. They need only the
-value of an earlier row with the same key (block, node, or source and destination), which
-`ExtAlign`, `MatchIndex` and `IndexCells` already express. They still need the row reordering and
-a coded node column. The 0.4 MB gap to the full predictors is all thread ids; keyed
-port references did slightly better than the counter model.
+The `SL=1` predictors avoid per-node thread bracketing and port counters, but they still need
+the hidden logging node. Without it, keyed deltas do not pay. On the reordered prefix, threads
+keyed by the Receiving line's node cost 1.28 MB, against 1.22 MB for the current coding. Ports
+keyed by source IP cost 625 KB, against 602 KB raw: the line prints the destination IP as the
+source. The 0.4 MB gap to the full predictors is all thread ids.
 
 ## field partition search
 
