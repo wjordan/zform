@@ -5,7 +5,7 @@
 //! byte, integer, recurrence, and SSA lane-program primitives, while returning lazy [`Col`] views
 //! (`Const`, `Dict`, `Pool`, `Quoted`, `Flat`) so selective queries and skipped rows stay fast.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 use crate::cells::{Cells, Col, NOT_HELD, NULL_CELL, Pool};
@@ -24,6 +24,60 @@ thread_local! {
     static ENC_OPTS: Cell<(EntropyBackend, i32)> =
         const { Cell::new((EntropyBackend::Zstd, 3)) };
     static CONTEXT_MIXING: Cell<bool> = const { Cell::new(false) };
+    static ENCODE_MEMO: RefCell<Option<EncodeMemo>> = const { RefCell::new(None) };
+}
+
+/// Candidate encoders of one block often build the same integer stream several times;
+/// these results are pure functions of the values and the encode options in scope.
+#[derive(Default)]
+struct EncodeMemo {
+    ints: FastMap<u64, Vec<(IntKey, Box<[i64]>, IntStream)>>,
+    held: usize,
+}
+
+type IntKey = (bool, EntropyBackend, i32);
+
+/// Values a memo may hold before it stops recording; it bounds memory, not output.
+const MEMO_MAX_HELD: usize = 1 << 22;
+const MEMO_MIN_LEN: usize = 32;
+
+/// Shares identical encoder work for the lifetime of the guard. Nested scopes reuse the outer memo.
+pub(crate) struct EncodeMemoScope(bool);
+
+impl EncodeMemoScope {
+    pub(crate) fn new() -> Self {
+        Self(ENCODE_MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            let fresh = m.is_none();
+            if fresh {
+                *m = Some(EncodeMemo::default());
+            }
+            fresh
+        }))
+    }
+}
+
+impl Drop for EncodeMemoScope {
+    fn drop(&mut self) {
+        if self.0 {
+            ENCODE_MEMO.with(|m| m.borrow_mut().take());
+        }
+    }
+}
+
+fn int_key() -> IntKey {
+    let (backend, level) = ENC_OPTS.with(Cell::get);
+    (CONTEXT_MIXING.with(Cell::get), backend, level)
+}
+
+fn hash_ints(vals: &[i64]) -> u64 {
+    use core::hash::Hasher;
+    let mut h = FastHasher::default();
+    for &v in vals {
+        h.write_i64(v);
+    }
+    h.write_usize(vals.len());
+    h.finish()
 }
 
 /// Enables the bounded integer context-mixing candidate within `f`. The fast numeric path
@@ -260,6 +314,38 @@ impl IntStream {
 
     /// Automatically chooses the smallest domain-agnostic encoding for `vals`.
     pub fn auto_encode(vals: &[i64]) -> Self {
+        if vals.len() < MEMO_MIN_LEN || ENCODE_MEMO.with(|m| m.borrow().is_none()) {
+            return Self::auto_encode_uncached(vals);
+        }
+        let key = int_key();
+        let h = hash_ints(vals);
+        let hit = ENCODE_MEMO.with(|m| {
+            let m = m.borrow();
+            let entries = m.as_ref()?.ints.get(&h)?;
+            entries
+                .iter()
+                .find(|(k, v, _)| *k == key && **v == *vals)
+                .map(|(_, _, s)| s.clone())
+        });
+        if let Some(s) = hit {
+            return s;
+        }
+        let s = Self::auto_encode_uncached(vals);
+        ENCODE_MEMO.with(|m| {
+            if let Some(m) = m.borrow_mut().as_mut()
+                && m.held + vals.len() <= MEMO_MAX_HELD
+            {
+                m.held += vals.len();
+                m.ints
+                    .entry(h)
+                    .or_default()
+                    .push((key, vals.into(), s.clone()));
+            }
+        });
+        s
+    }
+
+    fn auto_encode_uncached(vals: &[i64]) -> Self {
         let base = Self::auto_encode_inner(vals, true);
         if CONTEXT_MIXING.with(Cell::get) {
             Self::consider_context_mix(vals, base)

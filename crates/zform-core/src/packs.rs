@@ -340,6 +340,7 @@ impl PackRegistry {
                 .iter()
                 .map(|c| {
                     s.spawn(move || {
+                        let _memo = crate::payload::graph::EncodeMemoScope::new();
                         let rows: Vec<&[u8]> = c.iter().map(Vec::as_slice).collect();
                         self.encode_best_graph_inner(&rows, 0).0
                     })
@@ -4752,6 +4753,7 @@ impl PackRegistry {
         level: i32,
     ) -> EncodedDenseBlock {
         let _mixing = crate::payload::graph::ContextMixScope::new(false);
+        let _memo = crate::payload::graph::EncodeMemoScope::new();
         let search = crate::payload::graph::search_level(level);
         with_encode_opts(backend, search, || {
             let n_cols = occ_streams.len();
