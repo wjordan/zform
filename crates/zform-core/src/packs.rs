@@ -200,7 +200,8 @@ pub struct RelationContext<'a, 'v> {
 
 /// Gathers a file's table columns in a pass over its records ahead of writing.
 pub trait TableBuilder {
-    fn push(&mut self, rec: &[u8]);
+    /// A chunk's records, each a span of `raw`.
+    fn push(&mut self, raw: &[u8], spans: &[(u32, u32)]);
     /// Each column's cells.
     fn finish(self: Box<Self>) -> Vec<Vec<Vec<u8>>>;
 }
@@ -325,13 +326,20 @@ impl PackRegistry {
         columns: &[Vec<Vec<u8>>],
         budget: &crate::wire::DecodeBudget,
     ) -> crate::wire::Result<Tables> {
-        let graphs: Vec<PayloadGraph> = columns
-            .iter()
-            .map(|c| {
-                let rows: Vec<&[u8]> = c.iter().map(Vec::as_slice).collect();
-                self.encode_best_graph_inner(&rows, 0).0
-            })
-            .collect();
+        let graphs: Vec<PayloadGraph> = std::thread::scope(|s| {
+            let jobs: Vec<_> = columns
+                .iter()
+                .map(|c| {
+                    s.spawn(move || {
+                        let rows: Vec<&[u8]> = c.iter().map(Vec::as_slice).collect();
+                        self.encode_best_graph_inner(&rows, 0).0
+                    })
+                })
+                .collect();
+            jobs.into_iter()
+                .map(|j| j.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+                .collect()
+        });
         Tables::new(&graphs, budget)
     }
 
@@ -579,6 +587,7 @@ pub fn invert_mt_twist_624(state: &[u32; MT_N]) -> [u32; MT_N] {
     old
 }
 
+#[derive(Clone)]
 struct MtStream {
     state: [u32; MT_N],
     words: Vec<u32>,
@@ -659,6 +668,7 @@ impl MtStream {
 }
 
 /// Shared generator-seed discovery cache across blocks of a stream.
+#[derive(Clone)]
 pub struct Seeds {
     found: Vec<(u32, MtStream)>,
     searches: u8,

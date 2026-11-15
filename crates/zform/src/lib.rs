@@ -273,6 +273,15 @@ mod tests {
     fn assert_roundtrip(raw: &[u8], opts: &PackOptions) -> Vec<u8> {
         let mut comp = Vec::new();
         pack(raw, &mut comp, opts).expect("pack");
+        if raw.len() > opts.chunk_bytes && opts.threads > 1 {
+            let one = PackOptions {
+                threads: 1,
+                ..opts.clone()
+            };
+            let mut seq = Vec::new();
+            pack(raw, &mut seq, &one).expect("pack");
+            assert!(comp == seq, "threads change the output");
+        }
         let mut restored = Vec::new();
         unpack(&comp[..], &mut restored).expect("unpack");
         assert_eq!(raw, &restored[..], "byte-exact roundtrip failed");
@@ -840,6 +849,7 @@ mod tests {
         let multi_opts = PackOptions {
             chunk_bytes: 64 << 10,
             sync_interval_frames: 3,
+            threads: 4,
             ..Default::default()
         };
         let mut big_lines = Vec::new();
@@ -891,6 +901,22 @@ mod tests {
             rng_bytes.len()
         );
         let comp_rng = assert_roundtrip(&rng_bytes, &PackOptions::default());
+
+        // 4. Frames of one model, noise, then a second model: each kind of frame, threaded.
+        let mut mixed = big_lines[..big_lines.len() / 2].to_vec();
+        for _ in 0..5 {
+            mixed.extend_from_slice(&rng_bytes);
+        }
+        mixed.push(b'\n');
+        for i in 0..6000 {
+            let l = format!("{i:05} GET /api/v{} {}ms\n", i % 3, i * 7 % 900);
+            mixed.extend_from_slice(l.as_bytes());
+        }
+        let comp_mixed = assert_roundtrip(&mixed, &multi_opts);
+        let rep = inspect_stream(&comp_mixed[..], &DecodeBudget::default()).unwrap();
+        let (frames, sync, raw) = (rep.frames, rep.sync_frames, rep.passthrough_frames);
+        assert!(frames > sync && sync > raw + 1 && raw > 0, "{rep:?}");
+
         let recs = lines(&rng_bytes);
         let needle = Predicate::Contains(recs[recs.len() / 2][..3].to_vec());
         let (rows, stats) = assert_grep(&comp_rng, &recs, &needle);

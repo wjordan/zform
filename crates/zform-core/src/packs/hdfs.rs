@@ -125,16 +125,27 @@ const ADDED: &[u8] = b"addStoredBlock: blockMap updated: ";
 const REPLICAS: usize = 3;
 
 impl TableBuilder for Replicas {
-    fn push(&mut self, rec: &[u8]) {
-        let Some(at) = memchr::memmem::find(rec, ADDED) else {
-            return;
-        };
-        let ip = &rec[at + ADDED.len()..];
-        // The model holds the port in a template literal.
-        let ip = &ip[..memchr::memchr2(b':', b' ', ip).unwrap_or(ip.len())];
-        if let Some(blk) = block_token(rec) {
-            let row = (lcg_state(rec), thread_id(rec), blk[4..].to_vec(), ip.to_vec());
-            self.rows.push(row);
+    fn push(&mut self, raw: &[u8], spans: &[(u32, u32)]) {
+        // One search over the chunk: few records match.
+        let mut next = 0;
+        for at in memchr::memmem::find_iter(raw, ADDED) {
+            let i = next + spans[next..].partition_point(|&(_, e)| e as usize <= at);
+            let Some(&(s, e)) = spans.get(i) else {
+                break;
+            };
+            next = i + 1;
+            let (s, e) = (s as usize, e as usize);
+            if at < s || at + ADDED.len() > e {
+                continue;
+            }
+            let rec = &raw[s..e];
+            let ip = &raw[at + ADDED.len()..e];
+            // The model holds the port in a template literal.
+            let ip = &ip[..memchr::memchr2(b':', b' ', ip).unwrap_or(ip.len())];
+            if let Some(blk) = block_token(rec) {
+                let row = (lcg_state(rec), thread_id(rec), blk[4..].to_vec(), ip.to_vec());
+                self.rows.push(row);
+            }
         }
     }
 

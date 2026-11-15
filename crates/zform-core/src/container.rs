@@ -8,7 +8,6 @@ use crate::codecs::{
     ensure_dense_block_column, with_seeds,
 };
 use crate::dictionary::{Dictionary, DictionaryBuilder, Scope};
-use crate::tables::Tables;
 use crate::framing::{
     FramedChunk, FramingSpec, ResolvedFraming, emit_framed_record, split_chunk, split_json_array,
 };
@@ -25,12 +24,14 @@ use crate::packs::{EncodedDenseBlock, PackRegistry, Paging};
 use crate::payload::graph::{NESTED_COLUMN_TAG, PayloadGraph};
 use crate::payload::library::{Harvest, Library, with_code_pricing};
 use crate::plan::{ProbeBackoff, Profile, TrainOptions, sample_strided, train_from_records};
+use crate::tables::Tables;
 use crate::wire::{
     Cursor, DecodeBudget, EntropyBackend, Error, Result, compress_leaf, crc32, decompress_leaf,
     leaf_raw_len, put_bytes, put_uvarint, xxh64,
 };
+use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 pub const FRAME_MAGIC: &[u8; 4] = b"ZFM1";
 
@@ -105,6 +106,8 @@ pub struct PackOptions {
     pub pool_page_bytes: usize,
     /// Pluggable writer-side codec packs evaluated on columns.
     pub packs: PackRegistry,
+    /// Frames `pack_stream` encodes at once; the output is the same for any count.
+    pub threads: usize,
 }
 
 impl Default for PackOptions {
@@ -127,6 +130,7 @@ impl Default for PackOptions {
             filter_bits: DEFAULT_FILTER_BITS,
             pool_page_bytes: DEFAULT_POOL_PAGE_BYTES,
             packs: PackRegistry::default(),
+            threads: std::thread::available_parallelism().map_or(1, |n| n.get()),
         }
     }
 }
@@ -247,20 +251,36 @@ impl StreamEncoder {
         fc: &FramedChunk<'_>,
         mut out: W,
     ) -> Result<FrameFit> {
+        self.start(&mut out)?;
+        let task = self.decide(fc);
+        // A sync frame starts afresh, so frames of different groups encode at once.
+        if !task.reuse {
+            self.seeds = Seeds::default();
+        }
+        let mut seeds = self.seeds.clone();
+        let mut enc = encode_task(&self.opts, &task, fc, self.active_plan.as_ref(), &mut seeds);
+        if !task.reuse {
+            self.seeds = seeds;
+        }
+        if let Some(p) = enc.plan.take() {
+            self.active_plan = Some(p);
+        }
+        self.emit(fc, &task, enc, out)
+    }
+
+    /// Writes what precedes the first frame.
+    fn start<W: Write>(&mut self, out: W) -> Result<()> {
         if self.comp_offset == 0
             && let Some(dict) = self.opts.dictionary.clone()
         {
-            self.write_dictionary(&dict, &mut out)?;
+            self.write_dictionary(&dict, out)?;
         }
-        let raw = fc.raw;
+        Ok(())
+    }
+
+    /// Chooses the frame's model and kind, in stream order: the model may retrain on drift.
+    fn decide(&mut self, fc: &FramedChunk<'_>) -> FrameTask {
         let all_recs: Vec<&[u8]> = (0..fc.len()).map(|i| fc.record(i)).collect();
-        let rec_bytes: usize = all_recs.iter().map(|r| r.len()).sum();
-        let mut fit = FrameFit {
-            rows: all_recs.len(),
-            bytes: rec_bytes,
-            residual_rows: all_recs.len(),
-            residual_bytes: rec_bytes,
-        };
 
         // Pilot probe (`<= 512` strided records) to detect drift BEFORE encoding the full chunk!
         let mut plan_changed = false;
@@ -323,7 +343,7 @@ impl StreamEncoder {
         }
 
         // Decide Passthrough vs Structural
-        let use_passthrough = match &self.active_plan {
+        let passthrough = match &self.active_plan {
             None => true,
             Some(p) => {
                 if all_recs.len() < 2 {
@@ -339,112 +359,68 @@ impl StreamEncoder {
             }
         };
 
-        let is_sync = use_passthrough
+        let sync = passthrough
             || plan_changed
             || self.opts.sync_interval_frames <= 1
             || self.frames_since_sync >= self.opts.sync_interval_frames - 1;
-        let reuse_prev = !use_passthrough && !is_sync;
-        let filter_bits = self.opts.index.then_some(self.opts.filter_bits);
-
-        let mut payload = Vec::new();
-        let mut blocks = Vec::new();
-        let mut sorted = false;
-        if use_passthrough {
-            compress_leaf(&mut payload, raw, self.opts.backend, self.opts.level);
+        let reuse = !passthrough && !sync;
+        let code = if reuse {
+            CodeSharing::Reuse
         } else {
-            // The blocks come first: a sync frame's model is written with the library they make.
-            let code = if reuse_prev {
-                CodeSharing::Reuse
+            // A chunk well short of full is taken for the stream's last.
+            let goes_on = fc.raw.len() * 2 >= self.opts.chunk_bytes;
+            let frames = if goes_on {
+                self.opts.sync_interval_frames.max(1)
             } else {
-                // A chunk well short of full is taken for the stream's last.
-                let goes_on = raw.len() * 2 >= self.opts.chunk_bytes;
-                let frames = if goes_on {
-                    self.opts.sync_interval_frames.max(1)
-                } else {
-                    1
-                };
-                CodeSharing::Build { frames }
+                1
             };
-            let mut body = Vec::new();
-            let plan = self.active_plan.as_ref().unwrap();
-            let (frame_blocks, library, frame_sorted) = {
-                let _dict = Scope::enter(self.opts.dictionary.clone());
-                with_seeds(&mut self.seeds, || {
-                    encode_structural_blocks(
-                        &all_recs,
-                        plan,
-                        &self.opts.packs,
-                        self.opts.backend,
-                        self.opts.level,
-                        self.opts.block_rows,
-                        self.opts.block_bytes,
-                        filter_bits,
-                        // Pages serve readers that come through the index.
-                        if self.opts.index {
-                            self.opts.pool_page_bytes
-                        } else {
-                            0
-                        },
-                        code,
-                        self.opts.packs.orders_rows(),
-                        &mut body,
-                    )
-                })
-            };
-            blocks = frame_blocks;
-            sorted = frame_sorted;
-            self.active_plan.as_mut().unwrap().library = library;
-            let plan = self.active_plan.as_ref().unwrap();
-            if !reuse_prev {
-                let mut raw_plan = Vec::new();
-                plan.encode(&mut raw_plan);
-                compress_leaf(
-                    &mut payload,
-                    &raw_plan,
-                    self.opts.backend,
-                    self.opts.level.max(3),
-                );
-                if self.opts.index {
-                    self.model_idx = self.index.model(&raw_plan);
-                }
-            }
-            if has_affixes(fc.framing) {
-                compress_leaf(&mut payload, fc.prefix, self.opts.backend, self.opts.level);
-                compress_leaf(&mut payload, fc.suffix, self.opts.backend, self.opts.level);
-            }
-            if fc.framing == ResolvedFraming::JsonArray {
-                compress_leaf(&mut payload, fc.sep(), self.opts.backend, self.opts.level);
-            }
-            for b in &mut blocks {
-                b.off += payload.len();
-            }
-            payload.extend_from_slice(&body);
-            fit.residual_rows = blocks.iter().map(|b| b.residual_rows).sum();
-            fit.residual_bytes = blocks.iter().map(|b| b.residual_bytes).sum();
-        }
-
-        // A structural payload larger than the plain leaf, as tiny or degenerate inputs give, is
-        // dropped for the leaf.
-        let mut final_passthrough = use_passthrough;
-        if !use_passthrough && raw.len() <= (1 << 20) {
-            let mut pt_trial = Vec::new();
-            compress_leaf(&mut pt_trial, raw, self.opts.backend, self.opts.level);
-            if pt_trial.len() + 32 < payload.len() {
-                payload = pt_trial;
-                final_passthrough = true;
-                (fit.residual_rows, fit.residual_bytes) = (fit.rows, fit.bytes);
-            }
-        }
-
-        let actual_sync = if final_passthrough { true } else { is_sync };
-        let actual_reuse = if final_passthrough { false } else { reuse_prev };
-        if final_passthrough {
-            // Don't reset `active_plan`, just force next structural frame to re-sync
+            CodeSharing::Build { frames }
+        };
+        // `emit` corrects this when the encoded frame falls back to passthrough.
+        if passthrough {
             self.frames_since_sync = usize::MAX;
-        } else if actual_sync {
+        } else if sync {
             self.frames_since_sync = 0;
         } else {
             self.frames_since_sync += 1;
+        }
+        FrameTask {
+            passthrough,
+            sync,
+            reuse,
+            code,
+            plan_changed,
+        }
+    }
+
+    /// Writes an encoded frame and indexes it, in stream order.
+    fn emit<W: Write>(
+        &mut self,
+        fc: &FramedChunk<'_>,
+        task: &FrameTask,
+        enc: EncodedFrame,
+        mut out: W,
+    ) -> Result<FrameFit> {
+        let EncodedFrame {
+            payload,
+            blocks,
+            sorted,
+            final_passthrough,
+            raw_plan,
+            fit,
+            ..
+        } = enc;
+        let raw = fc.raw;
+        if let Some(raw_plan) = &raw_plan
+            && self.opts.index
+        {
+            self.model_idx = self.index.model(raw_plan);
+        }
+        let actual_sync = final_passthrough || task.sync;
+        let actual_reuse = !final_passthrough && task.reuse;
+        if final_passthrough && !task.passthrough {
+            // The next structural frame re-syncs; it is decided after this one is written.
+            self.frames_since_sync = usize::MAX;
         }
 
         let mut flags = 0u16;
@@ -468,7 +444,7 @@ impl StreamEncoder {
             flags,
             self.opts.backend,
             raw.len(),
-            all_recs.len(),
+            fc.len(),
             fc.framing,
             payload.len(),
         );
@@ -517,10 +493,10 @@ impl StreamEncoder {
                     pages,
                 );
             }
-        } else if !all_recs.is_empty() {
+        } else if !fc.is_empty() {
             let mut fb = FilterBuilder::new(self.opts.filter_bits);
-            for r in &all_recs {
-                tokens(r, |t, _| fb.add(t));
+            for i in 0..fc.len() {
+                tokens(fc.record(i), |t, _| fb.add(t));
             }
             let kind = BlockKind::Verbatim {
                 framing: fc.framing,
@@ -529,7 +505,7 @@ impl StreamEncoder {
                 kind,
                 base,
                 payload.len() as u64,
-                all_recs.len() as u64,
+                fc.len() as u64,
                 &[],
                 &fb.finish(),
                 &[],
@@ -555,6 +531,141 @@ impl StreamEncoder {
         Ok(())
     }
 }
+
+/// A frame's kind and model sharing, decided in stream order.
+#[derive(Clone)]
+pub(crate) struct FrameTask {
+    passthrough: bool,
+    sync: bool,
+    reuse: bool,
+    code: CodeSharing,
+    /// The model was trained for this frame.
+    plan_changed: bool,
+}
+
+/// A frame's payload, encoded on any thread, to be written in stream order.
+pub(crate) struct EncodedFrame {
+    payload: Vec<u8>,
+    blocks: Vec<FrameBlock>,
+    sorted: bool,
+    final_passthrough: bool,
+    /// The model with the library a sync frame's blocks made.
+    plan: Option<ModelPlan>,
+    /// The model with that library, encoded, for a frame that writes its model.
+    raw_plan: Option<Vec<u8>>,
+    fit: FrameFit,
+}
+
+/// Encodes `fc` as `task` decided, with `plan` holding the library the frame starts from.
+fn encode_task(
+    opts: &PackOptions,
+    task: &FrameTask,
+    fc: &FramedChunk<'_>,
+    plan: Option<&ModelPlan>,
+    seeds: &mut Seeds,
+) -> EncodedFrame {
+    let raw = fc.raw;
+    let all_recs: Vec<&[u8]> = (0..fc.len()).map(|i| fc.record(i)).collect();
+    let rec_bytes: usize = all_recs.iter().map(|r| r.len()).sum();
+    let mut fit = FrameFit {
+        rows: all_recs.len(),
+        bytes: rec_bytes,
+        residual_rows: all_recs.len(),
+        residual_bytes: rec_bytes,
+    };
+    let filter_bits = opts.index.then_some(opts.filter_bits);
+    let mut payload = Vec::new();
+    let mut blocks = Vec::new();
+    let mut sorted = false;
+    let (mut new_plan, mut raw_plan) = (None, None);
+    if task.passthrough {
+        compress_leaf(&mut payload, raw, opts.backend, opts.level);
+    } else {
+        // The blocks come first: a sync frame's model is written with the library they make.
+        let plan = plan.expect("a structural frame has a model");
+        let fresh;
+        let plan = match task.reuse {
+            true => plan,
+            false => {
+                fresh = ModelPlan {
+                    library: Arc::default(),
+                    ..plan.clone()
+                };
+                &fresh
+            }
+        };
+        let mut body = Vec::new();
+        let (frame_blocks, lib, frame_sorted) = {
+            let _dict = Scope::enter(opts.dictionary.clone());
+            with_seeds(seeds, || {
+                encode_structural_blocks(
+                    &all_recs,
+                    plan,
+                    &opts.packs,
+                    opts.backend,
+                    opts.level,
+                    opts.block_rows,
+                    opts.block_bytes,
+                    filter_bits,
+                    // Pages serve readers that come through the index.
+                    if opts.index { opts.pool_page_bytes } else { 0 },
+                    task.code,
+                    opts.packs.orders_rows(),
+                    &mut body,
+                )
+            })
+        };
+        blocks = frame_blocks;
+        sorted = frame_sorted;
+        if !task.reuse {
+            let mut with_lib = plan.clone();
+            with_lib.library = Arc::clone(&lib);
+            let mut rp = Vec::new();
+            with_lib.encode(&mut rp);
+            compress_leaf(&mut payload, &rp, opts.backend, opts.level.max(3));
+            raw_plan = Some(rp);
+            new_plan = Some(with_lib);
+        }
+        if has_affixes(fc.framing) {
+            compress_leaf(&mut payload, fc.prefix, opts.backend, opts.level);
+            compress_leaf(&mut payload, fc.suffix, opts.backend, opts.level);
+        }
+        if fc.framing == ResolvedFraming::JsonArray {
+            compress_leaf(&mut payload, fc.sep(), opts.backend, opts.level);
+        }
+        for b in &mut blocks {
+            b.off += payload.len();
+        }
+        payload.extend_from_slice(&body);
+        fit.residual_rows = blocks.iter().map(|b| b.residual_rows).sum();
+        fit.residual_bytes = blocks.iter().map(|b| b.residual_bytes).sum();
+    }
+
+    // A structural payload larger than the plain leaf, as tiny or degenerate inputs give, is
+    // dropped for the leaf.
+    let mut final_passthrough = task.passthrough;
+    if !task.passthrough && raw.len() <= SMALL_FRAME {
+        let mut pt_trial = Vec::new();
+        compress_leaf(&mut pt_trial, raw, opts.backend, opts.level);
+        if pt_trial.len() + 32 < payload.len() {
+            payload = pt_trial;
+            final_passthrough = true;
+            (fit.residual_rows, fit.residual_bytes) = (fit.rows, fit.bytes);
+        }
+    }
+    EncodedFrame {
+        payload,
+        blocks,
+        sorted,
+        final_passthrough,
+        plan: new_plan,
+        raw_plan,
+        fit,
+    }
+}
+
+/// Raw bytes up to which a structural frame may fall back to passthrough once encoded.
+const SMALL_FRAME: usize = 1 << 20;
 
 fn frame_header(
     flags: u16,
@@ -1733,10 +1844,127 @@ pub fn decode_frame_payload<W: Write>(
 
 pub fn pack_stream<R: Read, W: Write>(reader: R, mut writer: W, opts: &PackOptions) -> Result<()> {
     let mut enc = StreamEncoder::new(opts.clone());
-    for_each_chunk(reader, opts, |fc| {
-        enc.encode_framed(fc, &mut writer).map(drop)
-    })?;
-    enc.finish(&mut writer)
+    if opts.threads <= 1 {
+        for_each_chunk(reader, opts, |fc| {
+            enc.encode_framed(fc, &mut writer).map(drop)
+        })?;
+        return enc.finish(&mut writer);
+    }
+    // Frames encode `threads` at a time and are written in order. A reuse frame waits for its
+    // sync frame's library and seeds, as `encode_framed` hands them on, so the bytes match.
+    std::thread::scope(|s| {
+        let mut queue = VecDeque::new();
+        let mut plan: Option<Arc<ModelPlan>> = None;
+        let mut group: Option<Arc<Link>> = None;
+        for_each_chunk(reader, opts, |fc| {
+            enc.start(&mut writer)?;
+            let task = enc.decide(fc);
+            if task.plan_changed || plan.is_none() {
+                plan = enc.active_plan.clone().map(Arc::new);
+            }
+            let (wait, publish) = if task.passthrough {
+                (None, None)
+            } else if task.reuse {
+                (group.clone(), None)
+            } else {
+                let next = Arc::new(Link::default());
+                group = Some(Arc::clone(&next));
+                (None, Some(next))
+            };
+            let plan = plan.clone();
+            let chunk = Arc::new(OwnedChunk::new(fc));
+            let (c, t) = (Arc::clone(&chunk), task.clone());
+            let handle = s.spawn(move || {
+                let (mut plan, mut seeds) = (plan, Seeds::default());
+                if let Some(l) = wait {
+                    let (p, sd) = l.get();
+                    (plan, seeds) = (Some(p), sd);
+                }
+                let mut frame = encode_task(opts, &t, &c.view(), plan.as_deref(), &mut seeds);
+                if let Some(l) = publish {
+                    let p = frame.plan.take().map(Arc::new).or(plan);
+                    l.set(p.expect("a structural frame has a model"), seeds);
+                }
+                frame
+            });
+            // A small frame may fall back to passthrough, which changes the next frame's kind.
+            let small = !task.passthrough && fc.raw.len() <= SMALL_FRAME;
+            queue.push_back((chunk, task, handle));
+            // Reuse frames wait on their sync frame, so the queue holds a group past the threads.
+            let depth = opts.threads + opts.sync_interval_frames;
+            while queue.len() >= depth || small && !queue.is_empty() {
+                write_job(&mut enc, queue.pop_front().unwrap(), &mut writer)?;
+            }
+            Ok(())
+        })?;
+        while let Some(job) = queue.pop_front() {
+            write_job(&mut enc, job, &mut writer)?;
+        }
+        enc.finish(&mut writer)
+    })
+}
+
+fn write_job<W: Write>(enc: &mut StreamEncoder, job: Job<'_>, out: W) -> Result<()> {
+    let (chunk, task, handle) = job;
+    let frame = handle
+        .join()
+        .unwrap_or_else(|p| std::panic::resume_unwind(p));
+    enc.emit(&chunk.view(), &task, frame, out).map(drop)
+}
+
+type Job<'s> = (
+    Arc<OwnedChunk>,
+    FrameTask,
+    std::thread::ScopedJoinHandle<'s, EncodedFrame>,
+);
+
+/// A sync frame's model and seeds once it is encoded, for the frames that start from them.
+#[derive(Default)]
+struct Link(Mutex<Option<(Arc<ModelPlan>, Seeds)>>, Condvar);
+
+impl Link {
+    fn set(&self, plan: Arc<ModelPlan>, seeds: Seeds) {
+        *self.0.lock().unwrap() = Some((plan, seeds));
+        self.1.notify_all();
+    }
+
+    fn get(&self) -> (Arc<ModelPlan>, Seeds) {
+        let g = self.1.wait_while(self.0.lock().unwrap(), |v| v.is_none());
+        let g = g.unwrap();
+        let (p, s) = g.as_ref().unwrap();
+        (Arc::clone(p), s.clone())
+    }
+}
+
+/// A framed chunk that owns its bytes, to encode on another thread.
+struct OwnedChunk {
+    framing: ResolvedFraming,
+    prefix: Vec<u8>,
+    suffix: Vec<u8>,
+    spans: Vec<(u32, u32)>,
+    raw: Vec<u8>,
+}
+
+impl OwnedChunk {
+    fn new(fc: &FramedChunk<'_>) -> Self {
+        Self {
+            framing: fc.framing,
+            prefix: fc.prefix.to_vec(),
+            suffix: fc.suffix.to_vec(),
+            spans: fc.spans.clone(),
+            raw: fc.raw.to_vec(),
+        }
+    }
+
+    fn view(&self) -> FramedChunk<'_> {
+        FramedChunk {
+            framing: self.framing,
+            prefix: &self.prefix,
+            suffix: &self.suffix,
+            spans: self.spans.clone(),
+            raw: &self.raw,
+        }
+    }
 }
 
 /// The dictionary of what `pack_stream` would write from `reader`, within `max_bytes`: `None` when
@@ -1763,14 +1991,15 @@ pub fn build_tables<R: Read>(reader: R, opts: &PackOptions) -> Result<Option<Tab
         return Ok(None);
     };
     for_each_chunk(reader, opts, |fc| {
-        (0..fc.len()).for_each(|i| b.push(fc.record(i)));
+        b.push(fc.raw, &fc.spans);
         Ok(())
     })?;
     let cols = b.finish();
     if cols.first().is_none_or(|c| c.is_empty()) {
         return Ok(None);
     }
-    opts.packs.build_tables(&cols, &DecodeBudget::default()).map(Some)
+    let budget = DecodeBudget::default();
+    opts.packs.build_tables(&cols, &budget).map(Some)
 }
 
 /// Cuts `reader` into the framed chunks `pack_stream` encodes, in order.

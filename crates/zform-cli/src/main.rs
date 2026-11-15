@@ -39,6 +39,7 @@ OPTIONS:
   --chunk-bytes <BYTES>     Streaming frame raw chunk size (default: 16777216 = 16 MiB)
   --block-bytes <BYTES>     Raw bytes per block, the unit a query reads (default: 8388608 = 8 MiB)
   --block-rows <N>          Max records per block (default: 65536)
+  --threads <N>             Frames encoded at once (default: the CPU count); the output is the same
   --dict-bytes <BYTES>      File dictionary budget, for a file input of over one block whose text
                             values recur across blocks (default: 0 = none; with --best, 1/32 of
                             the file, 8 to 32 MiB). Levels 1-4 use at most 16 MiB
@@ -290,6 +291,14 @@ fn cmd_pack(args: &[String]) -> Result<(), String> {
                     .ok_or("missing value for --block-rows")?
                     .parse()
                     .map_err(|_| "invalid --block-rows")?;
+            }
+            "--threads" => {
+                i += 1;
+                opts.threads = args
+                    .get(i)
+                    .ok_or("missing value for --threads")?
+                    .parse()
+                    .map_err(|_| "invalid --threads")?;
             }
             "--no-index" => opts.index = false,
             "-f" | "--force" | "-q" | "--quiet" | "-k" | "--keep" | "-c" | "--stdout" => {}
