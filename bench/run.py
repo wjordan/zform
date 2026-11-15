@@ -135,7 +135,7 @@ def main():
     if shutil.which("xz"):
         codecs.append(("xz -6", "xz", ["xz", "-T1", "-6", "-c"], ["xz", "-d", "-c"]))
     for label, extra in [("zform --lz4", ["--lz4"]), ("zform -3", ["-l", "3"]), ("zform --best", ["--best"])]:
-        codecs.append((label, "zfm", [zform_bin, "pack", *extra], [zform_bin, "unpack"]))
+        codecs.append((label, "zfm", [zform_bin, "pack", "--threads", "1", *extra], [zform_bin, "unpack"]))
     if TIME_BIN is None:
         print("note: GNU time not found; peak RSS is reported as n/a", file=sys.stderr)
 

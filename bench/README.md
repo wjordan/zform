@@ -98,10 +98,10 @@ WIN=60000 KEEP=del python3 bench/hdfs_trace.py HDFS.log  # carry state across wi
 WIN=60000 WINB=1 python3 bench/hdfs_trace.py HDFS.log  # windows of whole block lifecycles
 ```
 
-| Input | `--hdfs-predictors --context-mixing`, file order | The same, rows by block | Rows by block, replica table | Trace model, whole input | 60k-row windows |
-|---|---:|---:|---:|---:|---:|
-| First 256 MiB (LF line ends) | 5,755,995 | 5,305,515 | 4,868,361 | 3,495,157 | 3,939,185 |
-| HDFS.log | 32,709,019 | 25,283,398 | 23,470,438 | 15,192,577 | 21,053,965 |
+| Input | `--hdfs-predictors --context-mixing`, file order | The same, rows by block | Rows by block, replica table | Per-node clocks and counters | Trace model, whole input | 60k-row windows |
+|---|---:|---:|---:|---:|---:|---:|
+| First 256 MiB (LF line ends) | 5,755,995 | 5,305,515 | 4,868,361 | 3,925,739 | 3,495,157 | 3,939,185 |
+| HDFS.log | 32,709,019 | 25,283,398 | 23,470,438 | 17,599,245 | 15,192,577 | 21,053,965 |
 
 "Rows by block" is what `--hdfs-predictors` now writes when the input is collation-sorted
 (`FLAG_SORTED_ROWS`). Each block stores rows grouped by block id: write-pipeline rows by
@@ -114,6 +114,12 @@ block id with its first three datanodes, from the `addStoredBlock` lines, in gen
 Every datanode column keyed by block id (stored, received, served, invalidated) codes its value
 as which replica it is. On HDFS.log the table costs 1.72 MB and those five columns fall from
 4.9 MB to 1.3 MB. Served-to clients are a replica only half the time and stay as they are.
+
+"Per-node clocks and counters" is the current writer. Write times step on a start clock and a
+finish clock, thread ids on a counter per datanode, with the table's replicas and the write rows
+in pipeline order; deletion times step on a clock per datanode, taken in block-id order. The
+table lets it carry per-node state the windowed trace model resets, so it lands under that
+estimate.
 
 Estimates omit the template text (about 5 KB). Most of the gain comes from relations the
 column codecs cannot see:

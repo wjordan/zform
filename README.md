@@ -1,10 +1,10 @@
 # `zform` — Lossless Structure-Aware Compression
 
-`zform` is a lossless compressor for logs, telemetry and event streams, available as a CLI and a Rust library. It learns the structure of its input and writes files **1.3–3.2x smaller than `zstd -19`** that can be searched without unpacking them.
+`zform` is a lossless compressor for logs, telemetry and event streams, available as a CLI and a Rust library. It learns the structure of its input and writes files **1.3–3.1x smaller than `zstd -19`** that can be searched without unpacking them.
 
 | Corpus | Raw | `zstd -3` | `zstd -19` | `xz -6` | `zform` |
 |---|---:|---:|---:|---:|---:|
-| HDFS DataNode logs | 8.00 MiB | 0.72 MiB (11.1x) | 0.47 MiB (17.0x) | 0.49 MiB (16.2x) | **0.15 MiB (53.7x)** |
+| HDFS DataNode logs | 8.00 MiB | 0.72 MiB (11.1x) | 0.47 MiB (17.0x) | 0.49 MiB (16.2x) | **0.15 MiB (52.9x)** |
 | GitHub Archive NDJSON | 8.00 MiB | 0.89 MiB (8.9x) | 0.69 MiB (11.6x) | 0.69 MiB (11.6x) | **0.55 MiB (14.5x)** |
 | Silesia `sao` star catalog (binary) | 6.92 MiB | 5.29 MiB (1.31x) | 4.77 MiB (1.45x) | 4.21 MiB (1.64x) | **3.57 MiB (1.94x)** |
 
@@ -20,11 +20,11 @@ Machine-written data is full of structure: the same line layouts and keys over a
 
 `zform` keeps a stream compressor's contract and adds a columnar format's model. It learns how records split into fields, what each field's values look like, and how fields relate (`end = start + dur`, a URL built from other fields), then stores the model and only what the model cannot predict:
 
-- **Smaller files.** 1.5–4.8x smaller than `zstd -3` and 1.3–3.2x smaller than `zstd -19` on the corpora above, query index included.
+- **Smaller files.** 1.5–4.8x smaller than `zstd -3` and 1.3–3.1x smaller than `zstd -19` on the corpora above, query index included.
 - **Byte-exact output.** Formatting survives (`12.300`, `007`, `-0`, key order, whitespace). Mixed formats can share a file, and lines the model does not recognise are stored verbatim.
 - **Queries on the compressed file.** `zform grep` and `zform select` filter and project records without unpacking, skipping blocks by index and decoding only the columns a query touches.
 
-The price is CPU. On one core `zform` compresses logs at 24–41 MB/s, between `zstd -19` (3–6 MB/s) and `zstd -3` (590–740 MB/s), and decompresses at 460–540 MB/s, a third to a half of `zstd`'s speed. It suits archives of logs, events and telemetry, above all ones worth filtering in place. It does not suit hot paths where `lz4` or `zstd -1` speed matters more than size, and it gains nothing on opaque data (media, archives, encrypted payloads), which passes through at plain `zstd` ratios.
+The price is CPU. On one core `zform` compresses logs at 25–92 MB/s, between `zstd -19` (4–6 MB/s) and `zstd -3` (580–680 MB/s), and decompresses at 360–430 MB/s, a quarter to a third of `zstd`'s speed. It suits archives of logs, events and telemetry, above all ones worth filtering in place. It does not suit hot paths where `lz4` or `zstd -1` speed matters more than size, and it gains nothing on opaque data (media, archives, encrypted payloads), which passes through at plain `zstd` ratios.
 
 ## Usage
 
@@ -161,12 +161,14 @@ Single-core throughput and peak memory on the two log corpora:
 
 | Codec | Compress MB/s | Decompress MB/s | Compress RSS MiB | Decompress RSS MiB |
 |---|---:|---:|---:|---:|
-| `zstd -3` | 590–740 | 1,500–1,700 | 6.5–6.7 | 5.6–5.9 |
-| `zstd -19` | 3.3–5.6 | 930–1,200 | 92 | 11 |
-| `xz -6` | 7.1–7.9 | 350–430 | 79–91 | 10 |
-| `zform` | 24–41 | 460–540 | 31–240 | 16 |
+| `zstd -3` | 580–680 | 1,500 | 6.6–6.8 | 5.7–6.0 |
+| `zstd -19` | 3.6–6.3 | 1,100–1,200 | 92 | 11 |
+| `xz -6` | 8.7–9.4 | 380–440 | 79–91 | 10 |
+| `zform` | 25–92 | 360–430 | 38–250 | 26–30 |
 
 Larger inputs give every compressor more context. On a full hour of GitHub Archive (499 MB), `zform pack --best` writes 21.4 MB (23.3x), against 37.8 MB for `zstd -19` and 26.6 MB for `zstd --ultra -22 --long=31`; the default setting writes 30.4 MB. `--best` adds a file dictionary of values that recur across blocks, so blocks stay small and independently readable.
+
+On the whole Loghub HDFS log (1.58 GB), `zform pack` writes 35.0 MB (45x) in 12.2 s on one core and unpacks it in 2.6 s. `gzip -6` takes 13.1 s for 155.7 MB; `zstd -19` and `xz -9` write 98.3 MB and 96.3 MB. Adding `-l 6 --hdfs-predictors --context-mixing`, which models how HDFS hands out block ids, builds write pipelines, numbers threads and deletes blocks, brings the file to 17.6 MB (90x) in 18.4 s, unpacked in 5.3 s. `pack` encodes frames on every core by default and writes the same bytes: 2.3 s and 5.1 s on 24 cores.
 
 [`bench/README.md`](bench/README.md) has the commands for these tables, cold-query measurements and a CloudTrail comparison.
 
