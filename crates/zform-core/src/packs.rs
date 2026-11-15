@@ -4752,7 +4752,8 @@ impl PackRegistry {
         level: i32,
     ) -> EncodedDenseBlock {
         let _mixing = crate::payload::graph::ContextMixScope::new(false);
-        with_encode_opts(backend, level, || {
+        let search = crate::payload::graph::search_level(level);
+        with_encode_opts(backend, search, || {
             let n_cols = occ_streams.len();
             let mut col_blobs = Vec::with_capacity(n_cols);
             // What each blob counts as when sizes are compared: its length less shared code.

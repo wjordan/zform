@@ -74,6 +74,37 @@ pub(crate) fn pack_leaf(raw: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The level a column search prices leaves at; the winner is recompressed at `level`. Level 3
+/// ranks candidates as the middle levels do, at about a quarter less work on logs; the highest
+/// levels search for ratio and price at their own.
+pub(crate) fn search_level(level: i32) -> i32 {
+    match level {
+        4..=9 => 3,
+        _ => level,
+    }
+}
+
+/// `leaf` compressed afresh at `level`; `text` leaves are compressed against the dictionary.
+pub(crate) fn relevel_leaf(
+    leaf: &[u8],
+    backend: EntropyBackend,
+    level: i32,
+    text: bool,
+) -> Result<Vec<u8>> {
+    // A raw leaf may be a table a library shares by its bytes; other backends keep theirs.
+    let zstd = [EntropyBackend::Zstd as u8, EntropyBackend::ZstdDict as u8];
+    if !leaf.first().is_some_and(|t| zstd.contains(t)) {
+        return Ok(leaf.to_vec());
+    }
+    let raw = unpack_leaf(leaf, &DecodeBudget::default())?;
+    let mut out = Vec::with_capacity(leaf.len() + 12);
+    match text {
+        true => with_current(|dict| compress_leaf_with(&mut out, &raw, backend, level, dict)),
+        false => compress_leaf(&mut out, &raw, backend, level),
+    }
+    Ok(out)
+}
+
 /// A leaf of bytes, compressed against the dictionary in scope.
 #[inline]
 pub(crate) fn pack_text_leaf(raw: &[u8]) -> Vec<u8> {
@@ -207,6 +238,26 @@ pub enum IntStream {
 }
 
 impl IntStream {
+    fn relevel(&mut self, backend: EntropyBackend, level: i32) -> Result<()> {
+        match self {
+            Self::Rle { leaf, .. }
+            | Self::ForBitpack { leaf, .. }
+            | Self::ZigZagVarint { leaf, .. }
+            | Self::ForPlanes { leaf, .. } => *leaf = relevel_leaf(leaf, backend, level, false)?,
+            Self::ZigZagBytes {
+                head_leaf, tail, ..
+            }
+            | Self::ForTail255 {
+                head_leaf, tail, ..
+            } => {
+                *head_leaf = relevel_leaf(head_leaf, backend, level, false)?;
+                tail.relevel(backend, level)?;
+            }
+            Self::Const { .. } | Self::Rice { .. } | Self::ContextMix { .. } => {}
+        }
+        Ok(())
+    }
+
     /// Automatically chooses the smallest domain-agnostic encoding for `vals`.
     pub fn auto_encode(vals: &[i64]) -> Self {
         let base = Self::auto_encode_inner(vals, true);
@@ -1418,6 +1469,18 @@ impl PayloadGraph {
 
     pub fn decode(b: &[u8], budget: &DecodeBudget) -> Result<Self> {
         Self::decode_linked(b, &Library::default(), budget)
+    }
+
+    /// Recompresses every leaf at `level`, which a search may have priced at a cheaper one.
+    pub(crate) fn relevel(&mut self, backend: EntropyBackend, level: i32) -> Result<()> {
+        for node in &mut self.nodes {
+            match node {
+                GraphNode::Bytes { leaf } => *leaf = relevel_leaf(leaf, backend, level, true)?,
+                GraphNode::IntStream(s) => s.relevel(backend, level)?,
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Whether the graph holds code a library could carry.

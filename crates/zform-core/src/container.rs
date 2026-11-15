@@ -759,7 +759,17 @@ fn encode_structural_blocks(
                         }
                         None => recs,
                     };
-                    encode_block_columns(recs, plan, packs, backend, level, filter_bits, page_bytes)
+                    let mut p = encode_block_columns(
+                        recs,
+                        plan,
+                        packs,
+                        backend,
+                        level,
+                        filter_bits,
+                        page_bytes,
+                    );
+                    p.relevel(plan, backend, level);
+                    p
                 })
                 .collect()
         });
@@ -897,6 +907,26 @@ impl PendingBlock {
             .filter(|(_, c)| c.nested_plan.is_none())
             .map(|(b, _)| b);
         self.enc.shared_dict_blobs.iter_mut().chain(cols)
+    }
+
+    /// Recompresses the leaves the column search priced at a cheaper level than `level`.
+    fn relevel(&mut self, plan: &ModelPlan, backend: EntropyBackend, level: i32) {
+        if crate::payload::graph::search_level(level) == level {
+            return;
+        }
+        let budget = DecodeBudget::default();
+        for blob in self.graphs(plan) {
+            if let Ok(mut g) = PayloadGraph::decode(blob, &budget)
+                && g.relevel(backend, level).is_ok()
+            {
+                *blob = g.encode();
+            }
+        }
+        if let [pl] = self.enc.pool_pages.as_mut_slice()
+            && let Ok(l) = crate::payload::graph::relevel_leaf(pl, backend, level, true)
+        {
+            *pl = l;
+        }
     }
 
     fn harvest(&mut self, plan: &ModelPlan, into: &mut Harvest) {

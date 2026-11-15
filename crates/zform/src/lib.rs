@@ -1513,6 +1513,18 @@ mod tests {
         );
         assert_grep(&with, &recs, &eq("svc", "svc3"));
 
+        // Leaves priced at a cheaper level are recompressed, in frames that share code.
+        let six = PackOptions {
+            level: 6,
+            chunk_bytes: 64 << 10,
+            threads: 1,
+            ..opts.clone()
+        };
+        let at6 = assert_roundtrip(raw.as_bytes(), &six);
+        let rep = inspect_stream(&at6[..], &DecodeBudget::default()).unwrap();
+        assert!(rep.frames > rep.sync_frames, "{rep:?}");
+        assert_grep(&at6, &recs, &eq("svc", "svc3"));
+
         // Concatenated after a stream with no dictionary, and before one.
         let cat = [&plain[..], &with, &plain].concat();
         let mut restored = Vec::new();
