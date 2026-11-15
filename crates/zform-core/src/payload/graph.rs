@@ -2400,14 +2400,18 @@ impl GraphBuilder {
         };
         let mut counts: FastMap<&[u8], (u32, usize)> = fast_map_with_capacity(rows.len().min(1024));
         let mut n_uniq = 0usize;
+        // Each row's value by order of first appearance, so codes need no second lookup.
+        let mut row_uniq = Vec::with_capacity(rows.len());
         for &r in rows {
             if let Some(e) = counts.get_mut(r) {
                 e.0 += 1;
+                row_uniq.push(e.1);
             } else {
                 if n_uniq >= max_dict_uniq {
                     return emit_raw_slice(self);
                 }
                 counts.insert(r, (1, n_uniq));
+                row_uniq.push(n_uniq);
                 n_uniq += 1;
             }
         }
@@ -2422,15 +2426,15 @@ impl GraphBuilder {
             .collect();
         sorted.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
 
-        let mut remap = fast_map_with_capacity(sorted.len());
+        let mut remap = vec![0i64; sorted.len()];
         let mut dict_raw = Vec::new();
         let mut lens = Vec::with_capacity(sorted.len());
-        for (new_id, (s, _, _)) in sorted.into_iter().enumerate() {
-            remap.insert(s, new_id as i64);
+        for (new_id, (s, _, uniq)) in sorted.into_iter().enumerate() {
+            remap[uniq] = new_id as i64;
             lens.push(s.len() as i64);
             dict_raw.extend_from_slice(s);
         }
-        let codes: Vec<i64> = rows.iter().map(|r| remap[r]).collect();
+        let codes: Vec<i64> = row_uniq.iter().map(|&u| remap[u]).collect();
 
         let codes_id = if lens.len() >= 16 && rows.len() >= 64 {
             self.add_mtf_ints(&codes)
