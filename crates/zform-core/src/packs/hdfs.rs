@@ -91,8 +91,8 @@ impl RelationPack for HdfsRelations {
     }
 
     fn row_order(&self, recs: &[&[u8]]) -> Option<Vec<u32>> {
-        // Rows sit together by block: first each block's write pipeline by thread id, so its
-        // relations look a row or two back, then each block's other rows in file order. Block
+        // Rows sit together by block: first each block's write pipeline by thread id, or in
+        // [`in_pipeline_order`], then each block's other rows in file order. Block
         // ids are successive `java.util.Random` outputs, so blocks in allocation order make each
         // new id a short step from the one before. Rows naming no block follow in file order.
         let mut block_of: FastMap<&[u8], u32> = FastMap::default();
@@ -165,10 +165,60 @@ impl RelationPack for HdfsRelations {
                 let e = end[g] as usize;
                 let rows = &mut order[e - n as usize..e];
                 rows.sort_by_key(|&i| of_row[i as usize].1);
+                in_pipeline_order(recs, rows);
             }
         }
         Some(order)
     }
+}
+
+/// A block's write rows `rows`, by thread, reordered where its pipeline is known: the
+/// datanodes' rows by template, then by their node's place in the pipeline, so each template's
+/// replica codes repeat block after block. The NameNode's rows stay first, by thread.
+fn in_pipeline_order(recs: &[&[u8]], rows: &mut [u32]) {
+    let mut reps = Vec::with_capacity(REPLICAS);
+    let said: Vec<_> = (rows.iter())
+        .map(|&i| {
+            let r = recs[i as usize];
+            let (kind, p) = write_at(r)?;
+            let role = match kind {
+                0 => said_at(r, true, p),
+                1 => said_at(r, false, p),
+                _ => {
+                    if reps.len() < REPLICAS {
+                        reps.extend(added_node(r, p));
+                    }
+                    None
+                }
+            };
+            with_thread(r, role?)
+        })
+        .collect();
+    // As the table finds it, from `PacketResponder` rows.
+    let named: Vec<_> =
+        (said.iter().flatten()).filter(|s| s.0 != Role::Receiving).copied().collect();
+    let Some(chain) = pipeline(&reps, &named) else {
+        return;
+    };
+    let at = |v: &[u8]| chain.iter().position(|&c| reps[c] == v);
+    let mut keyed: Vec<_> = (rows.iter().zip(&said))
+        .map(|(&i, s)| match *s {
+            None => ((0, 0), i),
+            Some((role, _, Said::Node(v))) => ((role as u8, at(v).map_or(0, |p| p as i64 + 1)), i),
+            Some((role, _, Said::Responder(n))) => ((role as u8, REPLICAS as i64 - 1 - n), i),
+        })
+        .collect();
+    // Stable: rows alike stay by thread.
+    keyed.sort_by_key(|k| k.0);
+    for (r, k) in rows.iter_mut().zip(keyed) {
+        *r = k.1;
+    }
+}
+
+/// The datanode an `addStoredBlock` record adds, `at` the offset of [`ADDED`] in it.
+fn added_node(r: &[u8], at: usize) -> Option<&[u8]> {
+    let ip = r[at..].strip_prefix(ADDED)?;
+    Some(&ip[..memchr::memchr2(b':', b' ', ip).unwrap_or(ip.len())])
 }
 
 /// The table of each block's replicas, from the NameNode's `addStoredBlock` lines: a row per
@@ -1025,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    fn replicas_go_in_pipeline_order() {
+    fn write_rows_go_in_pipeline_order() {
         let recs: [&[u8]; 13] = [
             b"081109 203518 143 INFO dfs.DataNode$DataXceiver: Receiving block blk_-16 src: /10.250.19.102:54106 dest: /10.250.19.102:50010",
             b"081109 203518 35 INFO dfs.FSNamesystem: BLOCK* NameSystem.allocateBlock: /x/job.jar. blk_-16",
@@ -1051,6 +1101,10 @@ mod tests {
         b.push(&raw, &spans);
         let ips = Box::new(b).finish().remove(1);
         assert_eq!(ips, [&b"10.250.10.6"[..], b"10.250.14.224", b"10.251.111.209"]);
+        let mut rows: Vec<u32> = (0..recs.len() as u32).collect();
+        rows.sort_by_key(|&i| thread_id(recs[i as usize]));
+        in_pipeline_order(&recs, &mut rows);
+        assert_eq!(rows, [10, 11, 12, 1, 0, 2, 3, 5, 4, 8, 7, 6, 9]);
     }
 
     fn check_graph(plan: &ModelPlan, vids: &[u32], cols: &[Vec<&[u8]>], graph: PayloadGraph) {
