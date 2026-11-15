@@ -44,12 +44,23 @@ struct Counter {
 }
 /// Tables are allocated at their largest size so masked indexes need no bounds checks.
 const MAX_SLOTS: usize = 1 << 14;
+type Tables = [[Counter; MAX_SLOTS]; K];
 struct Model {
-    tables: Box<[[Counter; MAX_SLOTS]; K]>,
+    tables: Box<Tables>,
     weights: [[u32; K]; 16],
-    rates: [i32; 64],
     mask: usize,
 }
+/// The step of a counter seen `n` times; `n` stops at 63, and 256 entries spare a u8 index
+/// its bounds check.
+static RATES: [i32; 256] = {
+    let mut rates = [0; 256];
+    let mut n = 0;
+    while n < 256 {
+        rates[n] = 65536 / (if n < 63 { n } else { 63 } as i32 + 2);
+        n += 1;
+    }
+    rates
+};
 /// The splitmix64 finalizer after its first xor-shift, which [`seed`] applies up front.
 #[inline(always)]
 fn mix(mut x: u64) -> usize {
@@ -63,7 +74,13 @@ fn mix(mut x: u64) -> usize {
 fn seed(x: u64) -> u64 {
     x ^ x >> 30
 }
-type Slots = ([usize; K], [u32; K], [u32; K]);
+/// What [`update`] needs from [`predict`]'s loads.
+struct Slots {
+    ids: [usize; K],
+    ps: [u32; K],
+    prods: [u64; 2],
+    sum: u64,
+}
 impl Model {
     fn new(tb: u8) -> Self {
         Self {
@@ -72,47 +89,60 @@ impl Model {
                 .try_into()
                 .unwrap_or_else(|_| unreachable!()),
             weights: [[21845, 21845, 21846]; 16],
-            rates: std::array::from_fn(|n| 65536 / (n as i32 + 2)),
             mask: (1usize << tb) - 1,
         }
     }
-    fn seeds(prev: u32, prev2: u32) -> [u64; 2] {
-        [
-            seed((prev as u64) << 32),
-            seed((prev2 as u64) << 48 | (prev as u64) << 16),
-        ]
+    /// The tables, the weights and the index mask as separate borrows, so the coding
+    /// loops keep the mask and table base in registers across table stores.
+    fn parts(&mut self) -> (&mut Tables, &mut [[u32; K]; 16], usize) {
+        (
+            &mut self.tables,
+            &mut self.weights,
+            self.mask & (MAX_SLOTS - 1),
+        )
     }
-    /// Slot indexes, counter probabilities and weights at `prefix`, plus the prediction.
-    #[inline(always)]
-    fn predict(&self, prefix: u32, seeds: [u64; 2], depth: usize) -> (u32, Slots) {
-        let m = self.mask & (MAX_SLOTS - 1);
-        let ids = [
-            prefix as usize & m,
-            mix(seeds[0] ^ prefix as u64) & m,
-            mix(seeds[1] ^ prefix as u64) & m,
-        ];
-        let ws = self.weights[depth & 15];
-        let ps: [u32; K] = std::array::from_fn(|k| self.tables[k][ids[k]].p as u32);
-        let sum = (0..K).map(|k| ws[k] as u64 * ps[k] as u64).sum::<u64>();
-        // Weights sum to 65536 and each p is in 1..=65535, so this needs no clamp.
-        ((sum >> 16) as u32, (ids, ps, ws))
-    }
-    #[inline(always)]
-    fn update(&mut self, (ids, ps, ws): Slots, depth: usize, bit: bool) {
-        let likelihood: [u64; K] =
-            std::array::from_fn(|k| ws[k] as u64 * if bit { ps[k] } else { 65536 - ps[k] } as u64);
-        let total = likelihood.iter().sum::<u64>();
-        let w0 = (((likelihood[0] << 16) / total * 31 + 21845) >> 5) as u32;
-        let w1 = (((likelihood[1] << 16) / total * 31 + 21845) >> 5) as u32;
-        self.weights[depth & 15] = [w0, w1, 65536 - w0 - w1];
-        for k in 0..K {
-            let c = &mut self.tables[k][ids[k]];
-            let rate = self.rates[c.n as usize & 63];
-            let p = ps[k] as i32;
-            // A rate of at most 1/2 keeps p below 65536; only a step to 0 needs the floor.
-            c.p = (p + (((if bit { 65536 } else { 0 }) - p) * rate >> 16)).max(1) as u16;
-            c.n = (c.n + 1).min(63);
-        }
+}
+fn seeds(prev: u32, prev2: u32) -> [u64; 2] {
+    [
+        seed((prev as u64) << 32),
+        seed((prev2 as u64) << 48 | (prev as u64) << 16),
+    ]
+}
+/// The prediction at `prefix` under weights `ws`, and the slots it read.
+#[inline(always)]
+fn predict(tables: &Tables, ws: &[u32; K], m: usize, prefix: u32, seeds: [u64; 2]) -> (u32, Slots) {
+    let ids = [
+        prefix as usize & m,
+        mix(seeds[0] ^ prefix as u64) & m,
+        mix(seeds[1] ^ prefix as u64) & m,
+    ];
+    let ps: [u32; K] = std::array::from_fn(|k| tables[k][ids[k]].p as u32);
+    let prods: [u64; K] = std::array::from_fn(|k| ws[k] as u64 * ps[k] as u64);
+    let sum = prods.iter().sum::<u64>();
+    let slots = Slots {
+        ids,
+        ps,
+        prods: [prods[0], prods[1]],
+        sum,
+    };
+    // Weights sum to 65536 and each p is in 1..=65535, so this needs no clamp.
+    ((sum >> 16) as u32, slots)
+}
+#[inline(always)]
+fn update(tables: &mut Tables, ws: &mut [u32; K], s: Slots, bit: bool) {
+    // The likelihood of a 0 is w * (65536 - p), and the weights sum to 65536.
+    let pick = |one, zero| std::hint::select_unpredictable(bit, one, zero);
+    let l = |k: usize| pick(s.prods[k], ((ws[k] as u64) << 16) - s.prods[k]);
+    let total = pick(s.sum, (1 << 32) - s.sum);
+    let w0 = (((l(0) << 16) / total * 31 + 21845) >> 5) as u32;
+    let w1 = (((l(1) << 16) / total * 31 + 21845) >> 5) as u32;
+    *ws = [w0, w1, 65536 - w0 - w1];
+    for k in 0..K {
+        let c = &mut tables[k][s.ids[k]];
+        let p = s.ps[k] as i32;
+        // A rate of at most 1/2 keeps p below 65536; only a step to 0 needs the floor.
+        c.p = (p + ((bit as i32 * 65536 - p) * RATES[c.n as usize] >> 16)).max(1) as u16;
+        c.n += (c.n < 63) as u8;
     }
 }
 
@@ -160,20 +190,24 @@ impl Encoder {
     pub(super) fn push(&mut self, vals: &[i64], limit: usize) -> bool {
         let (bits, min) = (self.bits, self.min);
         let (mut lo, mut hi, mut prev, mut prev2) = (self.lo, self.hi, self.prev, self.prev2);
-        let (model, out) = (&mut self.model, &mut self.out);
+        let ((tables, weights, m), out) = (self.model.parts(), &mut self.out);
         assert!(
             vals.iter()
                 .all(|&v| (v.wrapping_sub(min) as u32 as u64) < (1u64 << bits))
         );
         for &value in vals {
             let x = value.wrapping_sub(min) as u32;
-            let seeds = Model::seeds(prev, prev2);
+            let seeds = seeds(prev, prev2);
             let mut prefix = 1u32;
-            for depth in 0..bits as usize {
-                let (p, slots) = model.predict(prefix, seeds, depth);
-                let bit = x & (1 << (bits as usize - 1 - depth)) != 0;
+            for (depth, ws) in weights[..bits as usize].iter_mut().enumerate() {
+                let (p, slots) = predict(tables, ws, m, prefix, seeds);
+                let bit = x >> (bits as usize - 1 - depth) & 1;
+                // The model never reads the coder, so updating first leaves only `p` live
+                // across the byte output.
+                update(tables, ws, slots, bit != 0);
+                prefix = prefix * 2 + bit;
                 let mid = lo + (((hi - lo) as u64 * p as u64) >> 16) as u32;
-                if bit {
+                if bit != 0 {
                     hi = mid;
                 } else {
                     lo = mid + 1;
@@ -186,8 +220,6 @@ impl Encoder {
                     lo <<= 8;
                     hi = (hi << 8) | 255;
                 }
-                model.update(slots, depth, bit);
-                prefix = prefix * 2 + bit as u32;
             }
             prev2 = prev;
             prev = x;
@@ -230,14 +262,15 @@ pub(super) fn decode(
         code = (code << 8) | next()? as u32;
     }
     let mut model = Model::new(tb);
+    let (tables, weights, m) = model.parts();
     let (mut lo, mut hi) = (0u32, u32::MAX);
     let (mut prev, mut prev2) = (0u32, 0u32);
     let mut out = Vec::with_capacity(len);
     for _ in 0..len {
-        let seeds = Model::seeds(prev, prev2);
+        let seeds = seeds(prev, prev2);
         let mut prefix = 1u32;
-        for depth in 0..bits as usize {
-            let (p, slots) = model.predict(prefix, seeds, depth);
+        for ws in &mut weights[..bits as usize] {
+            let (p, slots) = predict(tables, ws, m, prefix, seeds);
             let mid = lo + (((hi - lo) as u64 * p as u64) >> 16) as u32;
             let bit = code <= mid;
             if bit {
@@ -250,7 +283,7 @@ pub(super) fn decode(
                 hi = (hi << 8) | 255;
                 code = (code << 8) | next()? as u32;
             }
-            model.update(slots, depth, bit);
+            update(tables, ws, slots, bit);
             prefix = prefix * 2 + bit as u32;
         }
         let x = prefix - (1 << bits);
