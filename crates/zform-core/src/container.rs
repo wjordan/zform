@@ -63,14 +63,10 @@ fn collation_sorted(recs: &[&[u8]]) -> bool {
     })
 }
 
-/// `a`'s [`collation_key`] against `b`'s. Keys of a common prefix are equal, so it is skipped
-/// a word at a time.
+/// `a`'s [`collation_key`] against `b`'s. Keys of a common prefix are equal, so it is skipped.
 #[inline]
 fn collation_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
-    let word = |w: &[u8]| u64::from_le_bytes(w.try_into().unwrap());
-    let same = 8 * (a.chunks_exact(8).zip(b.chunks_exact(8)))
-        .take_while(|&(x, y)| word(x) == word(y))
-        .count();
+    let same = lcp(a, b);
     fn key(r: &[u8]) -> impl Iterator<Item = u8> + '_ {
         r.iter()
             .filter(|c| c.is_ascii_alphanumeric())
@@ -79,9 +75,113 @@ fn collation_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     key(&a[same..]).cmp(key(&b[same..]))
 }
 
-/// Restores a sorted-rows block's record order.
-pub(crate) fn sort_records(recs: &mut [Vec<u8>]) {
-    recs.sort_by(|a, b| collation_cmp(a, b));
+/// Restores a sorted-rows block's record order. Records sort as integers on 12 key bytes at a
+/// time, after skipping raw bytes a run of them shares; records still tied go again from where
+/// each stopped, and short runs of them by comparison from there. Order among equal keys is
+/// free: the writer only sorts records whose equal keys are equal.
+pub(crate) fn sort_records(recs: &mut Vec<Vec<u8>>) {
+    let n = recs.len();
+    if n < 2 {
+        return;
+    }
+    assert!(n <= u32::MAX as usize);
+    let idx = |k: &u128| *k as u32 as usize;
+    // Digest above record index; `at[i]`: how far record `i`'s raw bytes are accounted for.
+    let (mut keys, mut at): (Vec<u128>, _) = ((0..n as u128).collect(), vec![0; n]);
+    let mut work = vec![(0, n)];
+    while let Some((s, e)) = work.pop() {
+        // Tied records sit apart in memory: fetch the next run's while this one sorts.
+        if let Some(&(s, e)) = work.last() {
+            for k in &keys[s..e] {
+                prefetch(recs[idx(k)][at[idx(k)]..].as_ptr());
+            }
+        }
+        let run = &mut keys[s..e];
+        if run.len() <= 8 {
+            run.sort_unstable_by(|a, b| {
+                let (a, b) = (idx(a), idx(b));
+                collation_cmp(&recs[a][at[a]..], &recs[b][at[b]..])
+            });
+            continue;
+        }
+        let (r0, a0) = (&recs[idx(&run[0])], at[idx(&run[0])]);
+        if run.iter().all(|k| at[idx(k)] == a0) {
+            let shared = run[1..].iter().fold(r0.len() - a0, |l, k| {
+                lcp(&r0[a0..a0 + l], &recs[idx(k)][a0..])
+            });
+            run.iter().for_each(|k| at[idx(k)] += shared);
+        }
+        for k in run.iter_mut() {
+            let i = idx(k);
+            *k = digest(&recs[i], &mut at[i]) | i as u128;
+        }
+        run.sort_unstable();
+        let mut s1 = 0;
+        while s1 < run.len() {
+            let d = run[s1] >> 32;
+            let e1 = s1 + run[s1..].iter().take_while(|&&k| k >> 32 == d).count();
+            // A digest ending in a zero byte saw its whole key: the run's keys are equal.
+            if e1 - s1 > 1 && d & 0xff != 0 {
+                work.push((s + s1, s + e1));
+            }
+            s1 = e1;
+        }
+    }
+    *recs = keys
+        .iter()
+        .map(|k| std::mem::take(&mut recs[idx(k)]))
+        .collect();
+}
+
+fn prefetch(p: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: prefetching is a hint that never faults.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p.cast(), std::arch::x86_64::_MM_HINT_T0)
+    };
+}
+
+/// Length of the common prefix of `a` and `b`, compared a word at a time.
+fn lcp(a: &[u8], b: &[u8]) -> usize {
+    let word = |w: &[u8]| u64::from_le_bytes(w.try_into().unwrap());
+    let same = 8
+        * (a.chunks_exact(8).zip(b.chunks_exact(8)))
+            .take_while(|&(x, y)| word(x) == word(y))
+            .count();
+    same + a[same..]
+        .iter()
+        .zip(&b[same..])
+        .take_while(|(x, y)| x == y)
+        .count()
+}
+
+/// Each byte's [`collation_key`] byte, or 0 for bytes the key drops.
+const KEY: [u8; 256] = {
+    let mut t = [0; 256];
+    let mut c = 0;
+    while c < 256 {
+        if (c as u8).is_ascii_alphanumeric() {
+            t[c] = (c as u8).to_ascii_lowercase();
+        }
+        c += 1;
+    }
+    t
+};
+
+/// The next 12 key bytes of `r` from `*at`, big-endian above a 32-bit index slot, advancing
+/// `*at` past them. A key that ends pads with zeros, which no key byte is, so it sorts before
+/// the keys it is a prefix of.
+fn digest(r: &[u8], at: &mut usize) -> u128 {
+    let (mut d, mut k, mut i) = ([0u8; 16], 0, *at);
+    // A dropped byte stores a zero the next key byte overwrites: no data-dependent branch.
+    while k < 12 && i < r.len() {
+        let c = KEY[r[i] as usize];
+        d[k] = c;
+        k += usize::from(c != 0);
+        i += 1;
+    }
+    *at = i;
+    u128::from_be_bytes(d)
 }
 
 pub const DEFAULT_BLOCK_ROWS: usize = 65_536;
@@ -2261,6 +2361,56 @@ mod nested_tests {
             };
             let want = collation_key(a).cmp(&collation_key(&b));
             assert_eq!(collation_cmp(a, &b), want);
+        }
+    }
+
+    #[test]
+    fn sort_records_orders_by_key() {
+        let mut state = 11u64;
+        let mut next = |m: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % m
+        };
+        // Long runs of equal key bytes reached through different raw bytes, so ties go
+        // several digests deep and comparisons start at different offsets.
+        let alpha = b"aA0 :-zZ9";
+        let cases = [
+            (b"".as_slice(), 300, 1),
+            (b"081109 2035", 3000, 1),
+            (b"aA ", 40, 1),
+        ];
+        // A head every record shares, one record being just the head.
+        for (head, count, cut) in cases
+            .into_iter()
+            .chain([(b"081109 2 INFO".as_slice(), 500, 0)])
+        {
+            let mut recs: Vec<Vec<u8>> = (0..count)
+                .map(|_| {
+                    let keep = head.len() - cut * next(head.len() as u64 + 1) as usize;
+                    let mut r = head[..keep].to_vec();
+                    for _ in 0..next(60) {
+                        let m = if next(4) == 0 { 9 } else { 2 };
+                        r.push(alpha[next(m) as usize]);
+                    }
+                    r
+                })
+                .collect();
+            recs.push(head.to_vec());
+            if cut == 1 {
+                recs.extend([vec![], b"A".to_vec(), b"a".to_vec(), b" ".to_vec()]);
+            }
+            let dups: Vec<Vec<u8>> = recs.iter().step_by(7).cloned().collect();
+            recs.extend(dups);
+            let mut want = recs.clone();
+            want.sort_by_cached_key(|r| collation_key(r));
+            sort_records(&mut recs);
+            let keys = |v: &[Vec<u8>]| v.iter().map(|r| collation_key(r)).collect::<Vec<_>>();
+            assert_eq!(keys(&recs), keys(&want));
+            recs.sort();
+            want.sort();
+            assert_eq!(recs, want);
         }
     }
 
