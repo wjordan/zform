@@ -108,7 +108,7 @@ impl RelationPack for HdfsRelations {
             .find_map(|g| lcg_state(recs[g[0] as usize]));
         let mut order = Vec::with_capacity(recs.len());
         for mut g in in_allocation_order(recs, writes, anchor) {
-            g.sort_by_key(|&i| thread_id(recs[i as usize]));
+            g.sort_by_cached_key(|&i| thread_id(recs[i as usize]));
             order.extend(g);
         }
         in_allocation_order(recs, others, anchor)
