@@ -65,6 +65,7 @@ fn collation_sorted(recs: &[&[u8]]) -> bool {
 
 /// `a`'s [`collation_key`] against `b`'s. Keys of a common prefix are equal, so it is skipped
 /// a word at a time.
+#[inline]
 fn collation_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     let word = |w: &[u8]| u64::from_le_bytes(w.try_into().unwrap());
     let same = 8 * (a.chunks_exact(8).zip(b.chunks_exact(8)))
@@ -80,7 +81,7 @@ fn collation_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
 
 /// Restores a sorted-rows block's record order.
 pub(crate) fn sort_records(recs: &mut [Vec<u8>]) {
-    recs.sort_by_cached_key(|r| collation_key(r));
+    recs.sort_by(|a, b| collation_cmp(a, b));
 }
 
 pub const DEFAULT_BLOCK_ROWS: usize = 65_536;
