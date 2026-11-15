@@ -265,7 +265,7 @@ Unless typed otherwise, operands are `uvarint`. `ref` names an earlier node; `re
 | `22` | `ExtAlign` | `key`, `at` | Integers: for each cell of `at`, the value id of the first `key` cell in its record |
 | `23` | `MatchIndex` | `needles: ref`, `hay: ref`, `codes: ref` | Integers: positions in `hay` matched by key |
 | `24` | `PagedSlice` | `buf: ref`, `lens: ref`, `pages: ref`, `bases: ref` | Cell `i` of `lens[i]` bytes in page `pages[i]`; page `p`'s cells follow one another from offset `bases[p]` of `buf`; the pages' runs must not overlap |
-| `25` | `KeyedSum` | `keys: ref`, `deltas: ref` | Integers: `state[keys[i]] += deltas[i]`, wrapping from 0; key `0` yields `deltas[i]`; keys `0..=rows` |
+| `25` | `KeyedSum` | `keys: ref`, `deltas: ref` | Integers: `state[keys[i]] += deltas[i]`, wrapping; a new key's state starts at the last sum yielded (0 at first); key `0` yields `deltas[i]`; keys `0..=rows` |
 | `26` | `ExtVariant` | None | Integers: for each cell of this column, its record's variant id |
 | `27` | `CellIds` | `cells: ref` | Integers: each cell's value id, the rank of its value's first occurrence |
 | `28` | `Interleave` | `sel: ref`, `streams: refs` | Integers: row `i` is the next unread value of `streams[sel[i]]`; every stream is read to its end |

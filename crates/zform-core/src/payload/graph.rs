@@ -1232,8 +1232,8 @@ pub enum GraphNode {
         hay: u16,
         codes: u16,
     },
-    /// A running sum per key: `state[keys[i]] += deltas[i]` yields row `i`; key `0` yields
-    /// `deltas[i]` and leaves every state alone.
+    /// A running sum per key: `state[keys[i]] += deltas[i]` yields row `i`, a key's state
+    /// starting at the last sum yielded (0 at first); key `0` yields `deltas[i]` alone.
     KeyedSum {
         keys: u16,
         deltas: u16,
@@ -4119,13 +4119,19 @@ fn keyed_sum(keys: &[i64], deltas: &[i64], budget: &DecodeBudget) -> Result<Vec<
     if keys.iter().any(|&k| k < 0) || max as u64 > keys.len() as u64 {
         return Err(Error::Format("KeyedSum key out of range".into()));
     }
-    budget.check_alloc((max as usize + 1 + keys.len()).saturating_mul(8), "KeyedSum")?;
-    let mut state = vec![0i64; max as usize + 1];
+    budget.check_alloc((max as usize + 1 + keys.len()).saturating_mul(16), "KeyedSum")?;
+    // A key's first sum steps from the last sum yielded, as counters kept by peers run close.
+    let (mut state, mut last) = (vec![None::<i64>; max as usize + 1], 0i64);
     let mut out = Vec::with_capacity(keys.len());
     for (&k, &d) in keys.iter().zip(deltas) {
+        if k == 0 {
+            out.push(d);
+            continue;
+        }
         let s = &mut state[k as usize];
-        *s = s.wrapping_add(d);
-        out.push(if k == 0 { d } else { *s });
+        last = s.unwrap_or(last).wrapping_add(d);
+        *s = Some(last);
+        out.push(last);
     }
     Ok(out)
 }

@@ -202,6 +202,9 @@ pub struct Pick {
     /// The sample's cells of the column, and the bytes they took.
     pub cells: usize,
     pub cost: usize,
+    /// Whether a relation keeping a sum per key lost by under a half: its keys' first steps
+    /// weigh on a sample far more than on the block.
+    pub near: bool,
 }
 
 /// A column's best single-column graph.
@@ -421,6 +424,7 @@ impl PackRegistry {
                 tapes: sample.tapes,
                 cells: SAMPLE,
                 cost: sample.graph.cost(),
+                near: false,
             };
             let graph = self.encode_single(rows, 0, Some(&pick)).graph;
             let per = |cost: usize, cells: usize| cost as u128 * cells as u128;
@@ -5001,6 +5005,7 @@ impl PackRegistry {
                 tapes: Default::default(),
                 cells: 0,
                 cost: 0,
+                near: false,
             };
             let mut chosen = vec![unpicked.clone(); n_cols];
             let mut used_ext = vec![false; n_cols];
@@ -5067,7 +5072,7 @@ impl PackRegistry {
                     .filter(|p| p.cells >= PICK_CELLS.min(occ_len))
                     .unwrap_or(&whole);
                 let (mut best_blob, mut best_cost, mut is_raw_fb, mut choice, mut tapes);
-                let mut want = pick.choice;
+                let (mut want, mut near) = (pick.choice, false);
                 loop {
                     let all = want == Choice::Search;
                     (best_blob, best_cost, is_raw_fb, choice) = (Vec::new(), usize::MAX, false, want);
@@ -5407,7 +5412,7 @@ impl PackRegistry {
 
                     if !must_standalone
                         && occ_len >= 64
-                        && (all || want == Choice::Relation)
+                        && (all || want == Choice::Relation || pick.near)
                         && let Some((plan, vids)) = shaped
                     {
                         let tables = with_current(|d| d.and_then(|d| d.tables().cloned()));
@@ -5434,6 +5439,10 @@ impl PackRegistry {
                                 && graph.ext_dict.is_none()
                             {
                                 let (cand, cost) = graph.priced();
+                                let keyed = |n: &GraphNode| matches!(n, GraphNode::KeyedSum { .. });
+                                near |= all
+                                    && graph.nodes.iter().any(keyed)
+                                    && cost * 2 < best_cost.saturating_mul(3);
                                 if cost + 32 < best_cost {
                                     best_blob = cand;
                                     best_cost = cost;
@@ -5459,6 +5468,7 @@ impl PackRegistry {
                     tapes,
                     cells: occ_len,
                     cost: best_cost,
+                    near,
                 };
 
                 if !used_ext[cid]

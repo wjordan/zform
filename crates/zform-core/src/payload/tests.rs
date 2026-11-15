@@ -1476,9 +1476,10 @@ fn keyed(
 #[test]
 fn keyed_sums_run_a_state_per_key_over_interleaved_streams() {
     let budget = DecodeBudget::default();
-    // Key 0 passes its value through; keys 1 and 2 each keep a running sum.
+    // Key 0 passes its value through; keys 1 and 2 each keep a running sum, key 2's first
+    // stepping from key 1's.
     let got = keyed(&[1, 2, 0, 1, 2, 1], &[0, 1, 1, 0, 1, 0], &[&[10, 1, -3], &[100, 7, 5]], &budget);
-    assert_eq!(got.unwrap(), [10, 100, 7, 11, 105, 8]);
+    assert_eq!(got.unwrap(), [10, 110, 7, 11, 115, 8]);
     assert!(keyed(&[1, 1], &[0, 2], &[&[1], &[2]], &budget).is_err(), "selector past the streams");
     assert!(keyed(&[1, 1], &[0, 0], &[&[1], &[2]], &budget).is_err(), "stream underrun");
     assert!(keyed(&[1], &[0], &[&[1, 2]], &budget).is_err(), "trailing stream values");

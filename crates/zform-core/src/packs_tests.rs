@@ -2716,6 +2716,7 @@ fn a_sample_pick_is_tried_alone_unless_it_does_not_apply() {
         tapes: Default::default(),
         cells,
         cost,
+        near: false,
     };
     let cost = usize::MAX;
     let stray = [
