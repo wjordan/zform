@@ -4650,6 +4650,26 @@ fn replace_subslice(hay: &[u8], needle: &[u8], rep: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// A column's rows as ids of their distinct values.
+struct Interned<'v> {
+    ids: FastMap<&'v [u8], u32>,
+    rows: Vec<u32>,
+}
+
+impl<'v> Interned<'v> {
+    fn of(col: &[&'v [u8]]) -> Self {
+        let mut ids: FastMap<&[u8], u32> = FastMap::default();
+        let rows = col
+            .iter()
+            .map(|&v| {
+                let next = ids.len() as u32;
+                *ids.entry(v).or_insert(next)
+            })
+            .collect();
+        Self { ids, rows }
+    }
+}
+
 /// Column `cid` as the value an earlier column `src` holds in a record with the same `key` cell:
 /// `IndexCells(src, MatchIndex(key at cid, key at src, ranks))` with misses patched. Returns the
 /// smallest of a few (src, key) pairs, priced.
@@ -4658,6 +4678,7 @@ fn keyed_lookup<'v>(
     occ: &[Vec<&'v [u8]>],
     nested: &[Option<(ColSummary, Vec<u8>)>],
     head: impl Fn(usize) -> &'v FastSet<&'v [u8]>,
+    interned: impl Fn(usize) -> &'v Interned<'v>,
     align: impl Fn(usize, usize) -> Option<Vec<i64>>,
 ) -> Option<(Vec<u8>, usize)> {
     // Small columns rarely repay the search.
@@ -4696,19 +4717,27 @@ fn keyed_lookup<'v>(
                 continue;
             };
             tries += 1;
-            let (key, src) = (&occ[k], &occ[s]);
+            // Pairs of value ids stand for (key, value) pairs: hashing the bytes per try cost more.
+            let (key, src) = (interned(k), interned(s));
+            let pair = |k: u32, v: u32| u64::from(k) << 32 | u64::from(v);
             // The rank of the first source row holding each (key, value) among its key's rows.
-            let mut seen: FastMap<&[u8], i64> = fast_map_with_capacity(ks.len());
-            let mut first: FastMap<(&[u8], &[u8]), i64> = fast_map_with_capacity(ks.len());
-            for (&kj, &sv) in ks.iter().zip(src) {
-                let n = seen.entry(key[kj as usize]).or_insert(0);
+            let mut seen = vec![0i64; key.ids.len()];
+            let mut first: FastMap<u64, i64> = fast_map_with_capacity(ks.len());
+            for (&kj, &sv) in ks.iter().zip(&src.rows) {
+                let kid = key.rows[kj as usize];
+                let n = &mut seen[kid as usize];
                 *n += 1;
-                first.entry((key[kj as usize], sv)).or_insert(*n);
+                first.entry(pair(kid, sv)).or_insert(*n);
             }
             let mut codes = Vec::with_capacity(vals.len());
             let (mut exc_idx, mut exc_vals) = (Vec::new(), Vec::new());
             for (i, &v) in vals.iter().enumerate() {
-                let code = first.get(&(key[kc[i] as usize], v)).copied().unwrap_or(0);
+                let code = src
+                    .ids
+                    .get(v)
+                    .and_then(|&vid| first.get(&pair(key.rows[kc[i] as usize], vid)))
+                    .copied()
+                    .unwrap_or(0);
                 codes.push(code);
                 if code == 0 {
                     exc_idx.push(i);
@@ -4787,6 +4816,8 @@ impl PackRegistry {
                     .all(|&v| matches!(plan.variants.get(v as usize), Some(PlanVariant::Shape(_))))
             });
             let heads: Vec<OnceCell<FastSet<&[u8]>>> =
+                (0..n_cols).map(|_| OnceCell::new()).collect();
+            let interned: Vec<OnceCell<Interned<'_>>> =
                 (0..n_cols).map(|_| OnceCell::new()).collect();
 
             // Phase 1: Single-column `PayloadGraph` + horizontal `ExtPeer` derivations.
@@ -5108,6 +5139,7 @@ impl PackRegistry {
                                     occ_streams[c].iter().take(1024).copied().collect()
                                 })
                             },
+                            |c| interned[c].get_or_init(|| Interned::of(&occ_streams[c])),
                             |key, at| align_cells(plan, vids, key, at).ok(),
                         )
                         && cand_cost + 12 < best_cost
