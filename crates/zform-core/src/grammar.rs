@@ -117,6 +117,9 @@ impl LitFinder {
     /// The first occurrence of `lit`, the literal this was built from, in `hay`.
     #[inline]
     fn find(&self, lit: &[u8], hay: &[u8]) -> Option<usize> {
+        if let [b] = lit {
+            return memchr::memchr(*b, hay);
+        }
         let mut from = self.head;
         loop {
             let at = from + self.tail.find(hay.get(from..)?)?;
@@ -1087,14 +1090,18 @@ pub fn match_template<'a>(
         }
         return false;
     }
-    if tv.anchor_idx > 0 && tv.anchor_idx < k {
-        let body = &line[prefix.len()..line.len() - suffix.len()];
-        let a = tv.anchor_idx;
-        if tv.finders[a].find(&tv.literals[a], body).is_none() {
-            return false;
+    let body_end = line.len() - suffix.len();
+    let a = tv.anchor_idx;
+    // The anchor's first place in the body, which is its place in the walk below once the walk
+    // has not passed it.
+    let mut anchor_at = usize::MAX;
+    if a > 0 && a < k {
+        let body = &line[prefix.len()..body_end];
+        match tv.finders[a].find(&tv.literals[a], body) {
+            Some(at) => anchor_at = prefix.len() + at,
+            None => return false,
         }
     }
-    let body_end = line.len() - suffix.len();
     let mut pos = prefix.len();
     out_vals.clear();
     for s in 0..k {
@@ -1106,10 +1113,14 @@ pub fn match_template<'a>(
         if next_lit.is_empty() {
             return false;
         }
-        let Some(rel) = tv.finders[s + 1].find(next_lit, &line[pos..body_end]) else {
-            return false;
+        let match_at = if s + 1 == a && anchor_at >= pos {
+            anchor_at
+        } else {
+            match tv.finders[s + 1].find(next_lit, &line[pos..body_end]) {
+                Some(rel) => pos + rel,
+                None => return false,
+            }
         };
-        let match_at = pos + rel;
         out_vals.push((tv.slots[s], &line[pos..match_at]));
         pos = match_at + next_lit.len();
     }

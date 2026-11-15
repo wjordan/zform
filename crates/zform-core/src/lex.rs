@@ -8,7 +8,7 @@
 
 /// Equal-length slices compared as overlapping words when short: per-record checks of
 /// literals and number spellings cost more as `memcmp` calls than as such comparisons.
-#[inline]
+#[inline(always)]
 pub(crate) fn short_eq(a: &[u8], b: &[u8]) -> bool {
     let n = a.len();
     debug_assert_eq!(n, b.len());
