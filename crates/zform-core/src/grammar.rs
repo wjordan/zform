@@ -91,7 +91,41 @@ pub struct TemplateVariant {
     /// Index of the longest interior literal, searched first to reject a line early; 0 if none.
     anchor_idx: usize,
     min_len: usize,
-    finders: Vec<Finder<'static>>,
+    finders: Vec<LitFinder>,
+}
+
+/// Finds a literal by its last [`PACKED`] bytes, which `memchr` searches with packed compares,
+/// then checks the head: a longer needle would be verified a byte at a time, and template
+/// literals often share a long head.
+#[derive(Debug, Clone)]
+struct LitFinder {
+    tail: Finder<'static>,
+    head: usize,
+}
+
+const PACKED: usize = 32;
+
+impl LitFinder {
+    fn new(lit: &[u8]) -> Self {
+        let head = lit.len().saturating_sub(PACKED);
+        Self {
+            tail: Finder::new(&lit[head..]).into_owned(),
+            head,
+        }
+    }
+
+    /// The first occurrence of `lit`, the literal this was built from, in `hay`.
+    #[inline]
+    fn find(&self, lit: &[u8], hay: &[u8]) -> Option<usize> {
+        let mut from = self.head;
+        loop {
+            let at = from + self.tail.find(hay.get(from..)?)?;
+            if hay[at - self.head..at] == lit[..self.head] {
+                return Some(at - self.head);
+            }
+            from = at + 1;
+        }
+    }
 }
 
 impl TemplateVariant {
@@ -104,10 +138,7 @@ impl TemplateVariant {
         Self {
             anchor_idx,
             min_len: literals.iter().map(Vec::len).sum(),
-            finders: literals
-                .iter()
-                .map(|l| Finder::new(l).into_owned())
-                .collect(),
+            finders: literals.iter().map(|l| LitFinder::new(l)).collect(),
             literals,
             slots,
         }
@@ -1058,7 +1089,8 @@ pub fn match_template<'a>(
     }
     if tv.anchor_idx > 0 && tv.anchor_idx < k {
         let body = &line[prefix.len()..line.len() - suffix.len()];
-        if tv.finders[tv.anchor_idx].find(body).is_none() {
+        let a = tv.anchor_idx;
+        if tv.finders[a].find(&tv.literals[a], body).is_none() {
             return false;
         }
     }
@@ -1074,7 +1106,7 @@ pub fn match_template<'a>(
         if next_lit.is_empty() {
             return false;
         }
-        let Some(rel) = tv.finders[s + 1].find(&line[pos..body_end]) else {
+        let Some(rel) = tv.finders[s + 1].find(next_lit, &line[pos..body_end]) else {
             return false;
         };
         let match_at = pos + rel;
@@ -1629,6 +1661,28 @@ impl BlockReconstructor {
 mod tests {
     use super::*;
     use crate::packs::PackRegistry;
+
+    #[test]
+    fn literals_are_found_first_as_memmem_finds_them() {
+        let mut state = 7u64;
+        for len in [1usize, 5, 32, 33, 40] {
+            let lit: Vec<u8> = (0..len).map(|i| b'a' + (i % 5) as u8).collect();
+            let f = LitFinder::new(&lit);
+            // Pieces that hold the literal's tail without its head.
+            let cut = len.saturating_sub(PACKED);
+            let pieces: [&[u8]; 4] = [&lit, &lit[cut..], &lit[len / 2..], b"x"];
+            for _ in 0..200 {
+                let mut hay = Vec::new();
+                for _ in 0..state % 6 {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    hay.extend_from_slice(pieces[(state % 4) as usize]);
+                }
+                assert_eq!(f.find(&lit, &hay), memchr::memmem::find(&hay, &lit));
+            }
+        }
+    }
 
     fn shape(lits: &[&[u8]], slots: &[u16]) -> Shape {
         let literals = lits.iter().map(|l| l.to_vec()).collect();
