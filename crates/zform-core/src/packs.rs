@@ -398,7 +398,7 @@ impl PackRegistry {
                     s.spawn(move || {
                         let _memo = crate::payload::graph::EncodeMemoScope::new();
                         let rows: Vec<&[u8]> = c.iter().map(Vec::as_slice).collect();
-                        self.encode_best_graph_inner(&rows, 0).0
+                        self.table_column(&rows)
                     })
                 })
                 .collect();
@@ -407,6 +407,28 @@ impl PackRegistry {
                 .collect()
         });
         Tables::wire_of(&graphs)
+    }
+
+    /// A table column's graph. A long column is searched on a sample from its middle and
+    /// coded with what won there, as a block's columns are, unless that costs a cell a
+    /// quarter more on the whole.
+    fn table_column(&self, rows: &[&[u8]]) -> PayloadGraph {
+        const SAMPLE: usize = 16384;
+        if rows.len() >= 4 * SAMPLE {
+            let sample = self.encode_single(&rows[(rows.len() - SAMPLE) / 2..][..SAMPLE], 0, None);
+            let pick = Pick {
+                choice: Choice::Single(sample.won, sample.also),
+                tapes: sample.tapes,
+                cells: SAMPLE,
+                cost: sample.graph.cost(),
+            };
+            let graph = self.encode_single(rows, 0, Some(&pick)).graph;
+            let per = |cost: usize, cells: usize| cost as u128 * cells as u128;
+            if per(graph.cost(), SAMPLE) * 4 <= per(pick.cost, rows.len()) * 5 {
+                return graph;
+            }
+        }
+        self.encode_single(rows, 0, None).graph
     }
 
     pub fn register_relation<P: RelationPack + 'static>(&mut self, pack: P) {
