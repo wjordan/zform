@@ -474,10 +474,10 @@ impl IntStream {
                 };
                 let n = vals.len();
                 let mut planes = vec![0u8; n * (bw as usize)];
-                for (i, &v) in vals.iter().enumerate() {
-                    let le = (v as u64).wrapping_sub(min as u64).to_le_bytes();
-                    for p in 0..(bw as usize) {
-                        planes[p * n + i] = le[p];
+                // A plane at a time keeps the stores sequential.
+                for (p, plane) in planes.chunks_exact_mut(n).enumerate() {
+                    for (dst, &v) in plane.iter_mut().zip(vals) {
+                        *dst = ((v as u64).wrapping_sub(min as u64) >> (8 * p)) as u8;
                     }
                 }
                 let pay_p = pack_leaf(&planes);
