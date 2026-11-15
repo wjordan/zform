@@ -120,7 +120,7 @@ the state its key names and yields the sum (a new key starts from the last sum y
 key 0 passes the delta through. Keys come from the record's template (`ExtVariant` through a
 table) or from a value (`CellIds`, each value's first-occurrence rank); `Interleave` gives each
 template its own delta stream. HDFS times keep one clock for rows that start a block's write,
-and one for rows that finish it; other rows code their time by recency. Thread
+one for rows that finish it and one for reads; other rows code their time by recency. Thread
 ids keep a counter per datanode: the writer infers which replica logged a write row from the
 pipeline (a `Receiving` row names its upstream, `PacketResponder N` its place) and codes it as
 an index into the replica table, which lists each block's replicas in pipeline order; with

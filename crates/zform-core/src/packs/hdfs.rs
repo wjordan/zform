@@ -443,6 +443,8 @@ fn clocks(ctx: &RelationContext<'_, '_>, key: Option<usize>) -> Option<PayloadGr
             // `Receiving block`, `allocateBlock`
             Some(0 | 3) => 1,
             Some(_) => 2,
+            // A block is read soon after its neighbours.
+            None if has(b"Served block") || has(b"exception while serving") => 3,
             None => 0,
         };
         deletes[v] = u8::from(has(DELETING));
@@ -458,7 +460,7 @@ fn clocks(ctx: &RelationContext<'_, '_>, key: Option<usize>) -> Option<PayloadGr
     }
     // Sums count from the block's first time, and steps wrap at midnight.
     let base = vals.iter().find_map(|v| seconds(v))?;
-    let (mut state, mut last) = ([None; 3], base);
+    let (mut state, mut last) = ([None; 4], base);
     let (mut deltas, mut exc_idx, mut exc_vals) = (Vec::with_capacity(vals.len()), vec![], vec![]);
     for (i, (&v, &vid)) in vals.iter().zip(&vids).enumerate() {
         let k = clock[vid as usize] as usize;
