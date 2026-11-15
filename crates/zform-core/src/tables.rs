@@ -153,14 +153,32 @@ impl Tables {
     ) -> Result<Vec<u32>> {
         let (table, col) = (self.ids(c)?, self.col(c)?);
         let mut fresh: HashMap<&[u8], u32> = HashMap::new();
+        // Block columns tend to repeat a value, or step to the table's next one: both are
+        // checked before a lookup.
+        let mut prev: Option<(&[u8], u32)> = None;
         Ok(cells
             .into_iter()
-            .map(|v| match table.get(col, v) {
-                Some(id) => id,
-                None => {
-                    let next = table.len + fresh.len() as u32;
-                    *fresh.entry(v).or_insert(next)
-                }
+            .map(|v| {
+                let id = match prev {
+                    Some((p, id)) if p == v => id,
+                    Some((_, id))
+                        if table
+                            .rows
+                            .get(id as usize + 1)
+                            .is_some_and(|&r| col.get(r as usize) == Some(v)) =>
+                    {
+                        id + 1
+                    }
+                    _ => match table.get(col, v) {
+                        Some(id) => id,
+                        None => {
+                            let next = (table.rows.len() + fresh.len()) as u32;
+                            *fresh.entry(v).or_insert(next)
+                        }
+                    },
+                };
+                prev = Some((v, id));
+                id
             })
             .collect())
     }
@@ -170,7 +188,8 @@ impl Tables {
 struct Ids {
     /// Open addressing: each slot `0` or one more than a value's first row, with its id.
     slots: Vec<(u32, u32)>,
-    len: u32,
+    /// By id, the row of its first occurrence.
+    rows: Vec<u32>,
 }
 
 impl Ids {
@@ -182,15 +201,15 @@ impl Ids {
         let mask = (col.len() * 2).next_power_of_two().max(2) - 1;
         let mut ids = Self {
             slots: vec![(0, 0); mask + 1],
-            len: 0,
+            rows: Vec::new(),
         };
         for (row, v) in col.iter().enumerate() {
             let mut at = Self::hash(v) & mask;
             loop {
                 match ids.slots[at] {
                     (0, _) => {
-                        ids.slots[at] = (row as u32 + 1, ids.len);
-                        ids.len += 1;
+                        ids.slots[at] = (row as u32 + 1, ids.rows.len() as u32);
+                        ids.rows.push(row as u32);
                         break;
                     }
                     (r, _) if col.get(r as usize - 1) == Some(v) => break,
