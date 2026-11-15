@@ -56,17 +56,26 @@ pub fn collation_key(rec: &[u8]) -> Vec<u8> {
 /// Whether sorting `recs` by [`collation_key`] gives them back: keys never fall, and records with
 /// equal keys are equal.
 fn collation_sorted(recs: &[&[u8]]) -> bool {
-    let mut prev: Option<(Vec<u8>, &[u8])> = None;
-    for &r in recs {
-        let k = collation_key(r);
-        if let Some((pk, pr)) = &prev
-            && (pk > &k || (pk == &k && *pr != r))
-        {
-            return false;
-        }
-        prev = Some((k, r));
+    recs.windows(2).all(|w| match collation_cmp(w[0], w[1]) {
+        std::cmp::Ordering::Less => true,
+        std::cmp::Ordering::Equal => w[0] == w[1],
+        std::cmp::Ordering::Greater => false,
+    })
+}
+
+/// `a`'s [`collation_key`] against `b`'s. Keys of a common prefix are equal, so it is skipped
+/// a word at a time.
+fn collation_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let word = |w: &[u8]| u64::from_le_bytes(w.try_into().unwrap());
+    let same = 8 * (a.chunks_exact(8).zip(b.chunks_exact(8)))
+        .take_while(|&(x, y)| word(x) == word(y))
+        .count();
+    fn key(r: &[u8]) -> impl Iterator<Item = u8> + '_ {
+        r.iter()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_ascii_lowercase())
     }
-    true
+    key(&a[same..]).cmp(key(&b[same..]))
 }
 
 /// Restores a sorted-rows block's record order.
@@ -2229,6 +2238,30 @@ pub use crate::inspect::inspect_stream;
 #[cfg(test)]
 mod nested_tests {
     use super::*;
+
+    #[test]
+    fn collation_compares_as_keys_do() {
+        let mut state = 7u64;
+        let bytes: Vec<u8> = (0..60_000)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                b"aA0 :"[(state % 5) as usize]
+            })
+            .collect();
+        for i in 0..2000 {
+            let a = &bytes[i * 29..i * 29 + 4 + i % 20];
+            let b = &bytes[i * 29 + 24..i * 29 + 28 + i % 17];
+            // A shared head of a word or more is what the comparison skips.
+            let b = match i % 2 {
+                0 => [&a[..a.len().min(9)], b].concat(),
+                _ => b.to_vec(),
+            };
+            let want = collation_key(a).cmp(&collation_key(&b));
+            assert_eq!(collation_cmp(a, &b), want);
+        }
+    }
 
     #[test]
     fn nested_messages_keep_plain_bytes_and_json_tags_when_model_is_unhelpful() {
