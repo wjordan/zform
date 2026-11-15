@@ -50,13 +50,20 @@ struct Model {
     rates: [i32; 64],
     mask: usize,
 }
-fn hash(mut x: u64) -> usize {
-    x ^= x >> 30;
+/// The splitmix64 finalizer after its first xor-shift, which [`seed`] applies up front.
+#[inline(always)]
+fn mix(mut x: u64) -> usize {
     x = x.wrapping_mul(0xbf58476d1ce4e5b9);
     x ^= x >> 27;
     x = x.wrapping_mul(0x94d049bb133111eb);
     (x ^ (x >> 31)) as usize
 }
+/// `x ^ x >> 30` of a hash input without its prefix bits. A prefix (below 2^17) fills
+/// only zero bits of `x` and vanishes under `>> 30`, so it can be xored in afterwards.
+fn seed(x: u64) -> u64 {
+    x ^ x >> 30
+}
+type Slots = ([usize; K], [u32; K], [u32; K]);
 impl Model {
     fn new(tb: u8) -> Self {
         Self {
@@ -69,41 +76,41 @@ impl Model {
             mask: (1usize << tb) - 1,
         }
     }
-    #[inline(always)]
-    fn indexes(&self, prefix: u32, prev: u32, prev2: u32) -> [usize; K] {
+    fn seeds(prev: u32, prev2: u32) -> [u64; 2] {
         [
-            prefix as usize & self.mask & (MAX_SLOTS - 1),
-            hash((prev as u64) << 32 | prefix as u64) & self.mask & (MAX_SLOTS - 1),
-            hash((prev2 as u64) << 48 | (prev as u64) << 16 | prefix as u64)
-                & self.mask
-                & (MAX_SLOTS - 1),
+            seed((prev as u64) << 32),
+            seed((prev2 as u64) << 48 | (prev as u64) << 16),
         ]
     }
+    /// Slot indexes, counter probabilities and weights at `prefix`, plus the prediction.
     #[inline(always)]
-    fn predict(&self, ids: &[usize; K], depth: usize) -> u32 {
-        let mut sum = 0u64;
-        for k in 0..K {
-            sum += self.weights[depth & 15][k] as u64 * self.tables[k][ids[k]].p as u64;
-        }
-        ((sum >> 16) as u32).clamp(1, 65535)
+    fn predict(&self, prefix: u32, seeds: [u64; 2], depth: usize) -> (u32, Slots) {
+        let m = self.mask & (MAX_SLOTS - 1);
+        let ids = [
+            prefix as usize & m,
+            mix(seeds[0] ^ prefix as u64) & m,
+            mix(seeds[1] ^ prefix as u64) & m,
+        ];
+        let ws = self.weights[depth & 15];
+        let ps: [u32; K] = std::array::from_fn(|k| self.tables[k][ids[k]].p as u32);
+        let sum = (0..K).map(|k| ws[k] as u64 * ps[k] as u64).sum::<u64>();
+        // Weights sum to 65536 and each p is in 1..=65535, so this needs no clamp.
+        ((sum >> 16) as u32, (ids, ps, ws))
     }
     #[inline(always)]
-    fn update(&mut self, ids: &[usize; K], depth: usize, bit: bool) {
-        let weights = &mut self.weights[depth & 15];
-        let likelihood: [u64; K] = std::array::from_fn(|k| {
-            let p = self.tables[k][ids[k]].p as u64;
-            weights[k] as u64 * if bit { p } else { 65536 - p }
-        });
+    fn update(&mut self, (ids, ps, ws): Slots, depth: usize, bit: bool) {
+        let likelihood: [u64; K] =
+            std::array::from_fn(|k| ws[k] as u64 * if bit { ps[k] } else { 65536 - ps[k] } as u64);
         let total = likelihood.iter().sum::<u64>();
-        for k in 0..K - 1 {
-            weights[k] = (((likelihood[k] << 16) / total * 31 + 21845) >> 5) as u32;
-        }
-        weights[K - 1] = 65536 - weights[0] - weights[1];
+        let w0 = (((likelihood[0] << 16) / total * 31 + 21845) >> 5) as u32;
+        let w1 = (((likelihood[1] << 16) / total * 31 + 21845) >> 5) as u32;
+        self.weights[depth & 15] = [w0, w1, 65536 - w0 - w1];
         for k in 0..K {
             let c = &mut self.tables[k][ids[k]];
             let rate = self.rates[c.n as usize & 63];
-            c.p = (c.p as i32 + (((if bit { 65536 } else { 0 }) - c.p as i32) * rate >> 16))
-                .clamp(1, 65535) as u16;
+            let p = ps[k] as i32;
+            // A rate of at most 1/2 keeps p below 65536; only a step to 0 needs the floor.
+            c.p = (p + (((if bit { 65536 } else { 0 }) - p) * rate >> 16)).max(1) as u16;
             c.n = (c.n + 1).min(63);
         }
     }
@@ -154,13 +161,16 @@ impl Encoder {
         let (bits, min) = (self.bits, self.min);
         let (mut lo, mut hi, mut prev, mut prev2) = (self.lo, self.hi, self.prev, self.prev2);
         let (model, out) = (&mut self.model, &mut self.out);
+        assert!(
+            vals.iter()
+                .all(|&v| (v.wrapping_sub(min) as u32 as u64) < (1u64 << bits))
+        );
         for &value in vals {
             let x = value.wrapping_sub(min) as u32;
-            assert!((x as u64) < (1u64 << bits));
+            let seeds = Model::seeds(prev, prev2);
             let mut prefix = 1u32;
             for depth in 0..bits as usize {
-                let ids = model.indexes(prefix, prev, prev2);
-                let p = model.predict(&ids, depth);
+                let (p, slots) = model.predict(prefix, seeds, depth);
                 let bit = x & (1 << (bits as usize - 1 - depth)) != 0;
                 let mid = lo + (((hi - lo) as u64 * p as u64) >> 16) as u32;
                 if bit {
@@ -176,7 +186,7 @@ impl Encoder {
                     lo <<= 8;
                     hi = (hi << 8) | 255;
                 }
-                model.update(&ids, depth, bit);
+                model.update(slots, depth, bit);
                 prefix = prefix * 2 + bit as u32;
             }
             prev2 = prev;
@@ -224,10 +234,10 @@ pub(super) fn decode(
     let (mut prev, mut prev2) = (0u32, 0u32);
     let mut out = Vec::with_capacity(len);
     for _ in 0..len {
+        let seeds = Model::seeds(prev, prev2);
         let mut prefix = 1u32;
         for depth in 0..bits as usize {
-            let ids = model.indexes(prefix, prev, prev2);
-            let p = model.predict(&ids, depth);
+            let (p, slots) = model.predict(prefix, seeds, depth);
             let mid = lo + (((hi - lo) as u64 * p as u64) >> 16) as u32;
             let bit = code <= mid;
             if bit {
@@ -240,7 +250,7 @@ pub(super) fn decode(
                 hi = (hi << 8) | 255;
                 code = (code << 8) | next()? as u32;
             }
-            model.update(&ids, depth, bit);
+            model.update(slots, depth, bit);
             prefix = prefix * 2 + bit as u32;
         }
         let x = prefix - (1 << bits);
