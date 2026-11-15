@@ -6,6 +6,23 @@
 // 1. Exact Signed & Zero-Padded Integers
 // ============================================================================
 
+/// Equal-length slices compared as overlapping words when short: per-record checks of
+/// literals and number spellings cost more as `memcmp` calls than as such comparisons.
+#[inline]
+pub(crate) fn short_eq(a: &[u8], b: &[u8]) -> bool {
+    let n = a.len();
+    debug_assert_eq!(n, b.len());
+    let w8 = |s: &[u8], i: usize| u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
+    let w4 = |s: &[u8], i: usize| u32::from_le_bytes(s[i..i + 4].try_into().unwrap());
+    match n {
+        0 => true,
+        1..4 => (0..n).all(|i| a[i] == b[i]),
+        4..8 => w4(a, 0) == w4(b, 0) && w4(a, n - 4) == w4(b, n - 4),
+        8..=16 => w8(a, 0) == w8(b, 0) && w8(a, n - 8) == w8(b, n - 8),
+        _ => a == b,
+    }
+}
+
 /// Parses an ASCII integer (`"42"`, `"-17"`, `"007"`, `"+04"`, `"-0"`) into `(value, fmt_tag)`
 /// if and only if [`format_exact_int`] reproduces `src` byte-for-byte.
 #[inline]
@@ -60,7 +77,7 @@ pub fn parse_exact_int(src: &[u8]) -> Option<(i64, u8)> {
     let fmt = (pad_width << 2) | eff_sign;
     let mut check = [0u8; 24];
     let n = format_exact_int_buf(val, fmt, &mut check);
-    if &check[..n] == src {
+    if n == src.len() && short_eq(&check[..n], src) {
         Some((val, fmt))
     } else {
         None

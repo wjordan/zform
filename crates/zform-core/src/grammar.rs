@@ -9,7 +9,7 @@ use crate::container::block_col;
 use crate::json_tree::{JsonTreeBlockReconstructor, JsonTreeBlockSplitter, JsonTreePlan};
 use crate::lex::{
     parse_exact_decimal, parse_exact_int, parse_hex_exact, parse_ipv4_or_port, parse_timestamp,
-    parse_traceparent, parse_ulid, parse_uuid, split_email,
+    parse_traceparent, parse_ulid, parse_uuid, short_eq, split_email,
 };
 use crate::payload::library::Library;
 use crate::wire::{Cursor, DecodeBudget, Error, Result, put_bytes, put_uvarint};
@@ -1029,23 +1029,6 @@ fn scan_token_end(line: &[u8], start: usize) -> usize {
 }
 
 /// Matches `line` against a `TemplateVariant`, extracting `slots.len()` slices into `out_vals`.
-/// Equal-length slices compared as overlapping words when short: every line tests each
-/// template's end literals, and a `memcmp` call costs more than such a comparison.
-#[inline]
-fn short_eq(a: &[u8], b: &[u8]) -> bool {
-    let n = a.len();
-    debug_assert_eq!(n, b.len());
-    let w8 = |s: &[u8], i: usize| u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
-    let w4 = |s: &[u8], i: usize| u32::from_le_bytes(s[i..i + 4].try_into().unwrap());
-    match n {
-        0 => true,
-        1..4 => (0..n).all(|i| a[i] == b[i]),
-        4..8 => w4(a, 0) == w4(b, 0) && w4(a, n - 4) == w4(b, n - 4),
-        8..=16 => w8(a, 0) == w8(b, 0) && w8(a, n - 8) == w8(b, n - 8),
-        _ => a == b,
-    }
-}
-
 pub fn match_template<'a>(
     line: &'a [u8],
     tv: &TemplateVariant,
