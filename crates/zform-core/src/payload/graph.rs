@@ -407,16 +407,15 @@ impl IntStream {
         if vals.is_empty() {
             return Self::Const { val: 0, len: 0 };
         }
-        let first = vals[0];
-        if vals.iter().all(|&x| x == first) {
-            return Self::Const { val: first, len };
+        // One pass for the run count and range; a single run is a constant.
+        let (mut runs, mut min, mut max) = (1usize, vals[0], vals[0]);
+        for (&a, &b) in vals.iter().zip(&vals[1..]) {
+            runs += usize::from(a != b);
+            min = min.min(b);
+            max = max.max(b);
         }
-
-        let mut runs = 1usize;
-        for w in vals.windows(2) {
-            if w[0] != w[1] {
-                runs += 1;
-            }
+        if runs == 1 {
+            return Self::Const { val: vals[0], len };
         }
         let mut best: Option<(usize, Self)> = None;
         if runs * 3 < vals.len() {
@@ -437,8 +436,6 @@ impl IntStream {
             best = Some((leaf.len() + 4, Self::Rle { len, leaf }));
         }
 
-        let min = *vals.iter().min().unwrap();
-        let max = *vals.iter().max().unwrap();
         let span = (max as u128).wrapping_sub(min as u128);
         if span <= u64::MAX as u128 {
             let max_u = span as u64;
