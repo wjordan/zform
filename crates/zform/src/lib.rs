@@ -24,7 +24,7 @@ pub use zform_core::{
     EntropyBackend, Error, FrameFit, FramingSpec, HdfsRelations, InspectReport, ModelPlan,
     PackOptions, PackRegistry, PayloadGraph, Predicate, Profile, RelationContext, RelationPack,
     ResolvedFraming, Result, StreamEncoder, TrainOptions, build_dictionary, build_tables,
-    eval_raw_record, inspect_stream, logical, pack_stream, raw_field_values,
+    eval_raw_record, first_run, inspect_stream, logical, pack_stream, raw_field_values,
 };
 
 use std::io::{Read, Seek, SeekFrom, Write};

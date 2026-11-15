@@ -8,7 +8,8 @@ use std::sync::Arc;
 use zform::inspect::inspect_breakdown;
 use zform::{
     Archive, DecodeBudget, Dictionary, EntropyBackend, FramingSpec, PackOptions, Predicate,
-    Profile, Stats, TrainOptions, build_dictionary, build_tables, inspect_stream, logical, pack,
+    Profile, Stats, TrainOptions, build_dictionary, build_tables, first_run, inspect_stream,
+    logical, pack,
     train, train_seekable, unpack_with_budget,
 };
 
@@ -383,7 +384,15 @@ fn file_profile(path: &str, opts: &mut PackOptions, max_bytes: usize) -> Result<
         } else {
             Some(train(&mut f, &opts.train, None).map_err(err)?)
         };
-        let prof = train_seekable(&mut f, &opts.train, head.as_ref()).map_err(err)?;
+        let prof = if opts.order_by.is_empty() || !dict {
+            train_seekable(&mut f, &opts.train, head.as_ref())
+        } else {
+            // Sorted neighbours relate as the input's do not. A file that gets a dictionary
+            // pass spends another to train on a run as it is stored.
+            let run = first_run(&mut f, opts).map_err(err)?;
+            train_seekable(&mut io::Cursor::new(run), &opts.train, head.as_ref())
+        }
+        .map_err(err)?;
         opts.profile = Some(prof);
         f.seek(SeekFrom::Start(0)).map_err(io_err)?;
     }

@@ -2221,6 +2221,15 @@ impl OwnedChunk {
     }
 }
 
+/// The first run `pack_stream` would store from `reader`, sorted as `opts.order_by` asks.
+pub fn first_run<R: Read>(reader: R, opts: &PackOptions) -> Result<Vec<u8>> {
+    let (by, cap) = (&opts.order_by, opts.order_run_bytes);
+    let sorted = OrderReader::new(reader, by, cap, opts.backend, opts.level, None);
+    let mut run = Vec::new();
+    sorted.take(cap as u64).read_to_end(&mut run)?;
+    Ok(run)
+}
+
 /// The dictionary of what `pack_stream` would write from `reader`, within `max_bytes`: `None` when
 /// `opts` names no profile or no value recurs across blocks.
 pub fn build_dictionary<R: Read>(
