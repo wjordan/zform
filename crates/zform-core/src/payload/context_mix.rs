@@ -24,7 +24,7 @@ pub(super) fn validate(
     if bytes > budget.max_frame_compressed_bytes {
         return Err(Error::BudgetExceeded("context stream bytes"));
     }
-    let tables = K * (1usize << tb) * std::mem::size_of::<Counter>();
+    let tables = std::mem::size_of::<[[Counter; MAX_SLOTS]; K]>();
     budget.check_alloc(tables, "context mixing tables")?;
     budget.check_alloc(len.saturating_mul(8), "context mixing output")?;
     if tables
@@ -42,8 +42,10 @@ struct Counter {
     p: u16,
     n: u8,
 }
+/// Tables are allocated at their largest size so masked indexes need no bounds checks.
+const MAX_SLOTS: usize = 1 << 14;
 struct Model {
-    tables: [Vec<Counter>; K],
+    tables: Box<[[Counter; MAX_SLOTS]; K]>,
     weights: [[u32; K]; 16],
     rates: [i32; 64],
     mask: usize,
@@ -58,28 +60,36 @@ fn hash(mut x: u64) -> usize {
 impl Model {
     fn new(tb: u8) -> Self {
         Self {
-            tables: std::array::from_fn(|_| vec![Counter { p: 32768, n: 0 }; 1usize << tb]),
+            tables: vec![[Counter { p: 32768, n: 0 }; MAX_SLOTS]; K]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap_or_else(|_| unreachable!()),
             weights: [[21845, 21845, 21846]; 16],
             rates: std::array::from_fn(|n| 65536 / (n as i32 + 2)),
             mask: (1usize << tb) - 1,
         }
     }
+    #[inline(always)]
     fn indexes(&self, prefix: u32, prev: u32, prev2: u32) -> [usize; K] {
         [
-            prefix as usize & self.mask,
-            hash((prev as u64) << 32 | prefix as u64) & self.mask,
-            hash((prev2 as u64) << 48 | (prev as u64) << 16 | prefix as u64) & self.mask,
+            prefix as usize & self.mask & (MAX_SLOTS - 1),
+            hash((prev as u64) << 32 | prefix as u64) & self.mask & (MAX_SLOTS - 1),
+            hash((prev2 as u64) << 48 | (prev as u64) << 16 | prefix as u64)
+                & self.mask
+                & (MAX_SLOTS - 1),
         ]
     }
+    #[inline(always)]
     fn predict(&self, ids: &[usize; K], depth: usize) -> u32 {
         let mut sum = 0u64;
         for k in 0..K {
-            sum += self.weights[depth][k] as u64 * self.tables[k][ids[k]].p as u64;
+            sum += self.weights[depth & 15][k] as u64 * self.tables[k][ids[k]].p as u64;
         }
         ((sum >> 16) as u32).clamp(1, 65535)
     }
+    #[inline(always)]
     fn update(&mut self, ids: &[usize; K], depth: usize, bit: bool) {
-        let weights = &mut self.weights[depth];
+        let weights = &mut self.weights[depth & 15];
         let likelihood: [u64; K] = std::array::from_fn(|k| {
             let p = self.tables[k][ids[k]].p as u64;
             weights[k] as u64 * if bit { p } else { 65536 - p }
@@ -91,8 +101,8 @@ impl Model {
         weights[K - 1] = 65536 - weights[0] - weights[1];
         for k in 0..K {
             let c = &mut self.tables[k][ids[k]];
-            c.p = (c.p as i32
-                + (((if bit { 65536 } else { 0 }) - c.p as i32) * self.rates[c.n as usize] >> 16))
+            let rate = self.rates[c.n as usize & 63];
+            c.p = (c.p as i32 + (((if bit { 65536 } else { 0 }) - c.p as i32) * rate >> 16))
                 .clamp(1, 65535) as u16;
             c.n = (c.n + 1).min(63);
         }
