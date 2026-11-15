@@ -2306,8 +2306,12 @@ impl GraphBuilder {
         }
         let lookback = 512;
         let head = &vals[..vals.len().min(2048)];
-        let near_hits = (1..head.len())
-            .filter(|&i| head[i.saturating_sub(lookback)..i].contains(&head[i]))
+        // A value recurs within the lookback when its previous occurrence is that recent.
+        let mut prior: FastMap<i64, usize> = fast_map_with_capacity(head.len());
+        let near_hits = head
+            .iter()
+            .enumerate()
+            .filter(|&(i, &v)| prior.insert(v, i).is_some_and(|j| j + lookback >= i))
             .count();
         if near_hits * 10 < head.len() {
             return self.add_ints(vals);
