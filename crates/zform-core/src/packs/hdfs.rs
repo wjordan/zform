@@ -1,5 +1,20 @@
 //! Writer-side HDFS relationships. Readers execute only ordinary payload operations.
 use super::*;
+use memchr::memmem::Finder;
+use std::sync::LazyLock;
+
+// Prebuilt searchers: these run once or more per record.
+static BLK: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new(b"blk_"));
+static ADDED_AT: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new(ADDED));
+static WRITES: LazyLock<[Finder<'static>; 4]> = LazyLock::new(|| {
+    [
+        b"Receiving block".as_slice(),
+        b"PacketResponder",
+        b"addStoredBlock: blockMap",
+        b"allocateBlock",
+    ]
+    .map(Finder::new)
+});
 
 /// Predicts output partitions from task numbers and repeated attributes from block IDs.
 pub struct HdfsRelations;
@@ -75,18 +90,10 @@ impl RelationPack for HdfsRelations {
         // relations look a row or two back, then each block's other rows in file order. Block
         // ids are successive `java.util.Random` outputs, so blocks in allocation order make each
         // new id a short step from the one before. Rows naming no block follow in file order.
-        const WRITE: [&[u8]; 4] = [
-            b"Receiving block",
-            b"PacketResponder",
-            b"addStoredBlock: blockMap",
-            b"allocateBlock",
-        ];
         let (mut writes, mut others, mut rest) = (Vec::new(), Vec::new(), Vec::new());
         for (i, r) in recs.iter().enumerate() {
             match block_token(r) {
-                Some(_) if WRITE.iter().any(|w| memchr::memmem::find(r, w).is_some()) => {
-                    writes.push(i as u32)
-                }
+                Some(_) if WRITES.iter().any(|w| w.find(r).is_some()) => writes.push(i as u32),
                 Some(_) => others.push(i as u32),
                 None => rest.push(i as u32),
             }
@@ -128,7 +135,7 @@ impl TableBuilder for Replicas {
     fn push(&mut self, raw: &[u8], spans: &[(u32, u32)]) {
         // One search over the chunk: few records match.
         let mut next = 0;
-        for at in memchr::memmem::find_iter(raw, ADDED) {
+        for at in ADDED_AT.find_iter(raw) {
             let i = next + spans[next..].partition_point(|&(_, e)| e as usize <= at);
             let Some(&(s, e)) = spans.get(i) else {
                 break;
@@ -247,7 +254,7 @@ fn in_allocation_order(
 
 /// The first `blk_<id>` token of a record.
 fn block_token(r: &[u8]) -> Option<&[u8]> {
-    let s = memchr::memmem::find(r, b"blk_")?;
+    let s = BLK.find(r)?;
     let tail = &r[s + 4..];
     let n = usize::from(tail.first() == Some(&b'-'));
     let d = tail[n..].iter().take_while(|b| b.is_ascii_digit()).count();
