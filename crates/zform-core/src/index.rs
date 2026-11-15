@@ -47,18 +47,8 @@ fn mix(h: u64) -> u64 {
 /// run that touches an end of `text`, where the text it was cut from may continue the run.
 pub fn tokens(text: &[u8], mut f: impl FnMut(u64, bool)) {
     let n = text.len();
-    let mut i = 0usize;
-    while i < n {
-        if !text[i].is_ascii_alphabetic() {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        i += 1;
-        while i < n && text[i].is_ascii_alphabetic() {
-            i += 1;
-        }
-        let run = &text[start..i];
+    let mut run = |start: usize, end: usize| {
+        let run = &text[start..end];
         if run.len() >= GRAM {
             // A gram is its eight letters read as one little-endian word.
             for w in run.windows(GRAM) {
@@ -69,8 +59,37 @@ pub fn tokens(text: &[u8], mut f: impl FnMut(u64, bool)) {
             let word = run.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &l| {
                 (h ^ l as u64).wrapping_mul(0x0000_0100_0000_01b3)
             });
-            f(mix(word), start > 0 && i < n);
+            f(mix(word), start > 0 && end < n);
         }
+    };
+    // Eight bytes at a time: a byte's top bit marks a letter, and a run's ends are where the
+    // mark changes. Bytes past the text read as zero, which is not a letter.
+    const HI: u64 = 0x8080_8080_8080_8080;
+    let mut open = None;
+    let mut scan = |at: usize, w: u64| {
+        let x = w | 0x2020_2020_2020_2020;
+        let y = x & !HI;
+        let m = (y + 0x1f1f_1f1f_1f1f_1f1f) & !(y + 0x0505_0505_0505_0505) & !x & HI;
+        let mut edges = m ^ ((m << 8) | if open.is_some() { 0x80 } else { 0 });
+        while edges != 0 {
+            let p = at + edges.trailing_zeros() as usize / 8;
+            edges &= edges - 1;
+            match open.take() {
+                Some(s) => run(s, p),
+                None => open = Some(p),
+            }
+        }
+    };
+    let chunks = text.chunks_exact(8);
+    let tail = chunks.remainder();
+    for (at, c) in (0..).step_by(8).zip(chunks) {
+        scan(at, u64::from_le_bytes(c.try_into().unwrap()));
+    }
+    let mut b = [0u8; 8];
+    b[..tail.len()].copy_from_slice(tail);
+    scan(n - tail.len(), u64::from_le_bytes(b));
+    if let Some(s) = open {
+        run(s, n);
     }
 }
 
@@ -875,7 +894,7 @@ mod tests {
                     state ^= state << 13;
                     state ^= state >> 7;
                     state ^= state << 17;
-                    b"abcXYZ  .9"[(state % 10) as usize]
+                    b"abcXYZ  .9@[`{zA\xc1\xe1"[(state % 18) as usize]
                 })
                 .collect();
             let (mut a, mut b) = (Vec::new(), Vec::new());
