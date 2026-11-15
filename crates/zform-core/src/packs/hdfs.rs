@@ -6,15 +6,13 @@ use std::sync::LazyLock;
 // Prebuilt searchers: these run once or more per record.
 static BLK: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new(b"blk_"));
 static ADDED_AT: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new(ADDED));
-static WRITES: LazyLock<[Finder<'static>; 4]> = LazyLock::new(|| {
-    [
-        b"Receiving block".as_slice(),
-        b"PacketResponder",
-        b"addStoredBlock: blockMap",
-        b"allocateBlock",
-    ]
-    .map(Finder::new)
-});
+/// What a write pipeline's lines say, each with the offset of an `R` or `B` in it.
+const WRITES: [(&[u8], usize); 4] = [
+    (b"Receiving block", 0),
+    (b"PacketResponder", 6),
+    (b"addStoredBlock: blockMap", 9),
+    (b"allocateBlock", 8),
+];
 
 /// Predicts output partitions from task numbers and repeated attributes from block IDs.
 pub struct HdfsRelations;
@@ -90,36 +88,40 @@ impl RelationPack for HdfsRelations {
         // relations look a row or two back, then each block's other rows in file order. Block
         // ids are successive `java.util.Random` outputs, so blocks in allocation order make each
         // new id a short step from the one before. Rows naming no block follow in file order.
-        let mut block_of: FastMap<&[u8], usize> = FastMap::default();
+        let mut block_of: FastMap<&[u8], u32> = FastMap::default();
         // By block: its generator state, and its group among the writes and among the others.
         let (mut states, mut slots) = (Vec::new(), Vec::new());
-        // The writes' and the others' groups, each in order of first appearance.
-        let mut groups: [Vec<(usize, Vec<u32>)>; 2] = Default::default();
-        let mut rest = Vec::new();
-        for (i, r) in recs.iter().enumerate() {
+        // Groups in order of first appearance: block, whether its rows are not writes, rows.
+        let mut groups: Vec<(u32, bool, u32)> = Vec::new();
+        // By row: its group, `u32::MAX` when it names no block, and a write's thread.
+        let mut of_row = Vec::with_capacity(recs.len());
+        for r in recs {
             let Some(blk) = block_token(r) else {
-                rest.push(i as u32);
+                of_row.push((u32::MAX, 0));
                 continue;
             };
-            let kind = usize::from(!WRITES.iter().any(|w| w.find(r).is_some()));
+            let other = !is_write(r);
             let b = *block_of.entry(blk).or_insert_with(|| {
                 states.push(token_state(blk));
-                slots.push([usize::MAX; 2]);
-                states.len() - 1
+                slots.push([u32::MAX; 2]);
+                states.len() as u32 - 1
             });
-            let list = &mut groups[kind];
-            if slots[b][kind] == usize::MAX {
-                slots[b][kind] = list.len();
-                list.push((b, Vec::new()));
+            let g = &mut slots[b as usize][usize::from(other)];
+            if *g == u32::MAX {
+                *g = groups.len() as u32;
+                groups.push((b, other, 0));
             }
-            list[slots[b][kind]].1.push(i as u32);
+            groups[*g as usize].2 += 1;
+            of_row.push((*g, if other { 0 } else { thread_id(r) }));
         }
-        if rest.len() == recs.len() {
+        if groups.is_empty() {
             return None;
         }
         // Groups go by the step from the first block's generator state to theirs; ids no
         // generator made go last.
-        let anchor = groups.iter().flatten().find_map(|&(b, _)| states[b]);
+        let anchor = (groups.iter().filter(|g| !g.1))
+            .chain(groups.iter().filter(|g| g.1))
+            .find_map(|g| states[g.0 as usize]);
         let steps: Vec<_> = states
             .iter()
             .map(|&s| match (anchor, s) {
@@ -127,17 +129,36 @@ impl RelationPack for HdfsRelations {
                 _ => (true, 0),
             })
             .collect();
-        let mut order = Vec::with_capacity(recs.len());
-        for (kind, mut list) in groups.into_iter().enumerate() {
-            list.sort_by_key(|&(b, _)| steps[b]);
-            for (_, mut g) in list {
-                if kind == 0 {
-                    g.sort_by_cached_key(|&i| thread_id(recs[i as usize]));
+        let mut ranked: Vec<u32> = (0..groups.len() as u32).collect();
+        ranked.sort_by_key(|&g| (groups[g as usize].1, steps[groups[g as usize].0 as usize]));
+        // Each group's place in the order, then rows placed in file order.
+        let mut end = vec![0u32; groups.len()];
+        let mut at = 0;
+        for &g in &ranked {
+            end[g as usize] = at;
+            at += groups[g as usize].2;
+        }
+        let mut order = vec![0u32; recs.len()];
+        let mut rest = at as usize;
+        for (i, &(g, _)) in of_row.iter().enumerate() {
+            let to = match end.get_mut(g as usize) {
+                Some(e) => {
+                    *e += 1;
+                    *e as usize - 1
                 }
-                order.extend(g);
+                None => {
+                    rest += 1;
+                    rest - 1
+                }
+            };
+            order[to] = i as u32;
+        }
+        for (g, &(_, other, n)) in groups.iter().enumerate() {
+            if !other {
+                let e = end[g] as usize;
+                order[e - n as usize..e].sort_by_key(|&i| of_row[i as usize].1);
             }
         }
-        order.extend(rest);
         Some(order)
     }
 }
@@ -242,6 +263,12 @@ fn replica(ctx: &RelationContext<'_, '_>, key: usize) -> Option<PayloadGraph> {
     let base = gb.add_index_cells(source, idx);
     let root = gb.add_patch(base, &exc_idx, &exc_vals);
     Some(gb.finish(root))
+}
+
+/// Whether a record says one of [`WRITES`], found from the letters they hold.
+fn is_write(r: &[u8]) -> bool {
+    memchr::memchr2_iter(b'R', b'B', r)
+        .any(|p| WRITES.iter().any(|&(w, at)| p >= at && r[p - at..].starts_with(w)))
 }
 
 /// The first `blk_<id>` token of a record.
@@ -416,6 +443,25 @@ mod tests {
             }),
             FrontEnd::None,
         );
+    }
+
+    #[test]
+    fn writes_are_found_by_their_letters() {
+        let lines: [&[u8]; 6] = [
+            b"INFO dfs.DataNode$PacketResponder: Received block blk_1",
+            b"BLOCK* NameSystem.addStoredBlock: blockMap updated: 10.0.0.1:50010",
+            b"BLOCK* NameSystem.allocateBlock: /x. blk_2",
+            b"Receiving block blk_3",
+            b"BLOCK* NameSystem.addStoredBlock: Redundant",
+            b"Deleting block blk_4 file /BlockReceiving block",
+        ];
+        for r in lines {
+            let any = WRITES.iter().any(|(w, _)| memchr::memmem::find(r, w).is_some());
+            assert_eq!(is_write(r), any, "{}", String::from_utf8_lossy(r));
+        }
+        for (w, at) in WRITES {
+            assert!(matches!(w[at], b'R' | b'B'));
+        }
     }
 
     fn check_graph(plan: &ModelPlan, vids: &[u32], cols: &[Vec<&[u8]>], graph: PayloadGraph) {
