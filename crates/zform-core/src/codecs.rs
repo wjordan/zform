@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::cells::{Cells, Col, Pool};
 use crate::grammar::{ModelPlan, PlanVariant};
-use crate::lex::{parse_exact_int, parse_timestamp};
+use crate::lex::parse_timestamp;
 pub use crate::packs::EncodedDenseBlock;
 use crate::packs::PackRegistry;
 pub(crate) use crate::packs::{Seeds, with_seeds};
@@ -77,7 +77,30 @@ pub(crate) fn time_bounds(vals: &[&[u8]]) -> Option<(i64, i64)> {
 
 /// Bounds of a column whose every value is an exact integer.
 pub(crate) fn int_bounds(vals: &[&[u8]]) -> Option<(i64, i64)> {
-    let mut ints = vals.iter().map(|v| parse_exact_int(v).map(|(iv, _)| iv));
+    // `parse_exact_int`'s value without its format: at most 19 digits cannot overflow.
+    let value = |v: &[u8]| {
+        let (neg, digits) = match v.first()? {
+            b'+' => (false, &v[1..]),
+            b'-' => (true, &v[1..]),
+            _ => (false, v),
+        };
+        if digits.is_empty() || digits.len() > 19 {
+            return None;
+        }
+        let mut u = 0u64;
+        for &b in digits {
+            let d = b.wrapping_sub(b'0');
+            if d > 9 {
+                return None;
+            }
+            u = u * 10 + d as u64;
+        }
+        match neg {
+            true => 0i64.checked_sub_unsigned(u),
+            false => i64::try_from(u).ok(),
+        }
+    };
+    let mut ints = vals.iter().map(|v| value(v));
     let first = ints.next()??;
     ints.try_fold((first, first), |(lo, hi), v| {
         v.map(|v| (lo.min(v), hi.max(v)))
@@ -617,6 +640,19 @@ mod tests {
     use crate::container::{PackOptions, pack_stream, unpack_stream};
     use crate::packs::{CodecPack, ColumnProfile};
     use crate::payload::graph::GraphBuilder;
+
+    #[test]
+    fn int_bounds_parse_as_exact_ints_do() {
+        let spellings = [
+            "", "+", "-", "0", "-0", "+0", "007", "-007", "42", "4a", " 1", "1 ",
+            "9223372036854775807", "9223372036854775808", "-9223372036854775808", "-9223372036854775809",
+            "9999999999999999999", "-9999999999999999999", "+9999999999999999999", "10000000000000000000",
+        ];
+        for s in spellings {
+            let want = crate::lex::parse_exact_int(s.as_bytes()).map(|(v, _)| (v, v));
+            assert_eq!(int_bounds(&[s.as_bytes()]), want, "{s:?}");
+        }
+    }
     use crate::payload::ir::{Builder, Op};
 
     #[test]
