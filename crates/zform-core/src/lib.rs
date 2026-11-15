@@ -18,11 +18,12 @@ pub mod packs;
 pub mod payload;
 pub mod plan;
 pub mod query;
+pub mod tables;
 pub mod wire;
 
 pub use container::{
-    FrameFit, InspectReport, PackOptions, StreamEncoder, build_dictionary, inspect_stream,
-    pack_stream, unpack_stream,
+    FrameFit, InspectReport, PackOptions, StreamEncoder, build_dictionary, build_tables,
+    inspect_stream, pack_stream, unpack_stream,
 };
 pub use dictionary::{Dictionary, DictionaryBuilder};
 pub use framing::{FramingSpec, ResolvedFraming};

@@ -7,6 +7,7 @@ use std::fmt::Write as _;
 use std::io::Read;
 use std::sync::Arc;
 
+use crate::tables::TABLE_PEER;
 use crate::container::{
     BlockParts, FLAG_DICTIONARY, FLAG_HAS_CHECKSUM, FLAG_PASSTHROUGH, FLAG_REUSE_PREV_MODEL,
     FLAG_SYNC_POINT, InspectReport, NextFrameKind, Structure, parse_frame_blocks,
@@ -614,10 +615,12 @@ impl Render<'_> {
         }
     }
 
-    fn col(&self, slot: u16) -> &str {
-        let id = self.g.ext_peers.get(slot as usize).map(|&c| c as usize);
-        id.and_then(|c| self.cols.get(c))
-            .map_or("?", |c| c.name.as_str())
+    fn col(&self, slot: u16) -> String {
+        match self.g.ext_peers.get(slot as usize) {
+            Some(&c) if c & TABLE_PEER != 0 => format!("table.{}", c & !TABLE_PEER),
+            Some(&c) => self.cols.get(c as usize).map_or("?", |c| c.name.as_str()).to_string(),
+            None => "?".to_string(),
+        }
     }
 
     fn label(&self, n: &GraphNode) -> String {

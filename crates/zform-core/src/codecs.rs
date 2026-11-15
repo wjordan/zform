@@ -17,6 +17,8 @@ use crate::payload::graph::{
     NESTED_COLUMN_TAG, PayloadGraph, unpack_leaf, with_encode_opts,
 };
 use crate::payload::library::Library;
+use crate::dictionary::with_current;
+use crate::tables::TABLE_PEER;
 use crate::wire::{Cursor, DecodeBudget, EntropyBackend, Error, Result, expand_page, put_bytes};
 
 // ============================================================================
@@ -501,8 +503,28 @@ fn ensure_col_inner(
             as_cells[slot as usize] = true;
         }
     }
+    let tables = if graph.ext_peers.iter().any(|&p| p & TABLE_PEER != 0) {
+        Some(with_current(|d| d.and_then(|d| d.tables().cloned())).ok_or(Error::NotLoaded)?)
+    } else {
+        None
+    };
+    let table_col = |p: u32| -> Result<Option<usize>> {
+        if p & TABLE_PEER == 0 {
+            return Ok(None);
+        }
+        let t = (p & !TABLE_PEER) as usize;
+        match &tables {
+            Some(tables) if t < tables.len() => Ok(Some(t)),
+            _ => Err(Error::Format("table column out of range".into())),
+        }
+    };
     let mut peers = Vec::with_capacity(graph.ext_peers.len());
     for (&peer_id, &as_cells) in graph.ext_peers.iter().zip(&as_cells) {
+        if let Some(t) = table_col(peer_id)? {
+            let tables = tables.as_ref().unwrap();
+            peers.push(if as_cells { Arc::clone(tables.col(t)?) } else { Arc::default() });
+            continue;
+        }
         let pid = peer_id as usize;
         if pid >= col_idx {
             return Err(Error::Format(
@@ -535,20 +557,35 @@ fn ensure_col_inner(
     let mut aligned = Vec::new();
     for node in &graph.nodes {
         if let GraphNode::ExtAlign { key, at } = *node {
-            let col = |s: u16| graph.ext_peers[s as usize] as usize;
-            let (key, at) = (col(key), if at == 0 { col_idx } else { col(at - 1) });
-            if ctx.key_ids[key].is_none() {
-                let ids = match ctx.cache[key].as_ref().unwrap() {
-                    Col::Dict { dict, ords } => {
-                        let d = value_ids(dict);
-                        ords.iter().map(|&o| d[o as usize]).collect()
-                    }
-                    Col::Flat(c) => value_ids(c),
-                    other => value_ids(&other.to_cells()?),
-                };
-                ctx.key_ids[key] = Some(Arc::new(ids));
+            let peer = |s: u16| graph.ext_peers[s as usize];
+            if table_col(peer(key))?.is_some() {
+                return Err(Error::Format("ExtAlign key is a table column".into()));
             }
-            let ids = Arc::clone(ctx.key_ids[key].as_ref().unwrap());
+            let key = peer(key) as usize;
+            let at_peer = (at > 0).then(|| peer(at - 1));
+            // `at` naming a table column aligns this column, with key ids joint with the table's.
+            let joint = at_peer.map(table_col).transpose()?.flatten();
+            let at = match (joint, at_peer) {
+                (None, Some(p)) => p as usize,
+                _ => col_idx,
+            };
+            let ids = if let Some(t) = joint {
+                let cells = ctx.cache[key].as_ref().unwrap().to_cells()?;
+                Arc::new(tables.as_ref().unwrap().joint_ids(t, cells.iter())?)
+            } else {
+                if ctx.key_ids[key].is_none() {
+                    let ids = match ctx.cache[key].as_ref().unwrap() {
+                        Col::Dict { dict, ords } => {
+                            let d = value_ids(dict);
+                            ords.iter().map(|&o| d[o as usize]).collect()
+                        }
+                        Col::Flat(c) => value_ids(c),
+                        other => value_ids(&other.to_cells()?),
+                    };
+                    ctx.key_ids[key] = Some(Arc::new(ids));
+                }
+                Arc::clone(ctx.key_ids[key].as_ref().unwrap())
+            };
             let (plan, vids) = ctx.layout.as_ref().ok_or(Error::NotLoaded)?;
             let mut idx = align_cells(plan, vids, key, at)?;
             for i in &mut idx {

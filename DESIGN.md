@@ -48,7 +48,8 @@ The library travels with the model in streams and profiles; it needs no external
 A column header declares its dependencies on the block's prose pool, one shared dictionary,
 and peer columns. The index records those dependencies so a selective read fetches the parts
 needed to evaluate the graph. Shared code in the model and shared data in the block have
-separate lifetimes. Neither creates a dependency on another block's column data.
+separate lifetimes. Neither creates a dependency on another block's column data; a file's tables,
+below, are the one input from outside the block.
 
 `CoreDecoder::decode_col` preserves constant, dictionary, pooled, and quoted columns as lazy
 views when the graph root permits it. This avoids copying repeated cell bytes and lets a
@@ -120,7 +121,7 @@ the regions anywhere and pass their bases to the reader.
 else, and two data regions concatenated are one valid stream.
 
 - A block needs its model and row count to decode and, in a file written with one, the file's
-  dictionary. No block refers to another block's bytes.
+  dictionary and tables. No block refers to another block's bytes.
 - A block is stored as parts: the row structure, then one part per column, plus the tables
   several columns share (a dictionary, pooled free text). A part decompresses on its own once
   the parts of the same block it depends on are present.
@@ -143,6 +144,15 @@ blocks within a byte budget, at most 16 MiB at levels 1 to 4, which is all zstd 
 It skips numbers and holds a hex id as the bytes it spells, as their columns code them. The CLI
 builds one for a file of over a block under `--best` (1/32 of the file, 8 to 32 MiB) or
 `--dict-bytes`.
+
+**Tables hold what blocks refer to across the file.** An entity named in many blocks, such as
+an HDFS block and its replicas, is stored once in a table column carried by the dictionary
+frame, and a block column codes a value as a lookup into it by key. Back-references to earlier
+blocks would do the same work but fan one query out to every block referred to (up to 48 for
+HDFS deletes); a table keeps each block self-contained apart from the table. A table column is
+decoded the first time a block reads it, so queries that do not touch those columns pay only
+for the table's bytes. A relation pack builds its table in a pass before writing; the CLI makes
+one for a file of over a block whose packs keep one.
 
 **The index region is derived data.** Scanning the data region rebuilds it.
 

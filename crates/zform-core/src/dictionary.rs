@@ -11,6 +11,7 @@ use zstd_safe::{CCtx, CParameter, DCtx, DictAttachPref, ResetDirective};
 use crate::container::PackOptions;
 use crate::grammar::{ModelPlan, split_records_with_plan};
 use crate::packs::HexFixedPack;
+use crate::tables::Tables;
 use crate::wire::{
     Cursor, DecodeBudget, EntropyBackend, Error, Result, decompress_leaf, put_leaf, window_log,
     xxh64,
@@ -28,6 +29,7 @@ pub struct Dictionary {
     id: u64,
     /// A compressor that has digested the content, with the level it did so at.
     enc: Mutex<Option<(i32, CCtx<'static>)>>,
+    tables: Option<Arc<Tables>>,
 }
 
 impl fmt::Debug for Dictionary {
@@ -42,7 +44,18 @@ impl Dictionary {
         if bytes.starts_with(&ZSTD_DICT_MAGIC) {
             bytes.insert(0, 0);
         }
-        Self { id: xxh64(&bytes, ID_SEED), bytes, enc: Mutex::new(None) }
+        Self { id: xxh64(&bytes, ID_SEED), bytes, enc: Mutex::new(None), tables: None }
+    }
+
+    /// This dictionary carrying `tables` too.
+    pub fn with_tables(mut self, tables: Tables) -> Self {
+        self.id = content_id(&self.bytes, Some(&tables));
+        self.tables = Some(Arc::new(tables));
+        self
+    }
+
+    pub fn tables(&self) -> Option<&Arc<Tables>> {
+        self.tables.as_ref()
     }
 
     /// Bytes of content, which is what a dictionary holds in memory until it is written with.
@@ -54,7 +67,8 @@ impl Dictionary {
         self.bytes.is_empty()
     }
 
-    /// The XXH64 of the content. A host that keeps dictionaries across opens keys them by it.
+    /// The XXH64 of the content and tables. A host that keeps dictionaries across opens keys
+    /// them by it.
     pub fn id(&self) -> u64 {
         self.id
     }
@@ -72,23 +86,32 @@ impl Dictionary {
             Ok(n) if n < len => put_leaf(&mut out, EntropyBackend::Zstd, len, &tmp[..n]),
             _ => put_leaf(&mut out, EntropyBackend::Raw, len, &self.bytes),
         }
+        if let Some(t) = &self.tables {
+            out.extend_from_slice(t.wire());
+        }
         out
     }
 
-    /// The dictionary stored as `leaf`, whose content has the id `id`.
-    pub(crate) fn read(leaf: &[u8], id: u64, budget: &DecodeBudget) -> Result<Self> {
-        let bytes = decompress_leaf(&mut Cursor::new(leaf), budget)?;
-        if budget.verify_checksums && xxh64(&bytes, ID_SEED) != id {
+    /// The dictionary `store` wrote, whose content and tables have the id `id`.
+    pub(crate) fn read(stored: &[u8], id: u64, budget: &DecodeBudget) -> Result<Self> {
+        let mut cur = Cursor::new(stored);
+        let bytes = decompress_leaf(&mut cur, budget)?;
+        let rest = &stored[stored.len() - cur.remaining()..];
+        let tables = (!rest.is_empty()).then(|| Tables::decode(rest, budget)).transpose()?;
+        if budget.verify_checksums && content_id(&bytes, tables.as_ref()) != id {
             return Err(Error::ChecksumMismatch("dictionary XXH64"));
         }
         if bytes.starts_with(&ZSTD_DICT_MAGIC) {
             return Err(Error::Format("dictionary content reads as zstd tables".into()));
         }
-        Ok(Self { bytes, id, enc: Mutex::new(None) })
+        Ok(Self { bytes, id, enc: Mutex::new(None), tables: tables.map(Arc::new) })
     }
 
     /// Compresses `src` into `dst` as a frame that decodes only against this dictionary.
     pub(crate) fn compress(&self, dst: &mut [u8], src: &[u8], level: i32) -> Option<usize> {
+        if self.is_empty() {
+            return None;
+        }
         let mut enc = self.enc.lock().unwrap();
         if enc.as_ref().is_none_or(|e| e.0 != level) {
             let mut ctx = CCtx::try_create()?;
@@ -120,6 +143,13 @@ impl Dictionary {
         src: &[u8],
     ) -> zstd_safe::SafeResult {
         dctx.decompress_using_dict(dst, src, &self.bytes)
+    }
+}
+
+fn content_id(bytes: &[u8], tables: Option<&Tables>) -> u64 {
+    match tables {
+        None => xxh64(bytes, ID_SEED),
+        Some(t) => xxh64(&[bytes, t.wire()].concat(), ID_SEED),
     }
 }
 

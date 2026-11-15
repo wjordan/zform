@@ -8,6 +8,7 @@ use crate::codecs::{
     ensure_dense_block_column, with_seeds,
 };
 use crate::dictionary::{Dictionary, DictionaryBuilder, Scope};
+use crate::tables::Tables;
 use crate::framing::{
     FramedChunk, FramingSpec, ResolvedFraming, emit_framed_record, split_chunk, split_json_array,
 };
@@ -1753,6 +1754,23 @@ pub fn build_dictionary<R: Read>(
         Ok(())
     })?;
     Ok(b.finish())
+}
+
+/// The table `opts`' packs look values up in, from a pass over `reader`: `None` when no pack
+/// keeps one or no record adds to it.
+pub fn build_tables<R: Read>(reader: R, opts: &PackOptions) -> Result<Option<Tables>> {
+    let Some(mut b) = opts.packs.table_builder() else {
+        return Ok(None);
+    };
+    for_each_chunk(reader, opts, |fc| {
+        (0..fc.len()).for_each(|i| b.push(fc.record(i)));
+        Ok(())
+    })?;
+    let cols = b.finish();
+    if cols.first().is_none_or(|c| c.is_empty()) {
+        return Ok(None);
+    }
+    opts.packs.build_tables(&cols, &DecodeBudget::default()).map(Some)
 }
 
 /// Cuts `reader` into the framed chunks `pack_stream` encodes, in order.

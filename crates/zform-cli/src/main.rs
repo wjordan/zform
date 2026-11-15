@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use zform::inspect::inspect_breakdown;
 use zform::{
-    Archive, DecodeBudget, EntropyBackend, FramingSpec, PackOptions, Predicate, Profile, Stats,
-    TrainOptions, build_dictionary, inspect_stream, logical, pack, train, train_seekable,
-    unpack_with_budget,
+    Archive, DecodeBudget, Dictionary, EntropyBackend, FramingSpec, PackOptions, Predicate,
+    Profile, Stats, TrainOptions, build_dictionary, build_tables, inspect_stream, logical, pack,
+    train, train_seekable, unpack_with_budget,
 };
 
 fn usage() -> &'static str {
@@ -335,7 +335,7 @@ fn cmd_pack(args: &[String]) -> Result<(), String> {
 /// is asked for, trained on samples from across the file, which hold the key layouts that turn up
 /// later; for text, it extends the profile a stream would train on its head. Then a dictionary,
 /// chosen in a pass over the file, unless the file is one block or less or no text value recurs
-/// across its blocks.
+/// across its blocks, and the packs' table in another.
 fn file_profile(path: &str, opts: &mut PackOptions, max_bytes: usize) -> Result<(), String> {
     let io_err = |e: io::Error| format!("{path}: {e}");
     let err = |e: zform::Error| format!("{path}: {e}");
@@ -344,7 +344,8 @@ fn file_profile(path: &str, opts: &mut PackOptions, max_bytes: usize) -> Result<
     if !meta.is_file() {
         return Ok(());
     }
-    let dict = max_bytes > 0 && meta.len() > opts.block_bytes as u64;
+    let multi_block = meta.len() > opts.block_bytes as u64;
+    let dict = max_bytes > 0 && multi_block;
     if opts.profile.is_none() && (dict || meta.len() > opts.chunk_bytes as u64) {
         // A JSON tree is trained afresh from any sample: the head's plan helps text alone.
         let mut lead = [0u8; 256];
@@ -360,13 +361,19 @@ fn file_profile(path: &str, opts: &mut PackOptions, max_bytes: usize) -> Result<
         opts.profile = Some(prof);
         f.seek(SeekFrom::Start(0)).map_err(io_err)?;
     }
-    if !dict {
-        return Ok(());
+    let mut d = None;
+    if dict {
+        d = build_dictionary(BufReader::with_capacity(256 << 10, &mut f), opts, max_bytes)
+            .map_err(err)?;
     }
-    let rdr = BufReader::with_capacity(256 << 10, f);
-    if let Some(d) = build_dictionary(rdr, opts, max_bytes).map_err(err)? {
-        opts.dictionary = Some(Arc::new(d));
+    if multi_block {
+        f.seek(SeekFrom::Start(0)).map_err(io_err)?;
+        let rdr = BufReader::with_capacity(256 << 10, f);
+        if let Some(t) = build_tables(rdr, opts).map_err(err)? {
+            d = Some(d.unwrap_or_else(|| Dictionary::new(Vec::new())).with_tables(t));
+        }
     }
+    opts.dictionary = d.map(Arc::new);
     Ok(())
 }
 

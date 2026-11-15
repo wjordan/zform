@@ -206,14 +206,14 @@ pub fn train_from_records(
             if !keep_all_prior && var_hits[*vi as usize] == 0 {
                 continue;
             }
-            let slots: Vec<u16> = tv
-                .slots
-                .iter()
-                .map(|&old_c| {
-                    let oc = &prev.columns[old_c as usize];
-                    plan.add_or_get_col_with_group(&oc.name, &oc.dict_group)
-                })
-                .collect();
+            // Block ids first, as `train_templates_arm` numbers them.
+            let mut slots = vec![0u16; tv.slots.len()];
+            let blk = |&(_, &c): &(usize, &u16)| prev.columns[c as usize].dict_group == "blk_id";
+            let (first, rest): (Vec<_>, Vec<_>) = tv.slots.iter().enumerate().partition(blk);
+            for (si, &old_c) in first.into_iter().chain(rest) {
+                let oc = &prev.columns[old_c as usize];
+                slots[si] = plan.add_or_get_col_with_group(&oc.name, &oc.dict_group);
+            }
             let literals = tv.literals.clone();
             plan.push_variant(
                 PlanVariant::Shape(Shape { literals, slots }),
@@ -644,9 +644,13 @@ fn train_templates_arm<'a>(rows: &[&'a [u8]], opts: &TrainOptions, plan: &mut Mo
         // so same-row `src_ip == dest_ip` `ExactCopy` and `SharedDictPool` both fire!).
         let mut used_in_tpl: HashSet<u16> = HashSet::with_capacity(classes.len());
         let mut ctx_ord: HashMap<String, usize> = HashMap::new();
-        let mut slots = Vec::with_capacity(classes.len());
+        let mut slots = vec![0u16; classes.len()];
 
-        for (si, &cls) in classes.iter().enumerate() {
+        // Block ids take their columns first, so the columns keyed on them come after them.
+        let is_blk = |si: usize| classes[si] == SlotClass::Int && literals[si].ends_with(b"blk_");
+        let order = (0..classes.len()).filter(|&si| is_blk(si));
+        for si in order.chain((0..classes.len()).filter(|&si| !is_blk(si))) {
+            let cls = classes[si];
             let prev_lit = &literals[si];
             let next_lit = &literals[si + 1];
             let prev_tail = &prev_lit[prev_lit.len().saturating_sub(8)..];
@@ -693,7 +697,7 @@ fn train_templates_arm<'a>(rows: &[&'a [u8]], opts: &TrainOptions, plan: &mut Mo
                 }
                 ord += 1;
             };
-            slots.push(cid);
+            slots[si] = cid;
         }
 
         let already = plan.variants.iter().zip(&plan.fronts).any(|v| match v {

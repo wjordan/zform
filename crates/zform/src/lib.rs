@@ -23,8 +23,8 @@ pub use zform_core::{
     CodecPack, ColumnProfile, CoreDecoder, DecodeBudget, Dictionary, DictionaryBuilder,
     EntropyBackend, Error, FrameFit, FramingSpec, HdfsRelations, InspectReport, ModelPlan,
     PackOptions, PackRegistry, PayloadGraph, Predicate, Profile, RelationContext, RelationPack,
-    ResolvedFraming, Result, StreamEncoder, TrainOptions, build_dictionary, eval_raw_record,
-    inspect_stream, logical, pack_stream, raw_field_values,
+    ResolvedFraming, Result, StreamEncoder, TrainOptions, build_dictionary, build_tables,
+    eval_raw_record, inspect_stream, logical, pack_stream, raw_field_values,
 };
 
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -1071,6 +1071,57 @@ mod tests {
         let (rows, _) = assert_grep(&comp, &recs, &contains("PacketResponder 0"));
         assert_eq!(rows.len(), 300);
         assert_grep(&comp, &recs, &word("terminating"));
+    }
+
+    #[test]
+    fn replicas_are_looked_up_in_the_file_table() {
+        // Each block is written to three datanodes and later invalidated on each, several
+        // blocks later in the file: the invalidations name replicas the file's table holds.
+        let mut log = Vec::new();
+        // Block ids are `java.util.Random::nextLong` outputs.
+        let mut state = 0x1234_5678_9abcu64;
+        let mut next = || {
+            state = state.wrapping_mul(0x5DEECE66D).wrapping_add(11) & ((1 << 48) - 1);
+            (state >> 16) as i32 as i64
+        };
+        for b in 0..400u64 {
+            let blk = (next() << 32).wrapping_add(next());
+            let s = 10 + b % 50;
+            for r in 0..3 {
+                let ip = format!("10.250.{}.{}", (b * 7 + r * 5) % 23, (b + r * 11) % 31);
+                log.push(format!("081109 2035{s} 19 INFO dfs.FSNamesystem: BLOCK* NameSystem.addStoredBlock: blockMap updated: {ip}:50010 is added to blk_{blk} size 67108864"));
+                log.push(format!("081109 2139{s} 32 INFO dfs.FSNamesystem: BLOCK* NameSystem.delete: blk_{blk} is added to invalidSet of {ip}:50010"));
+            }
+        }
+        let key = |l: &String| zform_core::container::collation_key(l.as_bytes());
+        log.sort_by_cached_key(key);
+        let raw: Vec<u8> = log
+            .iter()
+            .flat_map(|l| [l.as_bytes(), b"\n"].concat())
+            .collect();
+        let mut opts = PackOptions {
+            packs: PackRegistry::new().with_hdfs_predictors(),
+            block_bytes: 32 << 10,
+            ..PackOptions::default()
+        };
+        let plain = assert_roundtrip(&raw, &opts);
+        let tables = build_tables(&raw[..], &opts).unwrap().expect("addStoredBlock rows");
+        assert_eq!(tables.col(0).unwrap().len(), 400);
+        let dict = Dictionary::new(Vec::new()).with_tables(tables);
+        opts.dictionary = Some(std::sync::Arc::new(dict));
+        let comp = assert_roundtrip(&raw, &opts);
+        let size = |c: &[u8]| {
+            let (_, root) = inspect::inspect_breakdown(c, &DecodeBudget::default()).unwrap();
+            let col = root.children.into_iter().find(|n| n.name == "$ip.dsetof").unwrap();
+            let table = col.sigs.iter().any(|s| s.shape.contains("Peer(table.1)"));
+            (col.bytes, table)
+        };
+        let ((with, table), (without, _)) = (size(&comp), size(&plain));
+        assert!(table && with * 4 < without, "{with} vs {without}");
+        let recs = lines(&raw);
+        let (rows, _) = assert_grep(&comp, &recs, &contains("invalidSet of 10.250.3."));
+        assert!(!rows.is_empty());
+        assert_grep(&comp, &recs, &word("10.250.5.7"));
     }
 
     #[test]

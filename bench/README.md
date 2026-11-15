@@ -98,16 +98,22 @@ WIN=60000 KEEP=del python3 bench/hdfs_trace.py HDFS.log  # carry state across wi
 WIN=60000 WINB=1 python3 bench/hdfs_trace.py HDFS.log  # windows of whole block lifecycles
 ```
 
-| Input | `--hdfs-predictors --context-mixing`, file order | The same, rows by block | Trace model, whole input | 60k-row windows |
-|---|---:|---:|---:|---:|
-| First 256 MiB (LF line ends) | 5,755,995 | 5,189,860 | 3,495,157 | 3,939,185 |
-| HDFS.log | 32,709,019 | 25,499,260 | 15,192,577 | 21,053,965 |
+| Input | `--hdfs-predictors --context-mixing`, file order | The same, rows by block | Rows by block, replica table | Trace model, whole input | 60k-row windows |
+|---|---:|---:|---:|---:|---:|
+| First 256 MiB (LF line ends) | 5,755,995 | 5,305,515 | 4,868,361 | 3,495,157 | 3,939,185 |
+| HDFS.log | 32,709,019 | 25,283,398 | 23,470,438 | 15,192,577 | 21,053,965 |
 
 "Rows by block" is what `--hdfs-predictors` now writes when the input is collation-sorted
 (`FLAG_SORTED_ROWS`). Each block stores rows grouped by block id: write-pipeline rows by
 thread, then the block's other rows. Groups follow `java.util.Random` order. That cut `$blk_id`
 on the prefix from 1,128 KB to 130 KB, below the trace model's 166 KB. The other rows' times
 and threads lost about 0.7 MB of that back.
+
+"Replica table" adds the file table `--hdfs-predictors` builds for a file of over a block: each
+block id with its first three datanodes, from the `addStoredBlock` lines, in generator order.
+Every datanode column keyed by block id (stored, received, served, invalidated) codes its value
+as which replica it is. On HDFS.log the table costs 1.72 MB and those five columns fall from
+4.9 MB to 1.3 MB. Served-to clients are a replica only half the time and stay as they are.
 
 Estimates omit the template text (about 5 KB). Most of the gain comes from relations the
 column codecs cannot see:
@@ -145,8 +151,8 @@ window boundary averages 23.5k entries (max 280k), so snapshotting it per block 
 it saves. Windows of whole block lifecycles, blocks in generator order, give 16,034,397 B at
 60k rows and 15,461,397 at 240k. Because the file is collation-sorted, such blocks are sorted
 runs that a reader merges, but a point in time then falls in a median of 30 of them. zform
-itself gains nothing from either: 32 to 512 MiB blocks give 25.0 to 28.9 MB, and lifecycle
-blocks give 25,410,777 B, as time and thread costs rise by more than block ids fall.
+gains nothing from either: 32 to 512 MiB blocks give 25.0 to 28.9 MB, lifecycle blocks
+25,410,777 B.
 
 ## field partition search
 

@@ -54,13 +54,20 @@ impl RelationPack for HdfsRelations {
         if let Some(src) = task {
             return task_partition(ctx, src);
         }
+        let key = ctx.plan.columns[..cid]
+            .iter()
+            .position(|c| c.dict_group == "blk_id")?;
         if size {
-            let key = ctx.plan.columns[..cid]
-                .iter()
-                .position(|c| c.dict_group == "blk_id")?;
             return block_attribute(ctx, key, packs);
         }
+        if ctx.plan.columns[cid].dict_group == "ip" {
+            return replica(ctx, key);
+        }
         None
+    }
+
+    fn table_builder(&self) -> Option<Box<dyn TableBuilder>> {
+        Some(Box::<Replicas>::default())
     }
 
     fn row_order(&self, recs: &[&[u8]]) -> Option<Vec<u32>> {
@@ -103,6 +110,97 @@ impl RelationPack for HdfsRelations {
         order.extend(rest);
         Some(order)
     }
+}
+
+/// The table of each block's replicas, from the NameNode's `addStoredBlock` lines: a row per
+/// block id, in allocation order, and its first [`REPLICAS`] datanodes at a fixed stride, in the
+/// order [`HdfsRelations::row_order`] stores them, so a block's rows find them in sequence.
+#[derive(Default)]
+struct Replicas {
+    rows: Vec<(Option<u64>, u64, Vec<u8>, Vec<u8>)>,
+}
+
+const ADDED: &[u8] = b"addStoredBlock: blockMap updated: ";
+/// HDFS's default replication: datanodes past it are patched where a block names them.
+const REPLICAS: usize = 3;
+
+impl TableBuilder for Replicas {
+    fn push(&mut self, rec: &[u8]) {
+        let Some(at) = memchr::memmem::find(rec, ADDED) else {
+            return;
+        };
+        let ip = &rec[at + ADDED.len()..];
+        // The model holds the port in a template literal.
+        let ip = &ip[..memchr::memchr2(b':', b' ', ip).unwrap_or(ip.len())];
+        if let Some(blk) = block_token(rec) {
+            let row = (lcg_state(rec), thread_id(rec), blk[4..].to_vec(), ip.to_vec());
+            self.rows.push(row);
+        }
+    }
+
+    fn finish(self: Box<Self>) -> Vec<Vec<Vec<u8>>> {
+        let mut rows = self.rows;
+        let anchor = rows.iter().find_map(|r| r.0);
+        rows.sort_by_cached_key(|(s, thread, blk, _)| match (anchor, s) {
+            (Some(a), Some(s)) => (false, JavaLcgPack::distance(a, *s), Vec::new(), *thread),
+            _ => (true, 0, blk.clone(), *thread),
+        });
+        let (mut keys, mut ips): (Vec<Vec<u8>>, Vec<Vec<u8>>) = (Vec::new(), Vec::new());
+        for (_, _, blk, ip) in rows {
+            if keys.last() != Some(&blk) {
+                keys.push(blk);
+                ips.resize(keys.len() * REPLICAS, Vec::new());
+            }
+            let at = (keys.len() - 1) * REPLICAS;
+            if let Some(slot) = ips[at..].iter_mut().find(|v| v.is_empty()) {
+                *slot = ip;
+            }
+        }
+        vec![keys, ips]
+    }
+}
+
+/// A datanode column looked up among its block's replicas in the file's table: each value is
+/// coded as which replica it is, and values the table lacks are patched.
+fn replica(ctx: &RelationContext<'_, '_>, key: usize) -> Option<PayloadGraph> {
+    const KEY: u32 = TABLE_PEER;
+    const IP: u32 = TABLE_PEER | 1;
+    let tables = ctx.tables.filter(|t| t.len() == 2)?;
+    let table_ips = tables.col(1).ok()?;
+    let vals = &ctx.columns[ctx.column];
+    let aligned = align_cells(ctx.plan, ctx.variant_ids, key, ctx.column).ok()?;
+    if aligned.len() != vals.len() {
+        return None;
+    }
+    let ids = tables.joint_ids(0, ctx.columns[key].iter().copied()).ok()?;
+    let (mut codes, mut exc_idx, mut exc_vals) = (Vec::with_capacity(vals.len()), vec![], vec![]);
+    for (i, (&at, &v)) in aligned.iter().zip(vals).enumerate() {
+        let row = ids[at as usize] as usize * REPLICAS;
+        match (row..row + REPLICAS).position(|r| table_ips.get(r) == Some(v)) {
+            Some(c) => codes.push(c as i64 + 1),
+            None => {
+                codes.push(0);
+                exc_idx.push(i);
+                exc_vals.push(v);
+            }
+        }
+    }
+    if exc_idx.len() * 4 > vals.len() {
+        return None;
+    }
+    let mut gb = GraphBuilder::new(vals.len());
+    let source = gb.add_ext_peer(IP);
+    let ids = gb.add_ext_align(key as u32, Some(KEY));
+    let codes = gb.add_ints(&codes);
+    // Table row `REPLICAS * id + code - 1`; code 0, a patched value, reads row 0.
+    let b = Builder::new(2);
+    let (id, code) = (b.input(0), b.input(1));
+    let row = b.rr(Op::Add, b.ri(Op::MulI, id, REPLICAS as i64), b.ri(Op::AddI, code, -1));
+    let row = b.select(code, row, b.konst(0));
+    let idx = gb.add_prog_i64(b.finish(&[(row, 8)]), vec![ids, codes], vec![]);
+    let base = gb.add_index_cells(source, idx);
+    let root = gb.add_patch(base, &exc_idx, &exc_vals);
+    Some(gb.finish(root))
 }
 
 /// `rows` grouped by their first block id, groups in order of first appearance.
@@ -378,6 +476,7 @@ mod tests {
             target.iter().map(|v| &v[..]).collect(),
         ];
         let ctx = RelationContext {
+            tables: None,
             column: 2,
             columns: &cols,
             plan: &plan,
@@ -399,6 +498,7 @@ mod tests {
         };
         s.literals[0] = b"unrelated task_m_".to_vec();
         let ctx = RelationContext {
+            tables: None,
             column: 2,
             columns: &cols,
             plan: &plan,
@@ -510,6 +610,7 @@ mod tests {
             values.iter().map(|v| v.as_bytes()).collect(),
         ];
         let ctx = RelationContext {
+            tables: None,
             column: 2,
             columns: &cols,
             plan: &plan,
@@ -531,6 +632,7 @@ mod tests {
         s.slots.push(1);
         s.literals.push(vec![]);
         let ctx = RelationContext {
+            tables: None,
             column: 2,
             columns: &cols,
             plan: &plan,

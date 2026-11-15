@@ -8,6 +8,7 @@
 
 use crate::container::DEFAULT_FILTER_BITS;
 use crate::dictionary::with_current;
+use crate::tables::{TABLE_PEER, Tables};
 use crate::index::{FilterBuilder, MAX_PAGES, tokens};
 use std::cell::{OnceCell, RefCell};
 use std::fmt;
@@ -193,6 +194,15 @@ pub struct RelationContext<'a, 'v> {
     pub columns: &'a [Vec<&'v [u8]>],
     pub plan: &'a ModelPlan,
     pub variant_ids: &'a [u32],
+    /// The file's tables, which a graph names as peers with [`TABLE_PEER`] set.
+    pub tables: Option<&'a Tables>,
+}
+
+/// Gathers a file's table columns in a pass over its records ahead of writing.
+pub trait TableBuilder {
+    fn push(&mut self, rec: &[u8]);
+    /// Each column's cells.
+    fn finish(self: Box<Self>) -> Vec<Vec<Vec<u8>>>;
 }
 
 /// Predicts a column from earlier columns using ordinary payload graph operations.
@@ -207,6 +217,11 @@ pub trait RelationPack: Send + Sync {
 
     /// The order to store a block's records in, when the reader restores theirs by sorting.
     fn row_order(&self, _recs: &[&[u8]]) -> Option<Vec<u32>> {
+        None
+    }
+
+    /// The builder of the table this pack's graphs look values up in.
+    fn table_builder(&self) -> Option<Box<dyn TableBuilder>> {
         None
     }
 }
@@ -297,6 +312,27 @@ impl PackRegistry {
 
     pub(crate) fn row_order(&self, recs: &[&[u8]]) -> Option<Vec<u32>> {
         self.relations.iter().find_map(|r| r.row_order(recs))
+    }
+
+    /// The first relation pack's table builder: a file has one table.
+    pub fn table_builder(&self) -> Option<Box<dyn TableBuilder>> {
+        self.relations.iter().find_map(|r| r.table_builder())
+    }
+
+    /// The tables holding `columns`, each column coded as the registry codes a block's.
+    pub fn build_tables(
+        &self,
+        columns: &[Vec<Vec<u8>>],
+        budget: &crate::wire::DecodeBudget,
+    ) -> crate::wire::Result<Tables> {
+        let graphs: Vec<PayloadGraph> = columns
+            .iter()
+            .map(|c| {
+                let rows: Vec<&[u8]> = c.iter().map(Vec::as_slice).collect();
+                self.encode_best_graph_inner(&rows, 0).0
+            })
+            .collect();
+        Tables::new(&graphs, budget)
     }
 
     pub fn register_relation<P: RelationPack + 'static>(&mut self, pack: P) {
@@ -5064,16 +5100,23 @@ impl PackRegistry {
                     && occ_len >= 64
                     && let Some((plan, vids)) = shaped
                 {
+                    let tables = with_current(|d| d.and_then(|d| d.tables().cloned()));
+                    let n_table = tables.as_ref().map_or(0, |t| t.len());
                     let context = RelationContext {
                         column: cid,
                         columns: occ_streams,
                         plan,
                         variant_ids: vids,
+                        tables: tables.as_deref(),
+                    };
+                    let peer_ok = |p: u32| match p & TABLE_PEER {
+                        0 => (p as usize) < cid,
+                        _ => ((p & !TABLE_PEER) as usize) < n_table,
                     };
                     for pack in &self.relations {
                         if let Some(graph) = pack.try_encode(&context, self)
                             && graph.rows as usize == occ_len
-                            && graph.ext_peers.iter().all(|&peer| (peer as usize) < cid)
+                            && graph.ext_peers.iter().all(|&p| peer_ok(p))
                             && !graph.ext_pool
                             && graph.ext_dict.is_none()
                         {
