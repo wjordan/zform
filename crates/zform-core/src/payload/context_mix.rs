@@ -74,6 +74,18 @@ fn mix(mut x: u64) -> usize {
 fn seed(x: u64) -> u64 {
     x ^ x >> 30
 }
+/// `(l << 16) / total` given `scale = 65536.0 / total`, for `l <= total` and
+/// `65536 <= total < 2^32`: one f64 division per update instead of two u64 ones.
+///
+/// Exact: the product is within 2^-36 of the quotient q (at most 2^16) and the subtraction
+/// adds at most 2^-38. A fractional q is over 1/total > 2^-32 from an integer, so the value
+/// sits strictly inside (floor(q) - 0.5, floor(q) + 0.5), which adding 1.5 * 2^52 rounds
+/// to floor(q) in the low mantissa bits.
+#[inline(always)]
+fn share(l: u64, scale: f64) -> u32 {
+    const MAGIC: f64 = 6755399441055744.0;
+    ((l as i64 as f64 * scale - (0.5 - 1.0 / 17179869184.0)) + MAGIC).to_bits() as u32
+}
 /// What [`update`] needs from [`predict`]'s loads.
 struct Slots {
     ids: [usize; K],
@@ -133,9 +145,9 @@ fn update(tables: &mut Tables, ws: &mut [u32; K], s: Slots, bit: bool) {
     // The likelihood of a 0 is w * (65536 - p), and the weights sum to 65536.
     let pick = |one, zero| std::hint::select_unpredictable(bit, one, zero);
     let l = |k: usize| pick(s.prods[k], ((ws[k] as u64) << 16) - s.prods[k]);
-    let total = pick(s.sum, (1 << 32) - s.sum);
-    let w0 = (((l(0) << 16) / total * 31 + 21845) >> 5) as u32;
-    let w1 = (((l(1) << 16) / total * 31 + 21845) >> 5) as u32;
+    let scale = 65536.0 / pick(s.sum, (1 << 32) - s.sum) as i64 as f64;
+    let w0 = (share(l(0), scale) * 31 + 21845) >> 5;
+    let w1 = (share(l(1), scale) * 31 + 21845) >> 5;
     *ws = [w0, w1, 65536 - w0 - w1];
     for k in 0..K {
         let c = &mut tables[k][s.ids[k]];
@@ -307,6 +319,26 @@ mod tests {
         *state ^= *state >> 7;
         *state ^= *state << 17;
         *state
+    }
+
+    #[test]
+    fn share_matches_integer_division() {
+        let check = |l: u64, t: u64| {
+            let scale = 65536.0 / t as i64 as f64;
+            assert_eq!(share(l, scale) as u64, (l << 16) / t, "{l} / {t}");
+        };
+        for t in 1..300 {
+            (0..=t).for_each(|l| check(l, t));
+        }
+        let mut rng = 99;
+        for _ in 0..50_000 {
+            let t = (next(&mut rng) >> 32).max(1) | [0, 0xffff_0000][rng as usize & 1];
+            // Quotients at and next to an integer are where rounding could bite.
+            let l = (next(&mut rng) % 65537 * t) >> 16;
+            for l in [l.saturating_sub(1), l, l + 1, next(&mut rng) % (t + 1), t] {
+                check(l.min(t), t);
+            }
+        }
     }
 
     #[test]
