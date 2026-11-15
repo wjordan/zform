@@ -1807,11 +1807,25 @@ pub(crate) fn mtf_split(vals: &[i64]) -> (Vec<i64>, Vec<i64>) {
     // A value's place in the list is how many distinct values were used since its own last
     // use, counted over a bitmap of last-use times instead of searched for in the list.
     let mut uses = LastUses::new(vals.len());
-    let mut last: FastMap<i64, u32> = FastMap::default();
+    // Last uses by offset from the minimum when the values span little more than their count.
+    let (lo, hi) = vals.iter().fold((i64::MAX, i64::MIN), |(l, h), &v| (l.min(v), h.max(v)));
+    let span = (hi as i128 - lo as i128) as u128;
+    let mut dense = if span < (vals.len() as u128) * 2 + 1024 {
+        vec![u32::MAX; span as usize + 1]
+    } else {
+        Vec::new()
+    };
+    let mut sparse: FastMap<i64, u32> = FastMap::default();
     let mut codes = Vec::with_capacity(vals.len());
     let mut misses = Vec::new();
     for (t, &v) in vals.iter().enumerate() {
-        let rank = last.insert(v, t as u32).map(|prev| {
+        let prev = if dense.is_empty() {
+            sparse.insert(v, t as u32)
+        } else {
+            let slot = &mut dense[(v as i128 - lo as i128) as usize];
+            Some(std::mem::replace(slot, t as u32)).filter(|&p| p != u32::MAX)
+        };
+        let rank = prev.map(|prev| {
             uses.clear(prev as usize);
             uses.between(prev as usize, t)
         });

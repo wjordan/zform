@@ -2595,6 +2595,9 @@ fn recency_ranks_match_a_searched_list() {
             })
             .collect();
         assert_eq!(mtf_split(&vals), crate::payload::graph::mtf_split_searched(&vals));
+        // Spread out, the same values take the hashed rather than the offset table.
+        let wide: Vec<i64> = vals.iter().map(|v| v * 1_000_003).collect();
+        assert_eq!(mtf_split(&wide), crate::payload::graph::mtf_split_searched(&wide));
     }
 }
 
