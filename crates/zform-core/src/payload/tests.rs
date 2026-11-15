@@ -1455,3 +1455,69 @@ fn ext_align_requires_declared_peers_and_supplied_alignment() {
         assert!(PayloadGraph::decode(&bad, &budget).is_err(), "key={key} at={at}");
     }
 }
+
+/// `KeyedSum(keys, Interleave(sel, streams))` as integers, through the wire.
+fn keyed(
+    keys: &[i64],
+    sel: &[i64],
+    streams: &[&[i64]],
+    budget: &DecodeBudget,
+) -> crate::wire::Result<Vec<i64>> {
+    let mut gb = GraphBuilder::new(keys.len());
+    let k = gb.add_ints(keys);
+    let s = gb.add_ints(sel);
+    let streams = streams.iter().map(|v| gb.add_ints(v)).collect();
+    let d = gb.push(GraphNode::Interleave { sel: s, streams });
+    let root = gb.push(GraphNode::KeyedSum { keys: k, deltas: d });
+    let g = PayloadGraph::decode(&gb.finish(root).encode(), budget)?;
+    CoreDecoder::decode_ints(&g, &Default::default(), budget)
+}
+
+#[test]
+fn keyed_sums_run_a_state_per_key_over_interleaved_streams() {
+    let budget = DecodeBudget::default();
+    // Key 0 passes its value through; keys 1 and 2 each keep a running sum.
+    let got = keyed(&[1, 2, 0, 1, 2, 1], &[0, 1, 1, 0, 1, 0], &[&[10, 1, -3], &[100, 7, 5]], &budget);
+    assert_eq!(got.unwrap(), [10, 100, 7, 11, 105, 8]);
+    assert!(keyed(&[1, 1], &[0, 2], &[&[1], &[2]], &budget).is_err(), "selector past the streams");
+    assert!(keyed(&[1, 1], &[0, 0], &[&[1], &[2]], &budget).is_err(), "stream underrun");
+    assert!(keyed(&[1], &[0], &[&[1, 2]], &budget).is_err(), "trailing stream values");
+    assert!(keyed(&[3, 1], &[0, 0], &[&[1, 2]], &budget).is_err(), "key past the row count");
+    assert!(keyed(&[-1, 1], &[0, 0], &[&[1, 2]], &budget).is_err(), "negative key");
+    let tight = DecodeBudget {
+        max_single_alloc_bytes: 64,
+        ..DecodeBudget::default()
+    };
+    let ones = vec![1i64; 16];
+    assert!(keyed(&ones, &[0; 16], &[&ones], &tight).is_err(), "allocation budget");
+    // References must point back.
+    let mut gb = GraphBuilder::new(1);
+    let k = gb.add_ints(&[0]);
+    let root = gb.push(GraphNode::KeyedSum { keys: k, deltas: k });
+    let mut wire = gb.finish(root).encode();
+    let at = wire.len() - 2;
+    assert_eq!(wire[at - 2], 25);
+    wire[at] = 1;
+    assert!(PayloadGraph::decode(&wire, &budget).is_err());
+}
+
+#[test]
+fn variants_and_cell_ids_number_cells() {
+    let budget = DecodeBudget::default();
+    let mut gb = GraphBuilder::new(4);
+    let cells = gb.add_dict_cells(&[b"b", b"a", b"b", b"c"]);
+    let ids = gb.push(GraphNode::CellIds { cells });
+    let vid = gb.push(GraphNode::ExtVariant);
+    let b = Builder::new(2);
+    let v = b.rr(Op::Add, b.ri(Op::MulI, b.input(0), 10), b.input(1));
+    let root = gb.add_prog_i64(b.finish(&[(v, 8)]), vec![ids, vid], vec![]);
+    let g = PayloadGraph::decode(&gb.finish(root).encode(), &budget).unwrap();
+    let aligned = [vec![3i64, 4, 5, 6]];
+    let ext = super::graph::ExtInputs {
+        aligned: &aligned,
+        ..Default::default()
+    };
+    assert_eq!(CoreDecoder::decode_ints(&g, &ext, &budget).unwrap(), [3, 14, 5, 26]);
+    // A variant node needs the block's layout.
+    assert!(CoreDecoder::decode_ints(&g, &Default::default(), &budget).is_err());
+}

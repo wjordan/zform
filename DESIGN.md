@@ -112,11 +112,20 @@ For sizes, it tries a table holding the first attribute observed for each block 
 and `MatchIndex` locate the block's first occurrence; `IndexCells` reads its table entry.
 Changes become exact patches. Missing keys or ambiguous multi-key records decline the candidate.
 
+Counters a log keeps per entity are coded as keyed running sums: `KeyedSum` adds each delta to
+the state its key names and yields the sum, and key 0 passes the delta through. Keys come from
+the record's template (`ExtVariant` through a table) or from a value (`CellIds`, each value's
+first-occurrence rank). HDFS times keep one clock for rows that start a block's write, one for
+rows that finish it and one per other template. Thread ids keep a counter per datanode: the
+writer infers which replica logged a write row from the pipeline (a `Receiving` row names its
+upstream, `PacketResponder N` its place), codes that choice, and the reader reads the node from
+the replica table.
+
 The registry accepts only graphs with earlier peer dependencies and at least 32 bytes of savings
 over the current choice, including graph and shared-code costs. Standalone columns skip relation
-packs. Context mixing then prices integer transports in the selected graph. Relations need no
-new reader opcode or HDFS knowledge in the reader. Their state and dependencies stay within the
-block, and the existing index records which peers a selective read needs.
+packs; context mixing then prices the selected graph's integer transports. The reader knows no
+HDFS. State and dependencies stay within the block, and the index records the peers a selective
+read needs.
 
 The HDFS pack remains opt-in. Task/partition reuse saved more than the per-block size model on
 the measured samples. Emitter- and operation-keyed recent-block caches did not reliably improve

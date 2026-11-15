@@ -14,7 +14,7 @@ use crate::packs::PackRegistry;
 pub(crate) use crate::packs::{Seeds, with_seeds};
 use crate::payload::graph::{
     CoreDecoder, EXT_FLAG_DICT, EXT_FLAG_PEERS, EXT_FLAG_POOL, ExtInputs, GraphNode, IntStream,
-    NESTED_COLUMN_TAG, PayloadGraph, unpack_leaf, with_encode_opts,
+    NESTED_COLUMN_TAG, PayloadGraph, unpack_leaf, value_ids, with_encode_opts,
 };
 use crate::payload::library::Library;
 use crate::dictionary::with_current;
@@ -325,53 +325,22 @@ pub fn align_cells(plan: &ModelPlan, variant_ids: &[u32], key: usize, at: usize)
     Ok(out)
 }
 
-/// Each cell's value id: the rank of its value's first occurrence. Open addressing on a
-/// multiply-fold hash; a hash match is confirmed on the bytes.
-fn value_ids(cells: &Cells) -> Vec<u32> {
-    const K: u64 = 0x9e37_79b9_7f4a_7c15;
-    let word = |c: &[u8], at: usize| u64::from_le_bytes(c[at..at + 8].try_into().unwrap());
-    // Whole words, then the last eight bytes again when they overlap; short cells byte by byte.
-    let hash = |c: &[u8]| {
-        let mut h = c.len() as u64;
-        if c.len() >= 8 {
-            for at in (0..c.len() - 7).step_by(8) {
-                h = (h ^ word(c, at)).wrapping_mul(K).rotate_left(29);
-            }
-            h ^= word(c, c.len() - 8);
-        } else {
-            for &b in c {
-                h = (h << 8) | u64::from(b);
-            }
-        }
-        (h ^ (h >> 29)).wrapping_mul(K) >> 32
-    };
-    let (bytes, ends) = (cells.bytes(), cells.ends());
-    let mask = (ends.len() * 2).next_power_of_two().max(16) - 1;
-    // (hash, first cell's start and end, id); an empty slot has `end == 0` and `start == 1`.
-    let mut slots = vec![(0u64, 1u32, 0u32, 0u32); mask + 1];
-    let mut out = Vec::with_capacity(ends.len());
-    let (mut next, mut start) = (0u32, 0u32);
-    for &end in ends {
-        let c = &bytes[start as usize..end as usize];
-        let h = hash(c);
-        let mut p = h as usize & mask;
-        loop {
-            let (sh, s0, s1, id) = slots[p];
-            if s0 > s1 {
-                slots[p] = (h, start, end, next);
-                out.push(next);
-                next += 1;
-                break;
-            }
-            if sh == h && &bytes[s0 as usize..s1 as usize] == c {
-                out.push(id);
-                break;
-            }
-            p = (p + 1) & mask;
-        }
-        start = end;
+/// For each cell of column `at`, the variant id of its record. Other than shapes, variants
+/// place no cells by the variant alone and count none.
+pub fn cell_variants(plan: &ModelPlan, variant_ids: &[u32], at: usize) -> Result<Vec<i64>> {
+    let counts: Vec<usize> = (plan.variants.iter())
+        .map(|v| match v {
+            PlanVariant::Shape(s) => s.slots.iter().filter(|&&x| x as usize == at).count(),
+            _ => 0,
+        })
+        .collect();
+    let mut out = Vec::with_capacity(variant_ids.len());
+    for &v in variant_ids {
+        let &n = (counts.get(v as usize))
+            .ok_or_else(|| Error::Format("variant id out of range".into()))?;
+        out.extend(std::iter::repeat_n(i64::from(v), n));
     }
-    out
+    Ok(out)
 }
 
 /// The pages held laid out at their places in the pool, the rest left missing. Every page but
@@ -581,6 +550,10 @@ fn ensure_col_inner(
 
     let mut aligned = Vec::new();
     for node in &graph.nodes {
+        if let GraphNode::ExtVariant = node {
+            let (plan, vids) = ctx.layout.as_ref().ok_or(Error::NotLoaded)?;
+            aligned.push(cell_variants(plan, vids, col_idx)?);
+        }
         if let GraphNode::ExtAlign { key, at } = *node {
             let peer = |s: u16| graph.ext_peers[s as usize];
             if table_col(peer(key))?.is_some() {

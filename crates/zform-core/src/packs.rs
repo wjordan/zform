@@ -1651,7 +1651,7 @@ fn prog_fmt_zero_padded_uint(width: usize, seed: i64) -> Program {
     prog_fmt_zero_padded(width, Some(seed))
 }
 
-fn prog_fmt_zero_padded(width: usize, seed: Option<i64>) -> Program {
+pub(crate) fn prog_fmt_zero_padded(width: usize, seed: Option<i64>) -> Program {
     let b = Builder::new(1);
     let d = b.input(0);
     let val = seed.map_or(d, |seed| b.scan_add(d, seed));

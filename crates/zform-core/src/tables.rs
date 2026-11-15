@@ -82,7 +82,7 @@ impl Tables {
                 || graph
                     .nodes
                     .iter()
-                    .any(|n| matches!(n, GraphNode::ExtAlign { .. }))
+                    .any(|n| matches!(n, GraphNode::ExtAlign { .. } | GraphNode::ExtVariant))
             {
                 return Err(Error::Format("table column reads block parts".into()));
             }

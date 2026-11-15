@@ -67,6 +67,9 @@ impl RelationPack for HdfsRelations {
         if let Some(src) = task {
             return task_partition(ctx, src);
         }
+        if field(ctx.plan, cid) == Some(1) {
+            return clocks(ctx);
+        }
         let key = ctx.plan.columns[..cid]
             .iter()
             .position(|c| c.dict_group == "blk_id")?;
@@ -263,6 +266,161 @@ fn replica(ctx: &RelationContext<'_, '_>, key: usize) -> Option<PayloadGraph> {
     let base = gb.add_index_cells(source, idx);
     let root = gb.add_patch(base, &exc_idx, &exc_vals);
     Some(gb.finish(root))
+}
+
+/// The space-separated field column `cid` fills in every shape holding it, once each.
+fn field(plan: &ModelPlan, cid: usize) -> Option<usize> {
+    let mut at = None;
+    for v in &plan.variants {
+        let PlanVariant::Shape(s) = v else { continue };
+        let mut slots = s.slots.iter().enumerate().filter(|&(_, &c)| c as usize == cid);
+        let Some((i, _)) = slots.next() else { continue };
+        let (before, after) = (&s.literals[i], &s.literals[i + 1]);
+        let spaced = (before.is_empty() || before.ends_with(b" "))
+            && (after.is_empty() || after.starts_with(b" "));
+        if slots.next().is_some() || !spaced {
+            return None;
+        }
+        // Earlier slots are this format's leading numbers, which hold no spaces.
+        let f = s.literals[..=i].iter().map(|l| memchr::memchr_iter(b' ', l).count()).sum();
+        if at.is_some_and(|a| a != f) {
+            return None;
+        }
+        at = Some(f);
+    }
+    at
+}
+
+const DAY: i64 = 86_400;
+
+/// A `HHMMSS` cell as seconds into the day.
+fn seconds(v: &[u8]) -> Option<i64> {
+    let n = (v.len() == 6).then(|| unsigned(v)).flatten()?;
+    let (h, m, s) = (n / 10000, n / 100 % 100, n % 100);
+    (h < 24 && m < 60 && s < 60).then_some(h * 3600 + m * 60 + s)
+}
+
+/// Times of day of a block's writes, each a step from the last row of its clock: one for rows
+/// starting the write, one for rows finishing it. Other rows' times are coded as they are,
+/// where recency finds them. Each template's values are a stream of their own. The reader
+/// finds a row's clock and stream from its template.
+fn clocks(ctx: &RelationContext<'_, '_>) -> Option<PayloadGraph> {
+    let vals = &ctx.columns[ctx.column];
+    let n_var = ctx.plan.variants.len();
+    // By variant: its clock (`0`: none) and its stream, numbering the variants holding the
+    // column; by stream, whether it is coded by recency.
+    let (mut clock, mut stream, mut recency) = (vec![0u8; n_var], vec![0u8; n_var], vec![]);
+    for (v, var) in ctx.plan.variants.iter().enumerate() {
+        let PlanVariant::Shape(s) = var else { continue };
+        if !s.slots.contains(&(ctx.column as u16)) {
+            continue;
+        }
+        let text = s.literals.concat();
+        let has = |w: &[u8]| memchr::memmem::find(&text, w).is_some();
+        clock[v] = match WRITES.iter().position(|&(w, _)| has(w)) {
+            // `Receiving block`, `allocateBlock`
+            Some(0 | 3) => 1,
+            Some(_) => 2,
+            None => 0,
+        };
+        stream[v] = recency.len() as u8;
+        recency.push(clock[v] == 0);
+    }
+    if n_var > 120 || recency.len() > 64 {
+        return None;
+    }
+    let vids = crate::codecs::cell_variants(ctx.plan, ctx.variant_ids, ctx.column).ok()?;
+    if vids.len() != vals.len() {
+        return None;
+    }
+    // Clocks start at the block's first time, and steps wrap at midnight.
+    let base = vals.iter().find_map(|v| seconds(v))?;
+    let mut state = [base; 3];
+    let (mut deltas, mut exc_idx, mut exc_vals) = (Vec::with_capacity(vals.len()), vec![], vec![]);
+    for (i, (&v, &vid)) in vals.iter().zip(&vids).enumerate() {
+        let k = clock[vid as usize] as usize;
+        match seconds(v) {
+            Some(t) => {
+                deltas.push((t - state[k] + DAY / 2).rem_euclid(DAY) - DAY / 2);
+                if k > 0 {
+                    state[k] = t;
+                }
+            }
+            None => {
+                deltas.push(0);
+                exc_idx.push(i);
+                exc_vals.push(v);
+            }
+        }
+    }
+    if exc_idx.len() * 8 > vals.len() {
+        return None;
+    }
+    let mut gb = GraphBuilder::new(vals.len());
+    // Each variant's clock, then its stream.
+    let mut luts = clock.clone();
+    luts.extend(&stream);
+    let lut = gb.add_raw_bytes(&luts);
+    let vid = gb.push(GraphNode::ExtVariant);
+    let keys = gb.add_prog_i64(lut_prog(0), vec![vid], vec![lut]);
+    let sel = gb.add_prog_i64(lut_prog(n_var as i64), vec![vid], vec![lut]);
+    let sels: Vec<usize> = vids.iter().map(|&v| stream[v as usize] as usize).collect();
+    let deltas = interleave(&mut gb, sel, &sels, &deltas, &recency);
+    let t = gb.push(GraphNode::KeyedSum { keys, deltas });
+    let b = Builder::new(1);
+    // Sums stay within a few days of the base.
+    let t_in = b.ri(Op::AddI, b.input(0), base + 4 * DAY);
+    let t_in = b.rr(Op::Add, t_in, b.ri(Op::MulI, b.div(t_in, DAY as u64, 20), -DAY));
+    let q = b.div(t_in, 60, 17);
+    let h = b.div(q, 60, 11);
+    let sec = b.rr(Op::Add, t_in, b.ri(Op::MulI, q, -60));
+    let min = b.rr(Op::Add, q, b.ri(Op::MulI, h, -60));
+    let hm = b.rr(Op::Add, b.ri(Op::MulI, h, 10000), b.ri(Op::MulI, min, 100));
+    let hms = b.rr(Op::Add, hm, sec);
+    let hms = gb.add_prog_i64(b.finish(&[(hms, 8)]), vec![t], vec![]);
+    let base = gb.add_prog_cells(prog_fmt_zero_padded(6, None), vec![hms], vec![]);
+    let root = gb.add_patch(base, &exc_idx, &exc_vals);
+    Some(gb.finish(root))
+}
+
+/// The byte at `offset + x` of the program's buffer.
+fn lut_prog(offset: i64) -> Program {
+    let b = Builder::new(1);
+    let buf = b.add_buf();
+    let v = b.gather(buf, 0, b.input(0), offset as u64);
+    b.finish(&[(v, 8)])
+}
+
+/// `vals` split by `sel` into a stream each, which `sel_node` interleaves again; a stream
+/// `recency` marks may be coded by recency. Streams go by selector, so a block and its sample
+/// number theirs alike.
+fn interleave(
+    gb: &mut GraphBuilder,
+    sel_node: u16,
+    sel: &[usize],
+    vals: &[i64],
+    recency: &[bool],
+) -> u16 {
+    let mut streams = vec![Vec::new(); recency.len()];
+    for (&s, &v) in sel.iter().zip(vals) {
+        streams[s].push(v);
+    }
+    if streams.iter().filter(|s| !s.is_empty()).count() <= 1 {
+        return gb.add_ints(vals);
+    }
+    // Empty streams still take a slot, so selectors index the list directly.
+    let empty = gb.add_ints(&[]);
+    let nodes = (streams.iter().zip(recency))
+        .map(|(s, &r)| match (s.is_empty(), r) {
+            (true, _) => empty,
+            (false, true) => gb.add_mtf_ints(s),
+            (false, false) => gb.add_ints(s),
+        })
+        .collect();
+    gb.push(GraphNode::Interleave {
+        sel: sel_node,
+        streams: nodes,
+    })
 }
 
 /// Whether a record says one of [`WRITES`], found from the letters they hold.
@@ -502,6 +660,73 @@ mod tests {
                 assert!(ctx.cache[1].is_some());
             }
         }
+    }
+
+    /// Column `cid` decoded from `graph`, the others coded on their own.
+    fn decode_with(
+        plan: &ModelPlan,
+        vids: &[u32],
+        cols: &[Vec<&[u8]>],
+        cid: usize,
+        graph: &PayloadGraph,
+    ) -> Vec<Vec<u8>> {
+        let packs = PackRegistry::default();
+        let mut blobs: Vec<_> = cols.iter().map(|col| packs.encode_best(col)).collect();
+        blobs[cid] = graph.clone().with_context_mixing().encode();
+        let blobs = blobs.iter().map(|v| Some(&v[..])).collect();
+        let mut ctx = BlockDecodeCtx::new(blobs, vec![], None, Arc::default())
+            .with_layout(plan, vids.to_vec().into());
+        let col = ensure_dense_block_column(cid, &mut ctx, &DecodeBudget::default()).unwrap();
+        col.to_cells().unwrap().iter().map(<[u8]>::to_vec).collect()
+    }
+
+    #[test]
+    fn write_times_run_on_start_and_finish_clocks() {
+        let mut plan = ModelPlan::residual_only();
+        plan.add_or_get_col("date");
+        plan.add_or_get_col("time");
+        let lines: [&[u8]; 4] = [
+            b" 19 INFO dfs.FSNamesystem: BLOCK* NameSystem.allocateBlock: /x. blk_1",
+            b" 300 INFO dfs.DataNode$DataXceiver: Receiving block blk_1",
+            b" 301 INFO dfs.DataNode$PacketResponder: PacketResponder 0 for block blk_1 terminating",
+            b" 13 INFO dfs.FSDataset: Deleting block blk_1",
+        ];
+        for l in lines {
+            shape(&mut plan, &[b"", b" ", l], &[1, 2]);
+        }
+        let (mut date, mut time, mut vids) = (Vec::new(), Vec::new(), Vec::new());
+        let mut t = 86_390;
+        for i in 0..600u32 {
+            let v = i % 4;
+            t = match v {
+                0 => t + i64::from(i % 3),
+                2 => t + 30,
+                _ => t,
+            } % DAY;
+            date.push(b"081109".to_vec());
+            time.push(match i {
+                7 => b"2461xx".to_vec(),
+                _ => format!("{:02}{:02}{:02}", t / 3600, t / 60 % 60, t % 60).into_bytes(),
+            });
+            vids.push(1 + v);
+        }
+        let cols = vec![
+            vec![],
+            date.iter().map(|v| &v[..]).collect(),
+            time.iter().map(|v| &v[..]).collect(),
+        ];
+        assert_eq!(field(&plan, 2), Some(1));
+        assert_eq!(field(&plan, 1), Some(0));
+        let ctx = RelationContext {
+            tables: None,
+            column: 2,
+            columns: &cols,
+            plan: &plan,
+            variant_ids: &vids,
+        };
+        let graph = HdfsRelations.try_encode(&ctx, &PackRegistry::default()).unwrap();
+        assert!(graph.nodes.iter().any(|n| matches!(n, GraphNode::KeyedSum { .. })));
+        assert_eq!(decode_with(&plan, &vids, &cols, 2, &graph), time);
     }
 
     #[test]

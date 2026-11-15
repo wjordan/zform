@@ -649,6 +649,10 @@ impl Render<'_> {
             GraphNode::QuoteOrNull { .. } => "QuoteOrNull".into(),
             GraphNode::ParseAsciiInt { .. } => "ParseAsciiInt".into(),
             GraphNode::MatchIndex { .. } => "MatchIndex".into(),
+            GraphNode::KeyedSum { .. } => "KeyedSum".into(),
+            GraphNode::ExtVariant => "Variant".into(),
+            GraphNode::CellIds { .. } => "CellIds".into(),
+            GraphNode::Interleave { .. } => "Interleave".into(),
             GraphNode::Bytes { .. } | GraphNode::IntStream(_) | GraphNode::ConstCells { .. } => {
                 unreachable!("leaves are labelled in Render::node")
             }

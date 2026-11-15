@@ -1159,6 +1159,23 @@ pub enum GraphNode {
         hay: u16,
         codes: u16,
     },
+    /// A running sum per key: `state[keys[i]] += deltas[i]` yields row `i`; key `0` yields
+    /// `deltas[i]` and leaves every state alone.
+    KeyedSum {
+        keys: u16,
+        deltas: u16,
+    },
+    /// For each cell of this column, the variant id of its record.
+    ExtVariant,
+    /// Each cell's value id: the rank of its value's first occurrence.
+    CellIds {
+        cells: u16,
+    },
+    /// Row `i` is the next value of `streams[sel[i]]`, so each stream codes its own rows.
+    Interleave {
+        sel: u16,
+        streams: Vec<u16>,
+    },
 }
 
 impl GraphNode {
@@ -1171,8 +1188,20 @@ impl GraphNode {
             | Self::ExtPool
             | Self::ExtDict { .. }
             | Self::ExtPeer { .. }
-            | Self::ExtAlign { .. } => {}
+            | Self::ExtAlign { .. }
+            | Self::ExtVariant => {}
             Self::ByteChunks { buf, .. } => f(*buf),
+            Self::KeyedSum { keys, deltas } => {
+                f(*keys);
+                f(*deltas);
+            }
+            Self::CellIds { cells } => f(*cells),
+            Self::Interleave { sel, streams } => {
+                f(*sel);
+                for &x in streams {
+                    f(x);
+                }
+            }
             Self::MatchIndex {
                 needles,
                 hay,
@@ -1338,6 +1367,16 @@ impl GraphNode {
                 map: map.map(&mut f),
             },
             Self::ParseAsciiInt { cells } => Self::ParseAsciiInt { cells: f(*cells) },
+            Self::KeyedSum { keys, deltas } => Self::KeyedSum {
+                keys: f(*keys),
+                deltas: f(*deltas),
+            },
+            Self::CellIds { cells } => Self::CellIds { cells: f(*cells) },
+            Self::Interleave { sel, streams } => Self::Interleave {
+                sel: f(*sel),
+                streams: streams.iter().map(|&x| f(x)).collect(),
+            },
+            Self::ExtVariant => Self::ExtVariant,
             Self::ExtPool => Self::ExtPool,
             Self::ExtDict { dict_id } => Self::ExtDict { dict_id: *dict_id },
             Self::ExtPeer { slot } => Self::ExtPeer { slot: *slot },
@@ -2786,6 +2825,21 @@ fn encode_node_linked(n: &GraphNode, lib: Option<&Library>, out: &mut Vec<u8>) {
             put_uvarint(out, *hay as u64);
             put_uvarint(out, *codes as u64);
         }
+        GraphNode::KeyedSum { keys, deltas } => {
+            out.push(25);
+            put_uvarint(out, *keys as u64);
+            put_uvarint(out, *deltas as u64);
+        }
+        GraphNode::ExtVariant => out.push(26),
+        GraphNode::CellIds { cells } => {
+            out.push(27);
+            put_uvarint(out, *cells as u64);
+        }
+        GraphNode::Interleave { sel, streams } => {
+            out.push(28);
+            put_uvarint(out, *sel as u64);
+            put_u16_list(out, streams);
+        }
     }
 }
 
@@ -3004,6 +3058,22 @@ fn decode_node(
             hay: check_ref(cur.uvar()?)?,
             codes: check_ref(cur.uvar()?)?,
         }),
+        25 => Ok(GraphNode::KeyedSum {
+            keys: check_ref(cur.uvar()?)?,
+            deltas: check_ref(cur.uvar()?)?,
+        }),
+        26 => Ok(GraphNode::ExtVariant),
+        27 => Ok(GraphNode::CellIds {
+            cells: check_ref(cur.uvar()?)?,
+        }),
+        28 => {
+            let sel = check_ref(cur.uvar()?)?;
+            let streams = get_u16_list(cur, idx)?;
+            if streams.is_empty() {
+                return Err(Error::Format("Interleave without streams".into()));
+            }
+            Ok(GraphNode::Interleave { sel, streams })
+        }
         21 => {
             if flag {
                 return Err(Error::Format("invalid flag on LibraryBytes node".into()));
@@ -3023,7 +3093,8 @@ pub struct ExtInputs<'a> {
     pub pool: Option<&'a Arc<Pool>>,
     pub dict: Option<(u16, &'a Arc<Cells>)>,
     pub peers: &'a [Arc<Cells>],
-    /// The value of each `ExtAlign` node, in node order, which the block layout determines.
+    /// The value of each `ExtAlign` and `ExtVariant` node, in node order, which the block
+    /// layout determines.
     pub aligned: &'a [Vec<i64>],
 }
 
@@ -3898,10 +3969,41 @@ impl CoreDecoder {
                     let peer = ext.peers.get(*slot as usize).ok_or(Error::NotLoaded)?;
                     Val::SharedCells(Arc::clone(peer))
                 }
-                GraphNode::ExtAlign { .. } => {
+                GraphNode::ExtAlign { .. } | GraphNode::ExtVariant => {
                     let v = ext.aligned.get(n_aligned).ok_or(Error::NotLoaded)?;
                     n_aligned += 1;
                     Val::Ints(v.clone())
+                }
+                GraphNode::KeyedSum { keys, deltas } => Val::Ints(keyed_sum(
+                    head(as_ints(&vals[*keys as usize])?, upto),
+                    head(as_ints(&vals[*deltas as usize])?, upto),
+                    budget,
+                )?),
+                GraphNode::Interleave { sel, streams } => {
+                    let sel = head(as_ints(&vals[*sel as usize])?, upto);
+                    let streams: Vec<&[i64]> = (streams.iter())
+                        .map(|&s| as_ints(&vals[s as usize]))
+                        .collect::<Result<_>>()?;
+                    budget.check_alloc(sel.len().saturating_mul(8), "Interleave")?;
+                    let mut next = vec![0usize; streams.len()];
+                    let mut out = Vec::with_capacity(sel.len());
+                    for &s in sel {
+                        let v = usize::try_from(s).ok().and_then(|s| {
+                            let at = next.get_mut(s)?;
+                            *at += 1;
+                            streams[s].get(*at - 1)
+                        });
+                        out.push(*v.ok_or_else(|| Error::Format("Interleave stream underrun".into()))?);
+                    }
+                    if upto == usize::MAX && next.iter().zip(&streams).any(|(&n, s)| n != s.len()) {
+                        return Err(Error::Format("Interleave trailing values".into()));
+                    }
+                    Val::Ints(out)
+                }
+                GraphNode::CellIds { cells } => {
+                    let c = as_cells(&vals[*cells as usize])?;
+                    budget.check_alloc(c.len().saturating_mul(12), "CellIds")?;
+                    Val::Ints(value_ids(c).into_iter().map(i64::from).collect())
                 }
                 GraphNode::MatchIndex {
                     needles,
@@ -3931,6 +4033,75 @@ impl CoreDecoder {
 enum Piece<'a> {
     Lit(&'a [u8]),
     Slot(usize, bool),
+}
+
+/// `KeyedSum` over a dense state per key; keys are bounded by the row count.
+fn keyed_sum(keys: &[i64], deltas: &[i64], budget: &DecodeBudget) -> Result<Vec<i64>> {
+    if keys.len() != deltas.len() {
+        return Err(Error::Format("KeyedSum length mismatch".into()));
+    }
+    let max = keys.iter().copied().max().unwrap_or(0);
+    if keys.iter().any(|&k| k < 0) || max as u64 > keys.len() as u64 {
+        return Err(Error::Format("KeyedSum key out of range".into()));
+    }
+    budget.check_alloc((max as usize + 1 + keys.len()).saturating_mul(8), "KeyedSum")?;
+    let mut state = vec![0i64; max as usize + 1];
+    let mut out = Vec::with_capacity(keys.len());
+    for (&k, &d) in keys.iter().zip(deltas) {
+        let s = &mut state[k as usize];
+        *s = s.wrapping_add(d);
+        out.push(if k == 0 { d } else { *s });
+    }
+    Ok(out)
+}
+
+/// Each cell's value id: the rank of its value's first occurrence. Open addressing on a
+/// multiply-fold hash; a hash match is confirmed on the bytes.
+pub(crate) fn value_ids(cells: &Cells) -> Vec<u32> {
+    const K: u64 = 0x9e37_79b9_7f4a_7c15;
+    let word = |c: &[u8], at: usize| u64::from_le_bytes(c[at..at + 8].try_into().unwrap());
+    // Whole words, then the last eight bytes again when they overlap; short cells byte by byte.
+    let hash = |c: &[u8]| {
+        let mut h = c.len() as u64;
+        if c.len() >= 8 {
+            for at in (0..c.len() - 7).step_by(8) {
+                h = (h ^ word(c, at)).wrapping_mul(K).rotate_left(29);
+            }
+            h ^= word(c, c.len() - 8);
+        } else {
+            for &b in c {
+                h = (h << 8) | u64::from(b);
+            }
+        }
+        (h ^ (h >> 29)).wrapping_mul(K) >> 32
+    };
+    let (bytes, ends) = (cells.bytes(), cells.ends());
+    let mask = (ends.len() * 2).next_power_of_two().max(16) - 1;
+    // (hash, first cell's start and end, id); an empty slot has `end == 0` and `start == 1`.
+    let mut slots = vec![(0u64, 1u32, 0u32, 0u32); mask + 1];
+    let mut out = Vec::with_capacity(ends.len());
+    let (mut next, mut start) = (0u32, 0u32);
+    for &end in ends {
+        let c = &bytes[start as usize..end as usize];
+        let h = hash(c);
+        let mut p = h as usize & mask;
+        loop {
+            let (sh, s0, s1, id) = slots[p];
+            if s0 > s1 {
+                slots[p] = (h, start, end, next);
+                out.push(next);
+                next += 1;
+                break;
+            }
+            if sh == h && &bytes[s0 as usize..s1 as usize] == c {
+                out.push(id);
+                break;
+            }
+            p = (p + 1) & mask;
+        }
+        start = end;
+    }
+    out
 }
 
 /// `MatchIndex`: hay positions grouped by key in a counting sort, so each lookup is O(1). Keys
@@ -4226,6 +4397,14 @@ fn prefix_lens(nodes: &[GraphNode], root: usize, upto: usize) -> Vec<usize> {
                 need(*misses, usize::MAX);
             }
             GraphNode::QuoteOrNull { inner, map: None } => need(*inner, n),
+            GraphNode::KeyedSum { keys, deltas } => {
+                need(*keys, n);
+                need(*deltas, n);
+            }
+            GraphNode::Interleave { sel, streams } => {
+                need(*sel, n);
+                streams.iter().for_each(|&d| need(d, usize::MAX));
+            }
             node => node.for_each_dep(|d| need(d, usize::MAX)),
         }
     }
