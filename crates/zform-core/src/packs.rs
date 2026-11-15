@@ -321,11 +321,20 @@ impl PackRegistry {
     }
 
     /// The tables holding `columns`, each column coded as the registry codes a block's.
-    pub fn build_tables(
-        &self,
-        columns: &[Vec<Vec<u8>>],
-        budget: &crate::wire::DecodeBudget,
-    ) -> crate::wire::Result<Tables> {
+    pub fn build_tables(&self, columns: Vec<Vec<Vec<u8>>>) -> Tables {
+        let cells = columns
+            .iter()
+            .map(|c| {
+                let mut cells = crate::cells::Cells::with_capacity(c.len(), c.iter().map(Vec::len).sum());
+                c.iter().for_each(|v| cells.push(v));
+                cells
+            })
+            .collect();
+        let packs = self.clone();
+        Tables::from_cells(cells, move || packs.table_wire(&columns))
+    }
+
+    fn table_wire(&self, columns: &[Vec<Vec<u8>>]) -> Vec<u8> {
         let graphs: Vec<PayloadGraph> = std::thread::scope(|s| {
             let jobs: Vec<_> = columns
                 .iter()
@@ -340,7 +349,7 @@ impl PackRegistry {
                 .map(|j| j.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
                 .collect()
         });
-        Tables::new(&graphs, budget)
+        Tables::wire_of(&graphs)
     }
 
     pub fn register_relation<P: RelationPack + 'static>(&mut self, pack: P) {

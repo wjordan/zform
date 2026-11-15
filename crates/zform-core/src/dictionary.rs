@@ -4,7 +4,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use zstd_safe::{CCtx, CParameter, DCtx, DictAttachPref, ResetDirective};
 
@@ -26,7 +26,8 @@ const STORE_LEVEL: i32 = 16;
 
 pub struct Dictionary {
     bytes: Vec<u8>,
-    id: u64,
+    /// Computed when first asked for: a writer's tables may still be encoding their wire.
+    id: OnceLock<u64>,
     /// A compressor that has digested the content, with the level it did so at.
     enc: Mutex<Option<(i32, CCtx<'static>)>>,
     tables: Option<Arc<Tables>>,
@@ -34,7 +35,7 @@ pub struct Dictionary {
 
 impl fmt::Debug for Dictionary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Dictionary({} bytes, {:016x})", self.len(), self.id)
+        write!(f, "Dictionary({} bytes, {:016x?})", self.len(), self.id.get())
     }
 }
 
@@ -44,12 +45,12 @@ impl Dictionary {
         if bytes.starts_with(&ZSTD_DICT_MAGIC) {
             bytes.insert(0, 0);
         }
-        Self { id: xxh64(&bytes, ID_SEED), bytes, enc: Mutex::new(None), tables: None }
+        Self { id: OnceLock::new(), bytes, enc: Mutex::new(None), tables: None }
     }
 
     /// This dictionary carrying `tables` too.
     pub fn with_tables(mut self, tables: Tables) -> Self {
-        self.id = content_id(&self.bytes, Some(&tables));
+        self.id = OnceLock::new();
         self.tables = Some(Arc::new(tables));
         self
     }
@@ -69,8 +70,13 @@ impl Dictionary {
 
     /// The XXH64 of the content and tables. A host that keeps dictionaries across opens keys
     /// them by it.
+    /// Whether [`id`](Self::id) returns without waiting on the tables' wire.
+    pub(crate) fn has_id(&self) -> bool {
+        self.id.get().is_some()
+    }
+
     pub fn id(&self) -> u64 {
-        self.id
+        *self.id.get_or_init(|| content_id(&self.bytes, self.tables.as_deref()))
     }
 
     /// The content as a leaf, at `level` or [`STORE_LEVEL`], whichever is higher.
@@ -104,6 +110,7 @@ impl Dictionary {
         if bytes.starts_with(&ZSTD_DICT_MAGIC) {
             return Err(Error::Format("dictionary content reads as zstd tables".into()));
         }
+        let id = OnceLock::from(id);
         Ok(Self { bytes, id, enc: Mutex::new(None), tables: tables.map(Arc::new) })
     }
 

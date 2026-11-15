@@ -31,7 +31,7 @@ use crate::wire::{
 };
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 pub const FRAME_MAGIC: &[u8; 4] = b"ZFM1";
 
@@ -265,7 +265,7 @@ impl StreamEncoder {
         if let Some(p) = enc.plan.take() {
             self.active_plan = Some(p);
         }
-        self.emit(fc, &task, enc, out)
+        self.emit(&task, enc, out)
     }
 
     /// Writes what precedes the first frame.
@@ -396,7 +396,6 @@ impl StreamEncoder {
     /// Writes an encoded frame and indexes it, in stream order.
     fn emit<W: Write>(
         &mut self,
-        fc: &FramedChunk<'_>,
         task: &FrameTask,
         enc: EncodedFrame,
         mut out: W,
@@ -408,9 +407,13 @@ impl StreamEncoder {
             final_passthrough,
             raw_plan,
             fit,
+            raw_len,
+            records,
+            framing,
+            checksum,
+            verbatim_filter,
             ..
         } = enc;
-        let raw = fc.raw;
         if let Some(raw_plan) = &raw_plan
             && self.opts.index
         {
@@ -443,9 +446,9 @@ impl StreamEncoder {
         let hdr = frame_header(
             flags,
             self.opts.backend,
-            raw.len(),
-            fc.len(),
-            fc.framing,
+            raw_len,
+            records,
+            framing,
             payload.len(),
         );
 
@@ -454,8 +457,7 @@ impl StreamEncoder {
 
         out.write_all(&hdr)?;
         out.write_all(&payload)?;
-        if self.opts.checksum {
-            let csum = xxh64(raw, 0x5a46_4d31);
+        if let Some(csum) = checksum {
             out.write_all(&csum.to_le_bytes())?;
         }
 
@@ -493,23 +495,10 @@ impl StreamEncoder {
                     pages,
                 );
             }
-        } else if !fc.is_empty() {
-            let mut fb = FilterBuilder::new(self.opts.filter_bits);
-            for i in 0..fc.len() {
-                tokens(fc.record(i), |t, _| fb.add(t));
-            }
-            let kind = BlockKind::Verbatim {
-                framing: fc.framing,
-            };
-            self.index.block(
-                kind,
-                base,
-                payload.len() as u64,
-                fc.len() as u64,
-                &[],
-                &fb.finish(),
-                &[],
-            );
+        } else if let Some(filter) = verbatim_filter {
+            let kind = BlockKind::Verbatim { framing };
+            let (len, rows) = (payload.len() as u64, records as u64);
+            self.index.block(kind, base, len, rows, &[], &filter, &[]);
         }
         self.comp_offset += total_frame_bytes;
         self.frames += 1;
@@ -551,6 +540,12 @@ pub(crate) struct EncodedFrame {
     final_passthrough: bool,
     /// The model with the library a sync frame's blocks made.
     plan: Option<ModelPlan>,
+    raw_len: usize,
+    records: usize,
+    framing: ResolvedFraming,
+    checksum: Option<u64>,
+    /// The token filter of a passthrough frame's records, when indexed.
+    verbatim_filter: Option<Vec<u8>>,
     /// The model with that library, encoded, for a frame that writes its model.
     raw_plan: Option<Vec<u8>>,
     fit: FrameFit,
@@ -653,7 +648,19 @@ fn encode_task(
             (fit.residual_rows, fit.residual_bytes) = (fit.rows, fit.bytes);
         }
     }
+    let verbatim_filter = (opts.index && final_passthrough && !fc.is_empty()).then(|| {
+        let mut fb = FilterBuilder::new(opts.filter_bits);
+        for r in &all_recs {
+            tokens(r, |t, _| fb.add(t));
+        }
+        fb.finish()
+    });
     EncodedFrame {
+        raw_len: raw.len(),
+        records: fc.len(),
+        framing: fc.framing,
+        checksum: opts.checksum.then(|| xxh64(raw, 0x5a46_4d31)),
+        verbatim_filter,
         payload,
         blocks,
         sorted,
@@ -1853,11 +1860,21 @@ pub fn pack_stream<R: Read, W: Write>(reader: R, mut writer: W, opts: &PackOptio
     // Frames encode `threads` at a time and are written in order. A reuse frame waits for its
     // sync frame's library and seeds, as `encode_framed` hands them on, so the bytes match.
     std::thread::scope(|s| {
-        let mut queue = VecDeque::new();
+        let (tx, rx) = mpsc::channel();
+        let mut fl = Inflight {
+            queue: VecDeque::new(),
+            written: 0,
+            running: 0,
+            rx,
+            dict: opts.dictionary.as_deref(),
+        };
         let mut plan: Option<Arc<ModelPlan>> = None;
         let mut group: Option<Arc<Link>> = None;
+        // Tables may still be encoding their wire, which only the dictionary frame needs.
+        if let Some(d) = fl.dict {
+            s.spawn(|| d.id());
+        }
         for_each_chunk(reader, opts, |fc| {
-            enc.start(&mut writer)?;
             let task = enc.decide(fc);
             if task.plan_changed || plan.is_none() {
                 plan = enc.active_plan.clone().map(Arc::new);
@@ -1871,52 +1888,86 @@ pub fn pack_stream<R: Read, W: Write>(reader: R, mut writer: W, opts: &PackOptio
                 group = Some(Arc::clone(&next));
                 (None, Some(next))
             };
-            let plan = plan.clone();
-            let chunk = Arc::new(OwnedChunk::new(fc));
-            let (c, t) = (Arc::clone(&chunk), task.clone());
-            let handle = s.spawn(move || {
-                let (mut plan, mut seeds) = (plan, Seeds::default());
-                if let Some(l) = wait {
-                    let (p, sd) = l.get();
-                    (plan, seeds) = (Some(p), sd);
-                }
-                let mut frame = encode_task(opts, &t, &c.view(), plan.as_deref(), &mut seeds);
-                if let Some(l) = publish {
-                    let p = frame.plan.take().map(Arc::new).or(plan);
-                    l.set(p.expect("a structural frame has a model"), seeds);
-                }
-                frame
+            let (c, t, plan, tx) = (OwnedChunk::new(fc), task.clone(), plan.clone(), tx.clone());
+            let seq = fl.written + fl.queue.len();
+            s.spawn(move || {
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let (mut plan, mut seeds) = (plan, Seeds::default());
+                    if let Some(l) = wait {
+                        let (p, sd) = l.get();
+                        (plan, seeds) = (Some(p), sd);
+                    }
+                    let mut frame = encode_task(opts, &t, &c.view(), plan.as_deref(), &mut seeds);
+                    if let Some(l) = publish {
+                        let p = frame.plan.take().map(Arc::new).or(plan);
+                        l.set(p.expect("a structural frame has a model"), seeds);
+                    }
+                    frame
+                }));
+                let _ = tx.send((seq, r));
             });
             // A small frame may fall back to passthrough, which changes the next frame's kind.
             let small = !task.passthrough && fc.raw.len() <= SMALL_FRAME;
-            queue.push_back((chunk, task, handle));
-            // Reuse frames wait on their sync frame, so the queue holds a group past the threads.
+            fl.queue.push_back((task, None));
+            fl.running += 1;
+            // Reuse frames wait on their sync frame, so more frames run than threads.
             let depth = opts.threads + opts.sync_interval_frames;
-            while queue.len() >= depth || small && !queue.is_empty() {
-                write_job(&mut enc, queue.pop_front().unwrap(), &mut writer)?;
+            loop {
+                while let Ok(m) = fl.rx.try_recv() {
+                    fl.land(m);
+                }
+                fl.flush(&mut enc, &mut writer)?;
+                if fl.queue.is_empty() || fl.running < depth && !small {
+                    return Ok(());
+                }
+                fl.wait();
             }
-            Ok(())
         })?;
-        while let Some(job) = queue.pop_front() {
-            write_job(&mut enc, job, &mut writer)?;
+        while !fl.queue.is_empty() {
+            fl.wait();
+            fl.flush(&mut enc, &mut writer)?;
         }
         enc.finish(&mut writer)
     })
 }
 
-fn write_job<W: Write>(enc: &mut StreamEncoder, job: Job<'_>, out: W) -> Result<()> {
-    let (chunk, task, handle) = job;
-    let frame = handle
-        .join()
-        .unwrap_or_else(|p| std::panic::resume_unwind(p));
-    enc.emit(&chunk.view(), &task, frame, out).map(drop)
+/// Frames being encoded, in stream order from `written`, each with its encoding once done.
+struct Inflight<'d> {
+    queue: VecDeque<(FrameTask, Option<EncodedFrame>)>,
+    written: usize,
+    running: usize,
+    rx: mpsc::Receiver<(usize, std::thread::Result<EncodedFrame>)>,
+    dict: Option<&'d Dictionary>,
 }
 
-type Job<'s> = (
-    Arc<OwnedChunk>,
-    FrameTask,
-    std::thread::ScopedJoinHandle<'s, EncodedFrame>,
-);
+impl Inflight<'_> {
+    fn land(&mut self, (seq, frame): (usize, std::thread::Result<EncodedFrame>)) {
+        let frame = frame.unwrap_or_else(|p| std::panic::resume_unwind(p));
+        self.queue[seq - self.written].1 = Some(frame);
+        self.running -= 1;
+    }
+
+    /// Waits for a frame to finish or, with none running, for the dictionary.
+    fn wait(&mut self) {
+        match self.running {
+            0 => drop(self.dict.map(Dictionary::id)),
+            _ => self.land(self.rx.recv().expect("a running frame sends")),
+        }
+    }
+
+    /// Writes the finished frames at the front once the dictionary frame can go first.
+    fn flush<W: Write>(&mut self, enc: &mut StreamEncoder, mut out: W) -> Result<()> {
+        while self.dict.is_none_or(Dictionary::has_id)
+            && self.queue.front().is_some_and(|j| j.1.is_some())
+        {
+            let (task, frame) = self.queue.pop_front().unwrap();
+            enc.start(&mut out)?;
+            enc.emit(&task, frame.unwrap(), &mut out)?;
+            self.written += 1;
+        }
+        Ok(())
+    }
+}
 
 /// A sync frame's model and seeds once it is encoded, for the frames that start from them.
 #[derive(Default)]
@@ -1998,8 +2049,7 @@ pub fn build_tables<R: Read>(reader: R, opts: &PackOptions) -> Result<Option<Tab
     if cols.first().is_none_or(|c| c.is_empty()) {
         return Ok(None);
     }
-    let budget = DecodeBudget::default();
-    opts.packs.build_tables(&cols, &budget).map(Some)
+    Ok(Some(opts.packs.build_tables(cols)))
 }
 
 /// Cuts `reader` into the framed chunks `pack_stream` encodes, in order.

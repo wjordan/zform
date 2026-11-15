@@ -2,7 +2,7 @@
 //! A block column names a table column as a peer with [`TABLE_PEER`] set.
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::cells::Cells;
 use crate::payload::graph::{CoreDecoder, ExtInputs, GraphNode, PayloadGraph};
@@ -14,7 +14,9 @@ pub const TABLE_PEER: u32 = 1 << 31;
 /// Table columns, each a payload graph whose peers are earlier table columns. A column is
 /// decoded when a block first reads it.
 pub struct Tables {
-    wire: Vec<u8>,
+    wire: OnceLock<Vec<u8>>,
+    /// A writer's tables encode their wire when it is first asked for.
+    encode: Mutex<Option<Encode>>,
     graphs: Vec<PayloadGraph>,
     budget: DecodeBudget,
     cols: Vec<OnceLock<Arc<Cells>>>,
@@ -22,26 +24,42 @@ pub struct Tables {
     ids: Vec<OnceLock<Ids>>,
 }
 
+type Encode = Box<dyn FnOnce() -> Vec<u8> + Send>;
+
 impl std::fmt::Debug for Tables {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Tables({} columns, {} bytes)",
-            self.len(),
-            self.wire.len()
-        )
+        let bytes = self.wire.get().map(Vec::len);
+        write!(f, "Tables({} columns, {bytes:?} bytes)", self.len())
     }
 }
 
 impl Tables {
     /// Tables of `graphs`, read back as a reader reads them.
     pub fn new(graphs: &[PayloadGraph], budget: &DecodeBudget) -> Result<Self> {
+        Self::decode(&Self::wire_of(graphs), budget)
+    }
+
+    /// Tables of `cols`, whose wire `encode` writes once something asks for it.
+    pub fn from_cells(cols: Vec<Cells>, encode: impl FnOnce() -> Vec<u8> + Send + 'static) -> Self {
+        let n = cols.len();
+        Self {
+            wire: OnceLock::new(),
+            encode: Mutex::new(Some(Box::new(encode))),
+            graphs: Vec::new(),
+            budget: DecodeBudget::default(),
+            cols: cols.into_iter().map(Arc::new).map(OnceLock::from).collect(),
+            ids: (0..n).map(|_| OnceLock::new()).collect(),
+        }
+    }
+
+    /// The wire of `graphs`, as a dictionary frame carries it.
+    pub fn wire_of(graphs: &[PayloadGraph]) -> Vec<u8> {
         let mut wire = Vec::new();
         put_uvarint(&mut wire, graphs.len() as u64);
         for g in graphs {
             put_bytes(&mut wire, &g.encode());
         }
-        Self::decode(&wire, budget)
+        wire
     }
 
     /// Reads the table section of a dictionary frame.
@@ -74,7 +92,8 @@ impl Tables {
             return Err(Error::Format("trailing bytes after tables".into()));
         }
         Ok(Self {
-            wire: wire.to_vec(),
+            wire: OnceLock::from(wire.to_vec()),
+            encode: Mutex::new(None),
             graphs,
             budget: budget.clone(),
             cols: (0..n).map(|_| OnceLock::new()).collect(),
@@ -102,15 +121,18 @@ impl Tables {
     }
 
     pub fn wire(&self) -> &[u8] {
-        &self.wire
+        self.wire.get_or_init(|| {
+            let encode = self.encode.lock().unwrap().take();
+            encode.expect("tables have a wire or its encoder")()
+        })
     }
 
     pub fn len(&self) -> usize {
-        self.graphs.len()
+        self.cols.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.graphs.is_empty()
+        self.cols.is_empty()
     }
 
     /// Column `c`'s value ids: the rank of each value's first occurrence.
@@ -211,20 +233,20 @@ mod tests {
     fn block_ids_are_joint_with_table_ids() {
         let budget = DecodeBudget::default();
         let rows = [("a", "1"), ("b", "2"), ("a", "3"), ("c", "4"), ("b", "5")];
-        let t = PackRegistry::new()
-            .build_tables(&cols(&rows), &budget)
-            .unwrap();
-        assert_eq!(t.col(1).unwrap().get(2), Some(&b"3"[..]));
-        let block: [&[u8]; 4] = [b"x", b"b", b"y", b"x"];
-        assert_eq!(t.joint_ids(0, block).unwrap(), [3, 1, 4, 3]);
+        let t = PackRegistry::new().build_tables(cols(&rows));
+        // A reader decodes what the writer looked values up in.
+        let read = Tables::decode(t.wire(), &budget).unwrap();
+        for t in [&t, &read] {
+            assert_eq!(t.col(1).unwrap().get(2), Some(&b"3"[..]));
+            let block: [&[u8]; 4] = [b"x", b"b", b"y", b"x"];
+            assert_eq!(t.joint_ids(0, block).unwrap(), [3, 1, 4, 3]);
+        }
     }
 
     #[test]
     fn wire_is_checked() {
         let budget = DecodeBudget::default();
-        let t = PackRegistry::new()
-            .build_tables(&cols(&[("a", "1")]), &budget)
-            .unwrap();
+        let t = PackRegistry::new().build_tables(cols(&[("a", "1")]));
         let mut trailing = t.wire().to_vec();
         trailing.push(0);
         assert!(Tables::decode(&trailing, &budget).is_err());
