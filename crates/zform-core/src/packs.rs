@@ -176,6 +176,37 @@ impl ColumnProfile {
     }
 }
 
+/// The candidate that coded a column, which a search of like cells may try alone.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Choice {
+    /// Every candidate.
+    Search,
+    /// A single-column candidate, and the runner-up where it came close.
+    Single(Cand, Option<Cand>),
+    Horizontal,
+    Keyed,
+    Relation,
+}
+
+/// A single-column candidate: the generic dictionary or raw cells, or a pack by its index in
+/// the registry.
+pub type Cand = Option<u16>;
+
+/// What coded a column on a sample of a block.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Pick {
+    pub choice: Choice,
+    /// The sample's cells of the column, and the bytes they took.
+    pub cells: usize,
+    pub cost: usize,
+}
+
+/// Cells a sample needs of a column for its choice to stand for the block's.
+const PICK_CELLS: usize = 512;
+
+/// Rows below which [`keyed_lookup`] does not search, so that a sample cannot rule it out.
+const KEYED_ROWS: usize = 1024;
+
 /// Pluggable writer-side codec pack.
 pub trait CodecPack: Send + Sync {
     fn name(&self) -> &'static str;
@@ -357,6 +388,14 @@ impl PackRegistry {
         self.relations.push(Arc::new(pack));
     }
 
+    /// The registry a sample of a block is searched with: mixing only shrinks what won.
+    pub(crate) fn for_sample(&self) -> Self {
+        Self {
+            context_mixing: false,
+            ..self.clone()
+        }
+    }
+
     pub(crate) fn encoding_scope(&self) -> crate::payload::graph::ContextMixScope {
         crate::payload::graph::ContextMixScope::new(self.context_mixing)
     }
@@ -389,15 +428,28 @@ impl PackRegistry {
     }
 
     fn encode_best_graph_inner(&self, rows: &[&[u8]], depth: usize) -> (PayloadGraph, bool) {
+        let (graph, raw, _) = self.encode_single(rows, depth, None);
+        (graph, raw)
+    }
+
+    /// The best single-column graph, whether it is the raw fallback, and the candidate that
+    /// won with its runner-up. `pick` names the candidates to try; the rest are searched only
+    /// where none of those applies.
+    fn encode_single(
+        &self,
+        rows: &[&[u8]],
+        depth: usize,
+        pick: Option<(Cand, Option<Cand>)>,
+    ) -> (PayloadGraph, bool, (Cand, Option<Cand>)) {
         if rows.is_empty() {
-            return (PayloadGraph::empty(), false);
+            return (PayloadGraph::empty(), false, (None, None));
         }
         let n = rows.len();
         let first = rows[0];
         if rows.iter().all(|&r| r == first) {
             let mut gb = GraphBuilder::new(n);
             let root = gb.add_const_cells(first, n);
-            return (gb.finish(root), false);
+            return (gb.finish(root), false, (None, None));
         }
 
         // JSON `"..."` / `null` wrapper peeling -> `GraphNode::QuoteOrNull` (decodes into lazy `Col::Quoted`!).
@@ -428,11 +480,11 @@ impl PackRegistry {
                     if !any_null {
                         let inner_rows: Vec<&[u8]> =
                             rows.iter().map(|r| &r[1..r.len() - 1]).collect();
-                        let (inner_g, raw_like) = self.encode_best_graph_inner(&inner_rows, 1);
+                        let (inner_g, raw_like, won) = self.encode_single(&inner_rows, 1, pick);
                         let mut gb = GraphBuilder::new(n);
                         let inner_root = gb.merge_graph(&inner_g);
                         let q_root = gb.add_quote_or_null(inner_root, None);
-                        return (gb.finish(q_root), raw_like);
+                        return (gb.finish(q_root), raw_like, won);
                     }
                     let mut non_null: Vec<&[u8]> = Vec::with_capacity(n);
                     let mut row_map: Vec<i64> = Vec::with_capacity(n);
@@ -446,27 +498,52 @@ impl PackRegistry {
                         }
                     }
                     if !non_null.is_empty() {
-                        let (inner_g, _) = self.encode_best_graph_inner(&non_null, 1);
+                        let (inner_g, _, won) = self.encode_single(&non_null, 1, pick);
                         let mut gb = GraphBuilder::new(n);
                         let inner_root = gb.merge_graph(&inner_g);
                         let map_node = gb.add_ints(&row_map);
                         let q_root = gb.add_quote_or_null(inner_root, Some(map_node));
-                        return (gb.finish(q_root), false);
+                        return (gb.finish(q_root), false, won);
                     }
                 }
             }
         }
 
         // Generic baseline: dictionary or raw-slice `PayloadGraph`.
-        let mut base_gb = GraphBuilder::new(n);
-        let base_root = base_gb.add_dict_cells(rows);
-        let is_raw_fallback = matches!(
-            base_gb.nodes[base_root as usize],
-            GraphNode::SliceBuf { .. }
-        );
-        let mut best_graph = base_gb.finish(base_root);
+        let base = || {
+            let mut gb = GraphBuilder::new(n);
+            let root = gb.add_dict_cells(rows);
+            let raw = matches!(gb.nodes[root as usize], GraphNode::SliceBuf { .. });
+            (gb.finish(root), raw)
+        };
+        if let Some((first, also)) = pick {
+            let mut best: Option<(usize, PayloadGraph, bool, Cand)> = None;
+            for cand in std::iter::once(first).chain(also) {
+                let got = match cand {
+                    None => Some(base()),
+                    Some(k) => self
+                        .packs
+                        .get(k as usize)
+                        .filter(|p| p.precheck(&ColumnProfile::sample(rows)))
+                        .and_then(|p| p.try_encode(rows))
+                        .map(|g| (g, false)),
+                };
+                if let Some((graph, raw)) = got {
+                    let cost = graph.cost();
+                    if best.as_ref().is_none_or(|b| cost < b.0) {
+                        best = Some((cost, graph, raw, cand));
+                    }
+                }
+            }
+            if let Some((_, graph, raw, cand)) = best {
+                return (graph, raw, (cand, None));
+            }
+        }
+
+        let (mut best_graph, is_raw_fallback) = base();
         let mut best_len = best_graph.cost();
-        let mut won_by_pack = false;
+        let mut won = None;
+        let mut second: Option<(usize, Cand)> = None;
 
         // Ultra-low-cardinality categorical columns (`<= 8` unique values across `>= 64` rows,
         // already <1 byte/row as a dictionary) cannot be meaningfully beaten by structural packs
@@ -486,23 +563,30 @@ impl PackRegistry {
             );
         let profile = ColumnProfile::sample(rows);
         if is_tiny_dict && !(profile.min_len == profile.max_len && profile.min_len <= 16) {
-            return (best_graph, false);
+            return (best_graph, false, (None, None));
         }
 
-        for pack in &self.packs {
+        for (k, pack) in self.packs.iter().enumerate() {
             if !pack.precheck(&profile) {
                 continue;
             }
             if let Some(cand) = pack.try_encode(rows) {
                 let clen = cand.cost();
                 if clen < best_len {
+                    second = Some((best_len, won));
                     best_len = clen;
                     best_graph = cand;
-                    won_by_pack = true;
+                    won = Some(k as u16);
+                } else if second.is_none_or(|s| clen < s.0) {
+                    second = Some((clen, Some(k as u16)));
                 }
             }
         }
-        (best_graph, is_raw_fallback && !won_by_pack)
+        // A runner-up this close on a sample may win on the block.
+        let also = second
+            .filter(|&(len, _)| len * 4 <= best_len * 5)
+            .map(|s| s.1);
+        (best_graph, is_raw_fallback && won.is_none(), (won, also))
     }
 }
 
@@ -4528,6 +4612,8 @@ pub struct EncodedDenseBlock {
     pub pool_rows: Vec<u32>,
     pub col_blobs: Vec<Vec<u8>>,
     pub summaries: Vec<ColSummary>,
+    /// By column, the candidate that coded it and its cells.
+    pub picks: Vec<Pick>,
 }
 
 /// How a block's text pool is cut into pages.
@@ -4683,7 +4769,7 @@ fn keyed_lookup<'v>(
 ) -> Option<(Vec<u8>, usize)> {
     // Small columns rarely repay the search.
     let vals = &occ[cid];
-    if vals.len() < 1024 {
+    if vals.len() < KEYED_ROWS {
         return None;
     }
     let usable = |c: usize| !occ[c].is_empty() && nested.get(c).is_none_or(|x| x.is_none());
@@ -4781,6 +4867,36 @@ impl PackRegistry {
         backend: EntropyBackend,
         level: i32,
     ) -> EncodedDenseBlock {
+        self.encode_dense_block_picked(
+            occ_streams,
+            dict_groups,
+            horiz_cands,
+            preencoded_nested,
+            standalone,
+            layout,
+            paging,
+            backend,
+            level,
+            None,
+        )
+    }
+
+    /// [`Self::encode_dense_block`] given `picks`, what coded each column of a sample of the
+    /// block: a column the sample held enough of tries that candidate alone.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_dense_block_picked(
+        &self,
+        occ_streams: &[Vec<&[u8]>],
+        dict_groups: &[&str],
+        horiz_cands: &[Vec<usize>],
+        preencoded_nested: &mut [Option<(ColSummary, Vec<u8>)>],
+        standalone: &[bool],
+        layout: Option<(&ModelPlan, &[u32])>,
+        paging: Option<Paging<'_>>,
+        backend: EntropyBackend,
+        level: i32,
+        picks: Option<&[Pick]>,
+    ) -> EncodedDenseBlock {
         let _mixing = crate::payload::graph::ContextMixScope::new(false);
         let _memo = crate::payload::graph::EncodeMemoScope::new();
         let search = crate::payload::graph::search_level(level);
@@ -4790,6 +4906,12 @@ impl PackRegistry {
             // What each blob counts as when sizes are compared: its length less shared code.
             let mut col_costs = Vec::with_capacity(n_cols);
             let mut summaries = Vec::with_capacity(n_cols);
+            let unpicked = Pick {
+                choice: Choice::Search,
+                cells: 0,
+                cost: 0,
+            };
+            let mut chosen = vec![unpicked; n_cols];
             let mut used_ext = vec![false; n_cols];
             let mut raw_backed = vec![false; n_cols];
             let mut fixed_id_widths = vec![None::<usize>; n_cols];
@@ -4844,224 +4966,75 @@ impl PackRegistry {
                     (sum.numeric_kind, sum.min_val, sum.max_val) = (2, lo, hi);
                 }
 
-                let (best_single_g, is_raw_fb) = self.encode_best_graph_inner(vals, 0);
-                let (mut best_blob, mut best_cost) = best_single_g.priced();
                 let must_standalone = standalone.get(cid).copied().unwrap_or(false);
-
-                if !must_standalone && occ_len >= 8 {
-                    let cands = horiz_cands.get(cid).map_or(&[][..], |v| v.as_slice());
-
-                    // 1a. Equal-length `ExactCopy` & `SubstringInterp`.
-                    let mut interp_srcs = Vec::<usize>::new();
-                    for &src_i in cands {
-                        if src_i >= cid
-                            || occ_streams[src_i].len() != occ_len
-                            || preencoded_nested.get(src_i).is_some_and(|x| x.is_some())
-                        {
-                            continue;
-                        }
-                        let src_vals = &occ_streams[src_i];
-                        let probe = occ_len.min(64);
-                        let mut eq_probe = 0usize;
-                        let mut sub_probe = 0usize;
-                        for r in 0..probe {
-                            let tv = vals[r];
-                            let sv = src_vals[r];
-                            if tv == sv {
-                                eq_probe += 1;
-                            } else {
-                                let (sv_u, _) = unquote_json_opt(sv);
-                                if sv_u.len() >= 3
-                                    && tv.len() > sv_u.len()
-                                    && !sv_u.contains(&0x1f)
-                                    && memchr::memmem::find(tv, sv_u).is_some()
-                                {
-                                    sub_probe += 1;
-                                }
-                            }
-                        }
-                        if eq_probe * 4 >= probe {
-                            let mut exc_idx = Vec::new();
-                            let mut exc_vals = Vec::new();
-                            for r in 0..occ_len {
-                                if vals[r] != src_vals[r] {
-                                    exc_idx.push(r);
-                                    exc_vals.push(vals[r]);
-                                }
-                            }
-                            if exc_idx.len() * 2 <= occ_len {
-                                let mut gb = GraphBuilder::new(occ_len);
-                                let peer = gb.add_ext_peer(src_i as u32);
-                                let root = gb.add_patch(peer, &exc_idx, &exc_vals);
-                                let (cand, cand_cost) = gb.finish(root).priced();
-                                if cand_cost + 6 < best_cost {
-                                    best_blob = cand;
-                                    best_cost = cand_cost;
-                                    used_ext[cid] = true;
-                                }
-                            }
-                        }
-                        if interp_srcs.len() < 3 && sub_probe * 4 >= probe {
-                            interp_srcs.push(src_i);
-                        }
+                let pick = picks
+                    .and_then(|p| p.get(cid).copied())
+                    .filter(|p| p.cells >= PICK_CELLS.min(occ_len))
+                    .unwrap_or(Pick {
+                        cells: occ_len,
+                        ..unpicked
+                    });
+                let single = |pick| {
+                    let (graph, raw, (won, also)) = self.encode_single(vals, 0, pick);
+                    (graph.priced(), raw, Choice::Single(won, also))
+                };
+                let (mut best_blob, mut best_cost, mut is_raw_fb, mut choice);
+                let mut want = pick.choice;
+                loop {
+                    let all = want == Choice::Search;
+                    (best_blob, best_cost, is_raw_fb, choice) = (Vec::new(), usize::MAX, false, want);
+                    used_ext[cid] = false;
+                    if all {
+                        ((best_blob, best_cost), is_raw_fb, choice) = single(None);
+                    } else if let Choice::Single(first, also) = want {
+                        ((best_blob, best_cost), is_raw_fb, choice) = single(Some((first, also)));
                     }
 
-                    if !interp_srcs.is_empty() {
-                        let mut templated: Vec<Vec<u8>> = Vec::with_capacity(occ_len);
-                        let mut hits = 0usize;
-                        for r in 0..occ_len {
-                            let target = vals[r];
-                            if target.contains(&0x1f) {
-                                templated.push(target.to_vec());
+                    if !must_standalone && occ_len >= 8 && (all || want == Choice::Horizontal) {
+                        let cands = horiz_cands.get(cid).map_or(&[][..], |v| v.as_slice());
+
+                        // 1a. Equal-length `ExactCopy` & `SubstringInterp`.
+                        let mut interp_srcs = Vec::<usize>::new();
+                        for &src_i in cands {
+                            if src_i >= cid
+                                || occ_streams[src_i].len() != occ_len
+                                || preencoded_nested.get(src_i).is_some_and(|x| x.is_some())
+                            {
                                 continue;
                             }
-                            let mut cur = target.to_vec();
-                            let mut replaced = false;
-                            for (slot_k, &src_i) in interp_srcs.iter().enumerate() {
-                                let sv = occ_streams[src_i][r];
-                                let (sv_u, was_q) = unquote_json_opt(sv);
-                                if sv.len() >= 3
-                                    && cur.len() > sv.len()
-                                    && !sv.contains(&0x1f)
-                                    && let Some(next) =
-                                        replace_subslice(&cur, sv, &[0x1f, (slot_k * 2) as u8])
-                                {
-                                    cur = next;
-                                    replaced = true;
-                                } else if was_q
-                                    && sv_u.len() >= 3
-                                    && cur.len() > sv_u.len()
-                                    && !sv_u.contains(&0x1f)
-                                    && let Some(next) = replace_subslice(
-                                        &cur,
-                                        sv_u,
-                                        &[0x1f, (slot_k * 2 + 1) as u8],
-                                    )
-                                {
-                                    cur = next;
-                                    replaced = true;
-                                }
-                            }
-                            if replaced {
-                                hits += 1;
-                            }
-                            templated.push(cur);
-                        }
-                        if hits * 4 >= occ_len {
-                            let t_refs: Vec<&[u8]> =
-                                templated.iter().map(|x| x.as_slice()).collect();
-                            let t_graph = self.encode_best_graph_inner(&t_refs, 0).0;
-                            let mut gb = GraphBuilder::new(occ_len);
-                            let t_node = gb.merge_graph(&t_graph);
-                            let mut slot_nodes = Vec::with_capacity(interp_srcs.len());
-                            for &src_i in &interp_srcs {
-                                slot_nodes.push(gb.add_ext_peer(src_i as u32));
-                            }
-                            let root = gb.push(GraphNode::TemplateCells {
-                                template: t_node,
-                                slots: slot_nodes,
-                            });
-                            let (cand, cand_cost) = gb.finish(root).priced();
-                            if cand_cost + 6 < best_cost {
-                                best_blob = cand;
-                                best_cost = cand_cost;
-                                used_ext[cid] = true;
-                            }
-                        }
-                    }
-
-                    // 1b. Equal-length `AffineInt` (`c = a ± b + residual`, bare or JSON-quoted).
-                    let (u0, q0) = unquote_json_opt(vals[0]);
-                    if ExactIntPack::parse_canonical_i64(u0).is_some() {
-                        let mut int_srcs = Vec::new();
-                        for &src_i in cands {
-                            if src_i < cid
-                                && occ_streams[src_i].len() == occ_len
-                                && occ_streams[src_i].iter().take(16).all(|b| {
-                                    ExactIntPack::parse_canonical_i64(unquote_json_opt(b).0)
-                                        .is_some()
-                                })
-                            {
-                                int_srcs.push(src_i);
-                                if int_srcs.len() >= 4 {
-                                    break;
-                                }
-                            }
-                        }
-                        for ia in 0..int_srcs.len() {
-                            for ib in 0..int_srcs.len() {
-                                if ia == ib {
-                                    continue;
-                                }
-                                let sa = int_srcs[ia];
-                                let sb = int_srcs[ib];
-                                for sub in [false, true] {
-                                    let mut res = Vec::with_capacity(occ_len);
-                                    let mut exc_idx = Vec::new();
-                                    let mut exc_vals = Vec::new();
-                                    let mut ok = true;
-                                    for r in 0..occ_len {
-                                        let (ut, qt) = unquote_json_opt(vals[r]);
-                                        let (ua, _) = unquote_json_opt(occ_streams[sa][r]);
-                                        let (ub, _) = unquote_json_opt(occ_streams[sb][r]);
-                                        if qt == q0
-                                            && let (Some(vt), Some(va), Some(vb)) = (
-                                                ExactIntPack::parse_canonical_i64(ut),
-                                                ExactIntPack::parse_canonical_i64(ua),
-                                                ExactIntPack::parse_canonical_i64(ub),
-                                            )
-                                        {
-                                            let pred = if sub {
-                                                va.wrapping_sub(vb)
-                                            } else {
-                                                va.wrapping_add(vb)
-                                            };
-                                            res.push(vt.wrapping_sub(pred));
-                                        } else {
-                                            res.push(0);
-                                            exc_idx.push(r);
-                                            exc_vals.push(vals[r]);
-                                            if exc_idx.len() * 8 > occ_len {
-                                                ok = false;
-                                                break;
-                                            }
-                                        }
+                            let src_vals = &occ_streams[src_i];
+                            let probe = occ_len.min(64);
+                            let mut eq_probe = 0usize;
+                            let mut sub_probe = 0usize;
+                            for r in 0..probe {
+                                let tv = vals[r];
+                                let sv = src_vals[r];
+                                if tv == sv {
+                                    eq_probe += 1;
+                                } else {
+                                    let (sv_u, _) = unquote_json_opt(sv);
+                                    if sv_u.len() >= 3
+                                        && tv.len() > sv_u.len()
+                                        && !sv_u.contains(&0x1f)
+                                        && memchr::memmem::find(tv, sv_u).is_some()
+                                    {
+                                        sub_probe += 1;
                                     }
-                                    if !ok {
-                                        continue;
+                                }
+                            }
+                            if eq_probe * 4 >= probe {
+                                let mut exc_idx = Vec::new();
+                                let mut exc_vals = Vec::new();
+                                for r in 0..occ_len {
+                                    if vals[r] != src_vals[r] {
+                                        exc_idx.push(r);
+                                        exc_vals.push(vals[r]);
                                     }
+                                }
+                                if exc_idx.len() * 2 <= occ_len {
                                     let mut gb = GraphBuilder::new(occ_len);
-                                    let pa = gb.add_ext_peer(sa as u32);
-                                    let pb = gb.add_ext_peer(sb as u32);
-                                    let ia_n = gb.add_parse_ascii_int(pa);
-                                    let ib_n = gb.add_parse_ascii_int(pb);
-                                    let res_n = gb.add_ints(&res);
-                                    let b = Builder::new(3);
-                                    let va = b.input(0);
-                                    let vb = b.input(1);
-                                    let vr = b.input(2);
-                                    let comb = if sub {
-                                        b.rr(Op::Sub, va, vb)
-                                    } else {
-                                        b.rr(Op::Add, va, vb)
-                                    };
-                                    let out_v = b.rr(Op::Add, comb, vr);
-                                    let sum_n = gb.add_prog_i64(
-                                        b.finish(&[(out_v, 8)]),
-                                        vec![ia_n, ib_n, res_n],
-                                        vec![],
-                                    );
-                                    let fmt_n = gb.add_prog_cells(
-                                        prog_fmt_int(false, 0),
-                                        vec![sum_n],
-                                        vec![],
-                                    );
-                                    let base_n = if q0 {
-                                        gb.add_quote_or_null(fmt_n, None)
-                                    } else {
-                                        fmt_n
-                                    };
-                                    let root = gb.add_patch(base_n, &exc_idx, &exc_vals);
+                                    let peer = gb.add_ext_peer(src_i as u32);
+                                    let root = gb.add_patch(peer, &exc_idx, &exc_vals);
                                     let (cand, cand_cost) = gb.finish(root).priced();
                                     if cand_cost + 6 < best_cost {
                                         best_blob = cand;
@@ -5070,119 +5043,314 @@ impl PackRegistry {
                                     }
                                 }
                             }
+                            if interp_srcs.len() < 3 && sub_probe * 4 >= probe {
+                                interp_srcs.push(src_i);
+                            }
                         }
-                    }
 
-                    // 1c. Any-length Cross-Column ID Index (`payload.head` -> `commits[].sha`, etc.)!
-                    if let Some(fw) = fixed_id_widths[cid] {
-                        let mut tried = 0usize;
-                        for src_i in (0..cid).rev() {
-                            if fixed_id_widths[src_i] == Some(fw) && !occ_streams[src_i].is_empty()
-                            {
-                                let src_vals = &occ_streams[src_i];
-                                let mut lut: FastMap<&[u8], i64> =
-                                    fast_map_with_capacity(src_vals.len().min(4096));
-                                for (idx, &sv) in src_vals.iter().enumerate() {
-                                    lut.entry(sv).or_insert(idx as i64);
+                        if !interp_srcs.is_empty() {
+                            let mut templated: Vec<Vec<u8>> = Vec::with_capacity(occ_len);
+                            let mut hits = 0usize;
+                            for r in 0..occ_len {
+                                let target = vals[r];
+                                if target.contains(&0x1f) {
+                                    templated.push(target.to_vec());
+                                    continue;
                                 }
-                                let probe = occ_len.min(64);
-                                let probe_hits = vals[..probe]
-                                    .iter()
-                                    .filter(|&&v| lut.contains_key(v))
-                                    .count();
-                                if probe_hits * 5 >= probe {
-                                    let mut idxs = Vec::with_capacity(occ_len);
-                                    let mut exc_idx = Vec::new();
-                                    let mut exc_vals = Vec::new();
-                                    let mut last_idx = 0i64;
-                                    for (r, &v) in vals.iter().enumerate() {
-                                        if let Some(&pos) = lut.get(v) {
-                                            idxs.push(pos);
-                                            last_idx = pos;
-                                        } else {
-                                            idxs.push(last_idx);
-                                            exc_idx.push(r);
-                                            exc_vals.push(v);
-                                        }
+                                let mut cur = target.to_vec();
+                                let mut replaced = false;
+                                for (slot_k, &src_i) in interp_srcs.iter().enumerate() {
+                                    let sv = occ_streams[src_i][r];
+                                    let (sv_u, was_q) = unquote_json_opt(sv);
+                                    if sv.len() >= 3
+                                        && cur.len() > sv.len()
+                                        && !sv.contains(&0x1f)
+                                        && let Some(next) =
+                                            replace_subslice(&cur, sv, &[0x1f, (slot_k * 2) as u8])
+                                    {
+                                        cur = next;
+                                        replaced = true;
+                                    } else if was_q
+                                        && sv_u.len() >= 3
+                                        && cur.len() > sv_u.len()
+                                        && !sv_u.contains(&0x1f)
+                                        && let Some(next) = replace_subslice(
+                                            &cur,
+                                            sv_u,
+                                            &[0x1f, (slot_k * 2 + 1) as u8],
+                                        )
+                                    {
+                                        cur = next;
+                                        replaced = true;
                                     }
-                                    if exc_idx.len() < occ_len {
+                                }
+                                if replaced {
+                                    hits += 1;
+                                }
+                                templated.push(cur);
+                            }
+                            if hits * 4 >= occ_len {
+                                let t_refs: Vec<&[u8]> =
+                                    templated.iter().map(|x| x.as_slice()).collect();
+                                let t_graph = self.encode_best_graph_inner(&t_refs, 0).0;
+                                let mut gb = GraphBuilder::new(occ_len);
+                                let t_node = gb.merge_graph(&t_graph);
+                                let mut slot_nodes = Vec::with_capacity(interp_srcs.len());
+                                for &src_i in &interp_srcs {
+                                    slot_nodes.push(gb.add_ext_peer(src_i as u32));
+                                }
+                                let root = gb.push(GraphNode::TemplateCells {
+                                    template: t_node,
+                                    slots: slot_nodes,
+                                });
+                                let (cand, cand_cost) = gb.finish(root).priced();
+                                if cand_cost + 6 < best_cost {
+                                    best_blob = cand;
+                                    best_cost = cand_cost;
+                                    used_ext[cid] = true;
+                                }
+                            }
+                        }
+
+                        // 1b. Equal-length `AffineInt` (`c = a ± b + residual`, bare or JSON-quoted).
+                        let (u0, q0) = unquote_json_opt(vals[0]);
+                        if ExactIntPack::parse_canonical_i64(u0).is_some() {
+                            let mut int_srcs = Vec::new();
+                            for &src_i in cands {
+                                if src_i < cid
+                                    && occ_streams[src_i].len() == occ_len
+                                    && occ_streams[src_i].iter().take(16).all(|b| {
+                                        ExactIntPack::parse_canonical_i64(unquote_json_opt(b).0)
+                                            .is_some()
+                                    })
+                                {
+                                    int_srcs.push(src_i);
+                                    if int_srcs.len() >= 4 {
+                                        break;
+                                    }
+                                }
+                            }
+                            for ia in 0..int_srcs.len() {
+                                for ib in 0..int_srcs.len() {
+                                    if ia == ib {
+                                        continue;
+                                    }
+                                    let sa = int_srcs[ia];
+                                    let sb = int_srcs[ib];
+                                    for sub in [false, true] {
+                                        let mut res = Vec::with_capacity(occ_len);
+                                        let mut exc_idx = Vec::new();
+                                        let mut exc_vals = Vec::new();
+                                        let mut ok = true;
+                                        for r in 0..occ_len {
+                                            let (ut, qt) = unquote_json_opt(vals[r]);
+                                            let (ua, _) = unquote_json_opt(occ_streams[sa][r]);
+                                            let (ub, _) = unquote_json_opt(occ_streams[sb][r]);
+                                            if qt == q0
+                                                && let (Some(vt), Some(va), Some(vb)) = (
+                                                    ExactIntPack::parse_canonical_i64(ut),
+                                                    ExactIntPack::parse_canonical_i64(ua),
+                                                    ExactIntPack::parse_canonical_i64(ub),
+                                                )
+                                            {
+                                                let pred = if sub {
+                                                    va.wrapping_sub(vb)
+                                                } else {
+                                                    va.wrapping_add(vb)
+                                                };
+                                                res.push(vt.wrapping_sub(pred));
+                                            } else {
+                                                res.push(0);
+                                                exc_idx.push(r);
+                                                exc_vals.push(vals[r]);
+                                                if exc_idx.len() * 8 > occ_len {
+                                                    ok = false;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if !ok {
+                                            continue;
+                                        }
                                         let mut gb = GraphBuilder::new(occ_len);
-                                        let peer = gb.add_ext_peer(src_i as u32);
-                                        let idx_node = gb.add_mtf_ints(&idxs);
-                                        let indexed = gb.add_index_cells(peer, idx_node);
-                                        let root = gb.add_patch(indexed, &exc_idx, &exc_vals);
+                                        let pa = gb.add_ext_peer(sa as u32);
+                                        let pb = gb.add_ext_peer(sb as u32);
+                                        let ia_n = gb.add_parse_ascii_int(pa);
+                                        let ib_n = gb.add_parse_ascii_int(pb);
+                                        let res_n = gb.add_ints(&res);
+                                        let b = Builder::new(3);
+                                        let va = b.input(0);
+                                        let vb = b.input(1);
+                                        let vr = b.input(2);
+                                        let comb = if sub {
+                                            b.rr(Op::Sub, va, vb)
+                                        } else {
+                                            b.rr(Op::Add, va, vb)
+                                        };
+                                        let out_v = b.rr(Op::Add, comb, vr);
+                                        let sum_n = gb.add_prog_i64(
+                                            b.finish(&[(out_v, 8)]),
+                                            vec![ia_n, ib_n, res_n],
+                                            vec![],
+                                        );
+                                        let fmt_n = gb.add_prog_cells(
+                                            prog_fmt_int(false, 0),
+                                            vec![sum_n],
+                                            vec![],
+                                        );
+                                        let base_n = if q0 {
+                                            gb.add_quote_or_null(fmt_n, None)
+                                        } else {
+                                            fmt_n
+                                        };
+                                        let root = gb.add_patch(base_n, &exc_idx, &exc_vals);
                                         let (cand, cand_cost) = gb.finish(root).priced();
-                                        if cand_cost + 12 < best_cost {
+                                        if cand_cost + 6 < best_cost {
                                             best_blob = cand;
                                             best_cost = cand_cost;
                                             used_ext[cid] = true;
                                         }
                                     }
                                 }
-                                tried += 1;
-                                if tried >= 3 {
-                                    break;
+                            }
+                        }
+
+                        // 1c. Any-length Cross-Column ID Index (`payload.head` -> `commits[].sha`, etc.)!
+                        if let Some(fw) = fixed_id_widths[cid] {
+                            let mut tried = 0usize;
+                            for src_i in (0..cid).rev() {
+                                if fixed_id_widths[src_i] == Some(fw) && !occ_streams[src_i].is_empty()
+                                {
+                                    let src_vals = &occ_streams[src_i];
+                                    let mut lut: FastMap<&[u8], i64> =
+                                        fast_map_with_capacity(src_vals.len().min(4096));
+                                    for (idx, &sv) in src_vals.iter().enumerate() {
+                                        lut.entry(sv).or_insert(idx as i64);
+                                    }
+                                    let probe = occ_len.min(64);
+                                    let probe_hits = vals[..probe]
+                                        .iter()
+                                        .filter(|&&v| lut.contains_key(v))
+                                        .count();
+                                    if probe_hits * 5 >= probe {
+                                        let mut idxs = Vec::with_capacity(occ_len);
+                                        let mut exc_idx = Vec::new();
+                                        let mut exc_vals = Vec::new();
+                                        let mut last_idx = 0i64;
+                                        for (r, &v) in vals.iter().enumerate() {
+                                            if let Some(&pos) = lut.get(v) {
+                                                idxs.push(pos);
+                                                last_idx = pos;
+                                            } else {
+                                                idxs.push(last_idx);
+                                                exc_idx.push(r);
+                                                exc_vals.push(v);
+                                            }
+                                        }
+                                        if exc_idx.len() < occ_len {
+                                            let mut gb = GraphBuilder::new(occ_len);
+                                            let peer = gb.add_ext_peer(src_i as u32);
+                                            let idx_node = gb.add_mtf_ints(&idxs);
+                                            let indexed = gb.add_index_cells(peer, idx_node);
+                                            let root = gb.add_patch(indexed, &exc_idx, &exc_vals);
+                                            let (cand, cand_cost) = gb.finish(root).priced();
+                                            if cand_cost + 12 < best_cost {
+                                                best_blob = cand;
+                                                best_cost = cand_cost;
+                                                used_ext[cid] = true;
+                                            }
+                                        }
+                                    }
+                                    tried += 1;
+                                    if tried >= 3 {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if used_ext[cid] {
+                            choice = Choice::Horizontal;
+                        }
+                    }
+
+                    // A sample too small for the keyed search says nothing of it.
+                    let unjudged = pick.cells < KEYED_ROWS && occ_len >= KEYED_ROWS;
+                    if !must_standalone && occ_len >= 8 && (all || unjudged || want == Choice::Keyed) {
+                        // 1d. Keyed lookup: a value an earlier column holds in a record with the
+                        // same key.
+                        if let Some((plan, vids)) = shaped
+                            && let Some((cand, cand_cost)) = keyed_lookup(
+                                cid,
+                                occ_streams,
+                                preencoded_nested,
+                                |c| {
+                                    heads[c].get_or_init(|| {
+                                        occ_streams[c].iter().take(1024).copied().collect()
+                                    })
+                                },
+                                |c| interned[c].get_or_init(|| Interned::of(&occ_streams[c])),
+                                |key, at| align_cells(plan, vids, key, at).ok(),
+                            )
+                            && cand_cost + 12 < best_cost
+                        {
+                            best_blob = cand;
+                            best_cost = cand_cost;
+                            used_ext[cid] = true;
+                            choice = Choice::Keyed;
+                        }
+                    }
+
+                    if !must_standalone
+                        && occ_len >= 64
+                        && (all || want == Choice::Relation)
+                        && let Some((plan, vids)) = shaped
+                    {
+                        let tables = with_current(|d| d.and_then(|d| d.tables().cloned()));
+                        let n_table = tables.as_ref().map_or(0, |t| t.len());
+                        let context = RelationContext {
+                            column: cid,
+                            columns: occ_streams,
+                            plan,
+                            variant_ids: vids,
+                            tables: tables.as_deref(),
+                        };
+                        let peer_ok = |p: u32| match p & TABLE_PEER {
+                            0 => (p as usize) < cid,
+                            _ => ((p & !TABLE_PEER) as usize) < n_table,
+                        };
+                        for pack in &self.relations {
+                            if let Some(graph) = pack.try_encode(&context, self)
+                                && graph.rows as usize == occ_len
+                                && graph.ext_peers.iter().all(|&p| peer_ok(p))
+                                && !graph.ext_pool
+                                && graph.ext_dict.is_none()
+                            {
+                                let (cand, cost) = graph.priced();
+                                if cost + 32 < best_cost {
+                                    best_blob = cand;
+                                    best_cost = cost;
+                                    used_ext[cid] = true;
+                                    choice = Choice::Relation;
                                 }
                             }
                         }
                     }
-
-                    // 1d. Keyed lookup: a value an earlier column holds in a record with the
-                    // same key.
-                    if let Some((plan, vids)) = shaped
-                        && let Some((cand, cand_cost)) = keyed_lookup(
-                            cid,
-                            occ_streams,
-                            preencoded_nested,
-                            |c| {
-                                heads[c].get_or_init(|| {
-                                    occ_streams[c].iter().take(1024).copied().collect()
-                                })
-                            },
-                            |c| interned[c].get_or_init(|| Interned::of(&occ_streams[c])),
-                            |key, at| align_cells(plan, vids, key, at).ok(),
-                        )
-                        && cand_cost + 12 < best_cost
-                    {
-                        best_blob = cand;
-                        best_cost = cand_cost;
-                        used_ext[cid] = true;
+                    // The sample's choice may give nothing here, or cost a cell well over what
+                    // it did there: the column then gets the search.
+                    let per = |cost: usize, cells: usize| cost as u128 * cells as u128;
+                    let fits = best_cost < usize::MAX
+                        && per(best_cost, pick.cells) * 4 <= per(pick.cost, occ_len) * 5;
+                    if all || fits {
+                        break;
                     }
+                    want = Choice::Search;
                 }
-
-                if !must_standalone
-                    && occ_len >= 64
-                    && let Some((plan, vids)) = shaped
-                {
-                    let tables = with_current(|d| d.and_then(|d| d.tables().cloned()));
-                    let n_table = tables.as_ref().map_or(0, |t| t.len());
-                    let context = RelationContext {
-                        column: cid,
-                        columns: occ_streams,
-                        plan,
-                        variant_ids: vids,
-                        tables: tables.as_deref(),
-                    };
-                    let peer_ok = |p: u32| match p & TABLE_PEER {
-                        0 => (p as usize) < cid,
-                        _ => ((p & !TABLE_PEER) as usize) < n_table,
-                    };
-                    for pack in &self.relations {
-                        if let Some(graph) = pack.try_encode(&context, self)
-                            && graph.rows as usize == occ_len
-                            && graph.ext_peers.iter().all(|&p| peer_ok(p))
-                            && !graph.ext_pool
-                            && graph.ext_dict.is_none()
-                        {
-                            let (cand, cost) = graph.priced();
-                            if cost + 32 < best_cost {
-                                best_blob = cand;
-                                best_cost = cost;
-                                used_ext[cid] = true;
-                            }
-                        }
-                    }
-                }
+                chosen[cid] = Pick {
+                    choice,
+                    cells: occ_len,
+                    cost: best_cost,
+                };
 
                 if !used_ext[cid]
                     && !must_standalone
@@ -5435,6 +5603,7 @@ impl PackRegistry {
                 pool_rows,
                 col_blobs,
                 summaries,
+                picks: chosen,
             }
         })
     }

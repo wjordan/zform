@@ -213,8 +213,9 @@ pub fn encode_dense_block_columns(
     packs: &PackRegistry,
     backend: EntropyBackend,
     level: i32,
+    picks: Option<&[crate::packs::Pick]>,
 ) -> EncodedDenseBlock {
-    packs.encode_dense_block(
+    packs.encode_dense_block_picked(
         occ_streams,
         dict_groups,
         horiz_cands,
@@ -224,6 +225,7 @@ pub fn encode_dense_block_columns(
         paging,
         backend,
         level,
+        picks,
     )
 }
 

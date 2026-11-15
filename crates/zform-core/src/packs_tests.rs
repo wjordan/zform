@@ -2664,3 +2664,61 @@ fn text_pool_leaves_out_cells_of_one_length() {
     };
     assert!(pooled(0) && pooled(1) && !pooled(2));
 }
+
+#[test]
+fn a_sample_pick_is_tried_alone_unless_it_does_not_apply() {
+    let mut r = Rng::new(11);
+    // A counter, a category and addresses: an integer pack, the dictionary and the IPv4 pack.
+    let cols: Vec<Vec<String>> = vec![
+        (0..2000).map(|i| (1000 + 3 * i).to_string()).collect(),
+        (0..2000).map(|_| ["GET", "PUT", "HEAD"][r.below(3) as usize].to_string()).collect(),
+        (0..2000)
+            .map(|_| format!("10.{}.{}.{}", r.below(250), r.below(250), r.below(250)))
+            .collect(),
+    ];
+    let occ: Vec<Vec<&[u8]>> =
+        cols.iter().map(|c| c.iter().map(|v| v.as_bytes()).collect()).collect();
+    let encode = |occ: &[Vec<&[u8]>], picks: Option<&[Pick]>| {
+        PackRegistry::default().encode_dense_block_picked(
+            occ,
+            &[""; 3],
+            &[Vec::new(), Vec::new(), Vec::new()],
+            &mut [None, None, None],
+            &[false; 3],
+            None,
+            None,
+            EntropyBackend::Zstd,
+            3,
+            picks,
+        )
+    };
+    let full = encode(&occ, None);
+    let sample: Vec<Vec<&[u8]>> = occ.iter().map(|c| c[..PICK_CELLS].to_vec()).collect();
+    let picks = encode(&sample, None).picks;
+    // The winners, whatever came second.
+    let won = |p: &[Pick]| -> Vec<Cand> {
+        p.iter()
+            .map(|p| match p.choice {
+                Choice::Single(won, _) => won,
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    };
+    assert_eq!(won(&picks), won(&full.picks));
+    assert!(matches!(won(&picks)[..], [Some(a), None, Some(b)] if a != b));
+    assert!(picks.iter().all(|p| p.cells == PICK_CELLS));
+    assert_eq!(encode(&occ, Some(&picks)).col_blobs, full.col_blobs);
+    // A pack the cells do not fit, a relation the block lacks, a sample too small for its
+    // choice to count and a choice that cost the sample far less each leave the column to the
+    // search.
+    let pick = |choice, cells, cost| Pick { choice, cells, cost };
+    let cost = usize::MAX;
+    let stray = [
+        pick(picks[2].choice, PICK_CELLS, cost),
+        pick(Choice::Horizontal, PICK_CELLS, cost),
+        pick(picks[0].choice, PICK_CELLS - 1, cost),
+    ];
+    assert_eq!(encode(&occ, Some(&stray)).col_blobs, full.col_blobs);
+    let cheap = [picks[0], picks[1], pick(Choice::Single(None, None), PICK_CELLS, 1)];
+    assert_eq!(encode(&occ, Some(&cheap)).col_blobs, full.col_blobs);
+}

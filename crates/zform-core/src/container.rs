@@ -845,6 +845,9 @@ fn row_kinds(plan: &ModelPlan, variant_ids: &[u32]) -> u16 {
     kinds
 }
 
+/// Rows of a large block whose columns are searched in full ahead of the block's.
+const SAMPLE_ROWS: usize = 4096;
+
 /// Encodes one block against the library its model already has. `filter_bits` asks for its
 /// index pages as well.
 pub(crate) fn encode_block_fit(
@@ -1049,6 +1052,15 @@ fn encode_block_columns(
     filter_bits: Option<usize>,
     page_bytes: usize,
 ) -> PendingBlock {
+    // A large block is searched in full on rows from its middle; the block's columns then try
+    // what won there, which they would mostly pick again at many times the search.
+    let picks = (recs.len() >= 4 * SAMPLE_ROWS).then(|| {
+        let sample = &recs[(recs.len() - SAMPLE_ROWS) / 2..][..SAMPLE_ROWS];
+        let quiet = packs.for_sample();
+        encode_block_columns(sample, plan, &quiet, backend, level, None, 0)
+            .enc
+            .picks
+    });
     let _mixing = packs.encoding_scope();
     let split = split_records_with_plan(recs, plan);
     let n_cols = plan.columns.len();
@@ -1119,6 +1131,7 @@ fn encode_block_columns(
         packs,
         backend,
         level,
+        picks.as_deref(),
     );
 
     // Layout: row structure, shared dictionaries, text pool, column lengths, columns.
