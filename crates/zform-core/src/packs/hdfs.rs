@@ -90,30 +90,53 @@ impl RelationPack for HdfsRelations {
         // relations look a row or two back, then each block's other rows in file order. Block
         // ids are successive `java.util.Random` outputs, so blocks in allocation order make each
         // new id a short step from the one before. Rows naming no block follow in file order.
-        let (mut writes, mut others, mut rest) = (Vec::new(), Vec::new(), Vec::new());
+        let mut block_of: FastMap<&[u8], usize> = FastMap::default();
+        // By block: its generator state, and its group among the writes and among the others.
+        let (mut states, mut slots) = (Vec::new(), Vec::new());
+        // The writes' and the others' groups, each in order of first appearance.
+        let mut groups: [Vec<(usize, Vec<u32>)>; 2] = Default::default();
+        let mut rest = Vec::new();
         for (i, r) in recs.iter().enumerate() {
-            match block_token(r) {
-                Some(_) if WRITES.iter().any(|w| w.find(r).is_some()) => writes.push(i as u32),
-                Some(_) => others.push(i as u32),
-                None => rest.push(i as u32),
+            let Some(blk) = block_token(r) else {
+                rest.push(i as u32);
+                continue;
+            };
+            let kind = usize::from(!WRITES.iter().any(|w| w.find(r).is_some()));
+            let b = *block_of.entry(blk).or_insert_with(|| {
+                states.push(token_state(blk));
+                slots.push([usize::MAX; 2]);
+                states.len() - 1
+            });
+            let list = &mut groups[kind];
+            if slots[b][kind] == usize::MAX {
+                slots[b][kind] = list.len();
+                list.push((b, Vec::new()));
             }
+            list[slots[b][kind]].1.push(i as u32);
         }
-        if writes.is_empty() && others.is_empty() {
+        if rest.len() == recs.len() {
             return None;
         }
-        let (writes, others) = (by_block(recs, &writes), by_block(recs, &others));
-        let anchor = writes
+        // Groups go by the step from the first block's generator state to theirs; ids no
+        // generator made go last.
+        let anchor = groups.iter().flatten().find_map(|&(b, _)| states[b]);
+        let steps: Vec<_> = states
             .iter()
-            .chain(&others)
-            .find_map(|g| lcg_state(recs[g[0] as usize]));
+            .map(|&s| match (anchor, s) {
+                (Some(a), Some(s)) => (false, JavaLcgPack::distance(a, s)),
+                _ => (true, 0),
+            })
+            .collect();
         let mut order = Vec::with_capacity(recs.len());
-        for mut g in in_allocation_order(recs, writes, anchor) {
-            g.sort_by_cached_key(|&i| thread_id(recs[i as usize]));
-            order.extend(g);
+        for (kind, mut list) in groups.into_iter().enumerate() {
+            list.sort_by_key(|&(b, _)| steps[b]);
+            for (_, mut g) in list {
+                if kind == 0 {
+                    g.sort_by_cached_key(|&i| thread_id(recs[i as usize]));
+                }
+                order.extend(g);
+            }
         }
-        in_allocation_order(recs, others, anchor)
-            .into_iter()
-            .for_each(|g| order.extend(g));
         order.extend(rest);
         Some(order)
     }
@@ -221,37 +244,6 @@ fn replica(ctx: &RelationContext<'_, '_>, key: usize) -> Option<PayloadGraph> {
     Some(gb.finish(root))
 }
 
-/// `rows` grouped by their first block id, groups in order of first appearance.
-fn by_block(recs: &[&[u8]], rows: &[u32]) -> Vec<Vec<u32>> {
-    let mut at = std::collections::HashMap::new();
-    let mut groups: Vec<Vec<u32>> = Vec::new();
-    for &i in rows {
-        let b = block_token(recs[i as usize]).unwrap_or_default();
-        let g = *at.entry(b).or_insert_with(|| {
-            groups.push(Vec::new());
-            groups.len() - 1
-        });
-        groups[g].push(i);
-    }
-    groups
-}
-
-/// Groups by the step from `anchor` to their block id's generator state; ids no generator made
-/// go last.
-fn in_allocation_order(
-    recs: &[&[u8]],
-    mut groups: Vec<Vec<u32>>,
-    anchor: Option<u64>,
-) -> Vec<Vec<u32>> {
-    if let Some(anchor) = anchor {
-        groups.sort_by_cached_key(|g| match lcg_state(recs[g[0] as usize]) {
-            Some(s) => (false, JavaLcgPack::distance(anchor, s)),
-            None => (true, 0),
-        });
-    }
-    groups
-}
-
 /// The first `blk_<id>` token of a record.
 fn block_token(r: &[u8]) -> Option<&[u8]> {
     let s = BLK.find(r)?;
@@ -263,7 +255,11 @@ fn block_token(r: &[u8]) -> Option<&[u8]> {
 
 /// The `java.util.Random` state behind a record's first block id.
 fn lcg_state(r: &[u8]) -> Option<u64> {
-    let t = &block_token(r)?[4..];
+    token_state(block_token(r)?)
+}
+
+fn token_state(blk: &[u8]) -> Option<u64> {
+    let t = &blk[4..];
     let (neg, d) = match t.strip_prefix(b"-") {
         Some(d) => (true, d),
         None => (false, t),
