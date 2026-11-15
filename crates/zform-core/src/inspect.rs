@@ -650,6 +650,7 @@ impl Render<'_> {
             GraphNode::ParseAsciiInt { .. } => "ParseAsciiInt".into(),
             GraphNode::MatchIndex { .. } => "MatchIndex".into(),
             GraphNode::KeyedSum { .. } => "KeyedSum".into(),
+            GraphNode::RankedSum { .. } => "RankedSum".into(),
             GraphNode::ExtVariant => "Variant".into(),
             GraphNode::CellIds { .. } => "CellIds".into(),
             GraphNode::Interleave { .. } => "Interleave".into(),

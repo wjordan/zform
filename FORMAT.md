@@ -269,6 +269,7 @@ Unless typed otherwise, operands are `uvarint`. `ref` names an earlier node; `re
 | `26` | `ExtVariant` | None | Integers: for each cell of this column, its record's variant id |
 | `27` | `CellIds` | `cells: ref` | Integers: each cell's value id, the rank of its value's first occurrence |
 | `28` | `Interleave` | `sel: ref`, `streams: refs` | Integers: row `i` is the next unread value of `streams[sel[i]]`; every stream is read to its end |
+| `29` | `RankedSum` | `at: ref`, `picks: ref`, `deltas: ref`, `order: ref`, `cands: ref`, `width: u8` | Integers: a row with pick `0` yields `deltas[i]`. The others are taken in order of the integer in cell `at[i]` of `order` (parsed as by `ParseAsciiInt`), ties in row order. Rows of one order share the candidates of its first row: the distinct nonempty cells among `cands[width * at[i]..][..width]`, those that were picked in the last order they were candidates of first, each group in cell order. Pick `p` takes the `p`-th candidate that no earlier row of the order took and yields its sum plus `deltas[i]`, wrapping; a candidate's sum starts at the last sum yielded (0 at first) |
 
 `MtfFixed` keeps the last 64 items, most recent first. Code `0` consumes the next `width` fallback bytes and inserts that item. Code `k > 0` selects rank `k - 1` and moves it to the front. `MtfInts` uses the same code convention with integer misses.
 

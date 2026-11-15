@@ -1238,6 +1238,20 @@ pub enum GraphNode {
         keys: u16,
         deltas: u16,
     },
+    /// Sums on keys the rows do not name. Rows with a pick are taken in order of the integers
+    /// `order[at[i]]`, ties in row order; rows of one order share the first's candidates, the
+    /// distinct nonempty cells among the `width` of `cands` from `width * at[i]`, those that
+    /// stepped when last a candidate first. Pick `p` steps the `p`-th candidate no earlier row
+    /// of the order took: `deltas[i]` added to its sum, which starts at the last sum yielded
+    /// (0 at first). A row with pick `0` yields `deltas[i]` alone.
+    RankedSum {
+        at: u16,
+        picks: u16,
+        deltas: u16,
+        order: u16,
+        cands: u16,
+        width: u8,
+    },
     /// For each cell of this column, the variant id of its record.
     ExtVariant,
     /// Each cell's value id: the rank of its value's first occurrence.
@@ -1269,6 +1283,9 @@ impl GraphNode {
                 f(*deltas);
             }
             Self::CellIds { cells } => f(*cells),
+            Self::RankedSum { at, picks, deltas, order, cands, .. } => {
+                [*at, *picks, *deltas, *order, *cands].into_iter().for_each(f);
+            }
             Self::Interleave { sel, streams } => {
                 f(*sel);
                 for &x in streams {
@@ -1445,6 +1462,14 @@ impl GraphNode {
                 deltas: f(*deltas),
             },
             Self::CellIds { cells } => Self::CellIds { cells: f(*cells) },
+            Self::RankedSum { at, picks, deltas, order, cands, width } => Self::RankedSum {
+                at: f(*at),
+                picks: f(*picks),
+                deltas: f(*deltas),
+                order: f(*order),
+                cands: f(*cands),
+                width: *width,
+            },
             Self::Interleave { sel, streams } => Self::Interleave {
                 sel: f(*sel),
                 streams: streams.iter().map(|&x| f(x)).collect(),
@@ -2915,6 +2940,13 @@ fn encode_node_linked(n: &GraphNode, lib: Option<&Library>, out: &mut Vec<u8>) {
             put_uvarint(out, *sel as u64);
             put_u16_list(out, streams);
         }
+        GraphNode::RankedSum { at, picks, deltas, order, cands, width } => {
+            out.push(29);
+            for r in [at, picks, deltas, order, cands] {
+                put_uvarint(out, *r as u64);
+            }
+            out.push(*width);
+        }
     }
 }
 
@@ -3148,6 +3180,12 @@ fn decode_node(
                 return Err(Error::Format("Interleave without streams".into()));
             }
             Ok(GraphNode::Interleave { sel, streams })
+        }
+        29 => {
+            let mut r = || check_ref(cur.uvar()?);
+            let (at, picks, deltas, order, cands) = (r()?, r()?, r()?, r()?, r()?);
+            let width = cur.u8()?;
+            Ok(GraphNode::RankedSum { at, picks, deltas, order, cands, width })
         }
         21 => {
             if flag {
@@ -4075,6 +4113,17 @@ impl CoreDecoder {
                     }
                     Val::Ints(out)
                 }
+                GraphNode::RankedSum { at, picks, deltas, order, cands, width } => {
+                    Val::Ints(ranked_sum(
+                        as_ints(&vals[*at as usize])?,
+                        as_ints(&vals[*picks as usize])?,
+                        as_ints(&vals[*deltas as usize])?,
+                        as_cells(&vals[*order as usize])?,
+                        as_cells(&vals[*cands as usize])?,
+                        *width as usize,
+                        budget,
+                    )?)
+                }
                 GraphNode::CellIds { cells } => {
                     let c = as_cells(&vals[*cells as usize])?;
                     budget.check_alloc(c.len().saturating_mul(12), "CellIds")?;
@@ -4132,6 +4181,102 @@ fn keyed_sum(keys: &[i64], deltas: &[i64], budget: &DecodeBudget) -> Result<Vec<
         last = s.unwrap_or(last).wrapping_add(d);
         *s = Some(last);
         out.push(last);
+    }
+    Ok(out)
+}
+
+/// [`GraphNode::RankedSum`]'s keys: each one's sum, and whether it stepped when last a
+/// candidate. The writer walks its rows through the same state.
+#[derive(Default)]
+pub(crate) struct Ranked<'a> {
+    ids: FastMap<&'a [u8], u32>,
+    keys: Vec<(Option<i64>, bool)>,
+    last: i64,
+}
+
+impl<'a> Ranked<'a> {
+    /// A group's candidates, in pick order, as `left`.
+    pub(crate) fn open(&mut self, cells: impl Iterator<Item = &'a [u8]>, left: &mut Vec<u32>) {
+        left.clear();
+        for v in cells.filter(|v| !v.is_empty()) {
+            let next = self.keys.len() as u32;
+            let k = *self.ids.entry(v).or_insert(next);
+            if k == next {
+                self.keys.push((None, false));
+            }
+            if !left.contains(&k) {
+                left.push(k);
+            }
+        }
+        // Stable: candidates alike stay in cell order.
+        left.sort_by_key(|&k| !self.keys[k as usize].1);
+    }
+
+    pub(crate) fn keys(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub(crate) fn sum(&self, k: u32) -> i64 {
+        self.keys[k as usize].0.unwrap_or(self.last)
+    }
+
+    pub(crate) fn step(&mut self, k: u32, delta: i64) -> i64 {
+        self.last = self.sum(k).wrapping_add(delta);
+        self.keys[k as usize].0 = Some(self.last);
+        self.last
+    }
+
+    /// Ends a group of candidates `all`, `left` of them untaken.
+    pub(crate) fn close(&mut self, all: &[u32], left: &[u32]) {
+        for &k in all {
+            self.keys[k as usize].1 = !left.contains(&k);
+        }
+    }
+}
+
+/// The integer a `RankedSum` row is ordered by.
+pub(crate) fn ranked_order(cell: &[u8]) -> i64 {
+    parse_cell_ascii_i64(cell)
+}
+
+fn ranked_sum(
+    at: &[i64],
+    picks: &[i64],
+    deltas: &[i64],
+    order: &Cells,
+    cands: &Cells,
+    width: usize,
+    budget: &DecodeBudget,
+) -> Result<Vec<i64>> {
+    if at.len() != picks.len() || at.len() != deltas.len() {
+        return Err(Error::Format("RankedSum length mismatch".into()));
+    }
+    budget.check_alloc(at.len().saturating_mul(40), "RankedSum")?;
+    let mut rows = Vec::new();
+    for (i, (&a, &p)) in at.iter().zip(picks).enumerate() {
+        if p != 0 {
+            let cell = usize::try_from(a).ok().and_then(|a| order.get(a));
+            let cell = cell.ok_or_else(|| Error::Format("RankedSum row out of range".into()))?;
+            rows.push((ranked_order(cell), i));
+        }
+    }
+    rows.sort_unstable();
+    let mut out = deltas.to_vec();
+    let mut state = Ranked::default();
+    let (mut left, mut all) = (Vec::new(), Vec::new());
+    let mut j = 0;
+    while j < rows.len() {
+        let end = j + rows[j..].iter().take_while(|r| r.0 == rows[j].0).count();
+        let from = (at[rows[j].1] as usize).saturating_mul(width);
+        state.open((from..from.saturating_add(width)).filter_map(|c| cands.get(c)), &mut left);
+        all.clone_from(&left);
+        for &(_, i) in &rows[j..end] {
+            let p = usize::try_from(picks[i] - 1).ok().filter(|&p| p < left.len());
+            let p = p.ok_or_else(|| Error::Format("RankedSum pick out of range".into()))?;
+            out[i] = state.step(left.remove(p), deltas[i]);
+        }
+        state.close(&all, &left);
+        j = end;
     }
     Ok(out)
 }

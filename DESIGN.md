@@ -119,14 +119,19 @@ Counters a log keeps per entity are coded as keyed running sums: `KeyedSum` adds
 the state its key names and yields the sum (a new key starts from the last sum yielded), and
 key 0 passes the delta through. Keys come from the record's template (`ExtVariant` through a
 table) or from a value (`CellIds`, each value's first-occurrence rank); `Interleave` gives each
-template its own delta stream. HDFS times keep one clock for rows that start a block's write and
-one for rows that finish it; other rows code their time by recency. Thread ids keep a counter
-per datanode: the writer infers which replica logged a write row from the pipeline (a
-`Receiving` row names its upstream, `PacketResponder N` its place) and codes it as an index into
-the replica table, which lists each block's replicas in pipeline order; with write rows stored by
-template and pipeline place, those codes and the IP columns' repeat block after block. A keyed relation that loses a sample by under a
-half is tried again on the block, where its keys' first steps weigh less. On a 256 MB HDFS
-slice the two cut threads 25% and times 20%, the file 12%.
+template its own delta stream. HDFS times keep one clock for rows that start a block's write,
+and one for rows that finish it; other rows code their time by recency. Thread
+ids keep a counter per datanode: the writer infers which replica logged a write row from the
+pipeline (a `Receiving` row names its upstream, `PacketResponder N` its place) and codes it as
+an index into the replica table, which lists each block's replicas in pipeline order; with
+write rows stored by template and pipeline place, those codes and the IP columns' repeat block
+after block. A datanode deletes its blocks in id order and its deletion rows do not name it, so
+`RankedSum` takes those rows in id order, each a step on the clock of one of its block's
+replicas: the reader ranks first the replicas that deleted the last block they held, and the
+writer picks from that ranking the one whose clock is nearest. A keyed relation that loses a
+sample by under a half is tried again on the block, where its keys' first steps weigh less. On
+a 256 MB HDFS slice the write clocks and counters cut threads 25% and times 20%, the file 12%;
+on the whole log the deletion clocks cut times 18%, the file 3.5%.
 
 The registry accepts only graphs with earlier peer dependencies and at least 32 bytes of savings
 over the current choice, including graph and shared-code costs. Standalone columns skip relation

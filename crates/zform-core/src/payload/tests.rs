@@ -1456,6 +1456,47 @@ fn ext_align_requires_declared_peers_and_supplied_alignment() {
     }
 }
 
+/// `RankedSum` over a table two candidates wide, through the wire.
+fn ranked(
+    at: &[i64],
+    picks: &[i64],
+    deltas: &[i64],
+    order: &[&[u8]],
+    cands: &[&[u8]],
+) -> crate::wire::Result<Vec<i64>> {
+    let budget = DecodeBudget::default();
+    let mut gb = GraphBuilder::new(at.len());
+    let (at, picks, deltas) = (gb.add_ints(at), gb.add_ints(picks), gb.add_ints(deltas));
+    let (order, cands) = (gb.add_dict_cells(order), gb.add_dict_cells(cands));
+    let root = gb.push(GraphNode::RankedSum { at, picks, deltas, order, cands, width: 2 });
+    let g = PayloadGraph::decode(&gb.finish(root).encode(), &budget)?;
+    CoreDecoder::decode_ints(&g, &Default::default(), &budget)
+}
+
+#[test]
+fn ranked_sums_step_the_picked_candidate_in_key_order() {
+    let order: [&[u8]; 5] = [b"30", b"-5", b"7", b"40", b"50"];
+    let cands: [&[u8]; 10] = [b"a", b"b", b"b", b"c", b"a", b"", b"d", b"a", b"d", b"a"];
+    let at = [0, 1, 2, 0, 9, 1, 3, 4];
+    let picks = [1, 2, 1, 1, 0, 1, 1, 2];
+    let deltas = [5, 100, 3, 2, 42, 1, 1, 7];
+    // Order -5 goes first: `c` steps from 0, then `b` from `c`'s sum. Order 7 steps `a`.
+    // Order 30 holds `a` and `b`, which each step on. A row without a pick passes through.
+    // Orders 40 and 50 rank `a` ahead of `d`, which has yet to step.
+    let got = ranked(&at, &picks, &deltas, &order, &cands);
+    assert_eq!(got.unwrap(), [109, 100, 104, 103, 42, 101, 110, 117]);
+    let with = |i: usize, at_i: i64, pick: i64| {
+        let (mut at, mut picks) = (at, picks);
+        (at[i], picks[i]) = (at_i, pick);
+        ranked(&at, &picks, &deltas, &order, &cands)
+    };
+    assert!(with(2, 2, 2).is_err(), "pick past the candidates");
+    assert!(with(3, 0, 2).is_err(), "pick of a taken candidate");
+    assert!(with(2, 2, -1).is_err(), "negative pick");
+    assert!(with(4, 9, 1).is_err(), "row past the table");
+    assert!(ranked(&at, &picks[..7], &deltas, &order, &cands).is_err(), "length mismatch");
+}
+
 /// `KeyedSum(keys, Interleave(sel, streams))` as integers, through the wire.
 fn keyed(
     keys: &[i64],

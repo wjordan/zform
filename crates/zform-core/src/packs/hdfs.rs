@@ -1,5 +1,6 @@
 //! Writer-side HDFS relationships. Readers execute only ordinary payload operations.
 use super::*;
+use crate::payload::graph::{Ranked, ranked_order};
 use memchr::memmem::Finder;
 use std::mem::take;
 use std::sync::LazyLock;
@@ -68,12 +69,11 @@ impl RelationPack for HdfsRelations {
         if let Some(src) = task {
             return task_partition(ctx, src);
         }
+        let key = ctx.plan.columns[..cid].iter().position(|c| c.dict_group == "blk_id");
         if field(ctx.plan, cid) == Some(1) {
-            return clocks(ctx);
+            return clocks(ctx, key);
         }
-        let key = ctx.plan.columns[..cid]
-            .iter()
-            .position(|c| c.dict_group == "blk_id")?;
+        let key = key?;
         if size {
             return block_attribute(ctx, key, packs);
         }
@@ -421,15 +421,17 @@ fn seconds(v: &[u8]) -> Option<i64> {
 }
 
 /// Times of day of a block's writes, each a step from the last row of its clock: one for rows
-/// starting the write, one for rows finishing it. Other rows' times are coded as they are,
-/// where recency finds them. Each template's values are a stream of their own. The reader
-/// finds a row's clock and stream from its template.
-fn clocks(ctx: &RelationContext<'_, '_>) -> Option<PayloadGraph> {
+/// starting the write, one for rows finishing it. Deletions are steps on their datanodes'
+/// clocks, as [`deletions`] finds them. Other rows' times are coded as they are, where recency
+/// finds them. Each template's values are a stream of their own. The reader finds a row's
+/// clock and stream from its template.
+fn clocks(ctx: &RelationContext<'_, '_>, key: Option<usize>) -> Option<PayloadGraph> {
     let vals = &ctx.columns[ctx.column];
     let n_var = ctx.plan.variants.len();
-    // By variant: its clock (`0`: none) and its stream, numbering the variants holding the
-    // column; by stream, whether it is coded by recency.
+    // By variant: its clock (`0`: none), its stream, numbering the variants holding the
+    // column, and whether it deletes; by stream, whether it is coded by recency.
     let (mut clock, mut stream, mut recency) = (vec![0u8; n_var], vec![0u8; n_var], vec![]);
+    let mut deletes = vec![0u8; n_var];
     for (v, var) in ctx.plan.variants.iter().enumerate() {
         let PlanVariant::Shape(s) = var else { continue };
         if !s.slots.contains(&(ctx.column as u16)) {
@@ -443,6 +445,7 @@ fn clocks(ctx: &RelationContext<'_, '_>) -> Option<PayloadGraph> {
             Some(_) => 2,
             None => 0,
         };
+        deletes[v] = u8::from(has(DELETING));
         stream[v] = recency.len() as u8;
         recency.push(clock[v] == 0);
     }
@@ -479,17 +482,41 @@ fn clocks(ctx: &RelationContext<'_, '_>) -> Option<PayloadGraph> {
     if exc_idx.len() * 8 > vals.len() {
         return None;
     }
+    let marked: Vec<bool> = (vids.iter().zip(vals))
+        .map(|(&v, &t)| deletes[v as usize] > 0 && seconds(t).is_some())
+        .collect();
+    let picks = key.and_then(|key| deletions(ctx, key, &marked, &mut deltas));
+    if picks.is_some() {
+        // Steps, not times.
+        (0..n_var).filter(|&v| deletes[v] > 0).for_each(|v| recency[stream[v] as usize] = false);
+    }
     let mut gb = GraphBuilder::new(vals.len());
-    // Each variant's clock, then its stream.
+    // Each variant's clock, then its stream, then whether it deletes.
     let mut luts = clock.clone();
     luts.extend(&stream);
+    luts.extend(&deletes);
     let lut = gb.add_raw_bytes(&luts);
     let vid = gb.push(GraphNode::ExtVariant);
     let keys = gb.add_prog_i64(lut_prog(0), vec![vid], vec![lut]);
     let sel = gb.add_prog_i64(lut_prog(n_var as i64), vec![vid], vec![lut]);
     let sels: Vec<usize> = vids.iter().map(|&v| stream[v as usize] as usize).collect();
     let deltas = interleave(&mut gb, sel, &sels, &deltas, &recency);
-    let t = gb.push(GraphNode::KeyedSum { keys, deltas });
+    let mut t = gb.push(GraphNode::KeyedSum { keys, deltas });
+    if let (Some(picks), Some(key)) = (picks, key) {
+        let sel = gb.add_prog_i64(lut_prog(2 * n_var as i64), vec![vid], vec![lut]);
+        let sels: Vec<usize> = vids.iter().map(|&v| deletes[v as usize] as usize).collect();
+        let picks = interleave(&mut gb, sel, &sels, &picks, &[false; 2]);
+        let at = gb.add_ext_align(key as u32, Some(TABLE_PEER));
+        let (order, cands) = (gb.add_ext_peer(TABLE_PEER), gb.add_ext_peer(TABLE_PEER | 1));
+        t = gb.push(GraphNode::RankedSum {
+            at,
+            picks,
+            deltas: t,
+            order,
+            cands,
+            width: REPLICAS as u8,
+        });
+    }
     let b = Builder::new(1);
     // Sums stay within a few days of the base.
     let t_in = b.ri(Op::AddI, b.input(0), base + 4 * DAY);
@@ -504,6 +531,71 @@ fn clocks(ctx: &RelationContext<'_, '_>) -> Option<PayloadGraph> {
     let base = gb.add_prog_cells(prog_fmt_zero_padded(6, None), vec![hms], vec![]);
     let root = gb.add_patch(base, &exc_idx, &exc_vals);
     Some(gb.finish(root))
+}
+
+const DELETING: &[u8] = b"Deleting block";
+
+/// A datanode works through the blocks it is told to delete in order of their ids, so one
+/// node's deletions run on a clock of their own once the rows are taken in that order. Rows
+/// do not name the node: it is one of the block's replicas, and the reader ranks first those
+/// that deleted the last block they held. Each of the `marked` rows whose block the table
+/// holds has its time in `deltas` turned into a step on the replica it suits best; the picks
+/// that tell the reader which are returned, `0` for a row left as it was.
+fn deletions(
+    ctx: &RelationContext<'_, '_>,
+    key: usize,
+    marked: &[bool],
+    deltas: &mut [i64],
+) -> Option<Vec<i64>> {
+    let tables = ctx.tables.filter(|t| t.len() == 2)?;
+    let (blocks, ips) = (tables.col(0).ok()?, tables.col(1).ok()?);
+    let aligned = align_cells(ctx.plan, ctx.variant_ids, key, ctx.column).ok()?;
+    if aligned.len() != marked.len() {
+        return None;
+    }
+    let ids = tables.joint_ids(0, ctx.columns[key].iter().copied()).ok()?;
+    let row_of = |i: usize| ids[aligned[i] as usize] as usize;
+    let mut rows: Vec<(i64, usize)> = (0..marked.len())
+        .filter(|&i| marked[i])
+        .filter_map(|i| Some((ranked_order(blocks.get(row_of(i))?), i)))
+        .collect();
+    rows.sort_unstable();
+    let mut state = Ranked::default();
+    let (mut picks, mut steps) = (vec![0i64; marked.len()], deltas.to_vec());
+    let (mut left, mut all) = (Vec::new(), Vec::new());
+    let mut j = 0;
+    while j < rows.len() {
+        let end = j + rows[j..].iter().take_while(|r| r.0 == rows[j].0).count();
+        let group = &rows[j..end];
+        j = end;
+        let from = row_of(group[0].1) * REPLICAS;
+        state.open((from..from + REPLICAS).filter_map(|c| ips.get(c)), &mut left);
+        // One table row per order, with a replica for each of its deletions.
+        if group.len() > left.len() || group.iter().any(|r| row_of(r.1) * REPLICAS != from) {
+            continue;
+        }
+        all.clone_from(&left);
+        let cost = |c: &&[usize]| -> u32 {
+            (c.iter().zip(group)).map(|(&p, r)| bits(deltas[r.1] - state.sum(all[p]))).sum()
+        };
+        let chains = CHAINS.iter().map(|c| &c[..group.len()]);
+        let chain = chains.filter(|c| c.iter().all(|&p| p < all.len())).min_by_key(cost)?;
+        for (&p, &(_, i)) in chain.iter().zip(group) {
+            let at = left.iter().position(|&k| k == all[p])?;
+            let k = left.remove(at);
+            picks[i] = at as i64 + 1;
+            steps[i] = deltas[i] - state.sum(k);
+            state.step(k, steps[i]);
+        }
+        state.close(&all, &left);
+    }
+    // A clock pays once its node has rows to step between.
+    let n = picks.iter().filter(|&&p| p > 0).count();
+    if n < 4 * state.keys().max(4) {
+        return None;
+    }
+    deltas.copy_from_slice(&steps);
+    Some(picks)
 }
 
 /// The byte at `offset + x` of the program's buffer.
@@ -1297,6 +1389,72 @@ mod tests {
         let _scope = Scope::enter(Some(Arc::new(dict)));
         let got = decode_with(&plan, &vids, &cols, 2, &graph);
         assert!(got.iter().eq(cols[2].iter().map(|v| v.to_vec()).collect::<Vec<_>>().iter()));
+    }
+
+    #[test]
+    fn deletions_step_on_their_datanodes_clocks() {
+        use crate::{cells::Cells, dictionary::{Dictionary, Scope}, tables::Tables};
+        let mut plan = ModelPlan::residual_only();
+        plan.add_or_get_col_with_group("blk", "blk_id");
+        plan.add_or_get_col("date");
+        plan.add_or_get_col("time");
+        shape(&mut plan, &[b"", b" ", b" 19 INFO dfs.FSDataset: Deleting block blk_", b""], &[2, 3, 1]);
+        shape(&mut plan, &[b"", b" ", b" 9 INFO dfs.DataBlockScanner: Verification succeeded for blk_", b""], &[2, 3, 1]);
+        // Each node deletes its blocks in id order, a second on every other one.
+        let id = |b: usize| (b * 37 % 60) as i64 - 30;
+        let reps = |b: usize| [b % 5, (b + 1) % 5, (b + 3) % 5];
+        let mut by_id: Vec<usize> = (0..60).collect();
+        by_id.sort_by_key(|&b| id(b));
+        let (mut clock, mut seen) = ([1000i64, 1050, 1100, 1150, 1200], [0i64; 5]);
+        let mut times = vec![Vec::new(); 60];
+        for b in by_id {
+            for (r, n) in reps(b).into_iter().enumerate() {
+                // Some replicas are deleted in another block of the file.
+                if b % 4 == 0 && r == 1 {
+                    continue;
+                }
+                seen[n] += 1;
+                clock[n] += seen[n] % 2;
+                times[b].push(clock[n]);
+            }
+            times[b].sort_unstable();
+        }
+        let (mut cols, mut vids) = (vec![Vec::<Vec<u8>>::new(); 4], Vec::new());
+        let (mut keys, mut ips) = (Vec::new(), Vec::new());
+        let hms = |t: i64| format!("{:02}{:02}{:02}", t / 3600, t / 60 % 60, t % 60).into_bytes();
+        for b in 0..60 {
+            let blk = id(b).to_string().into_bytes();
+            keys.push(blk.clone());
+            ips.extend(reps(b).map(|n| format!("10.0.0.{n}").into_bytes()));
+            let scan = (b % 5 == 0).then_some((2, 5000 + b as i64));
+            for (v, t) in times[b].iter().map(|&t| (1, t)).chain(scan) {
+                vids.push(v);
+                cols[1].push(blk.clone());
+                cols[2].push(b"081109".to_vec());
+                cols[3].push(hms(t));
+            }
+        }
+        let cells = |v: &[Vec<u8>]| {
+            let lens: Vec<u32> = v.iter().map(|x| x.len() as u32).collect();
+            Cells::from_lens(v.concat(), &lens).unwrap()
+        };
+        let table = || Tables::from_cells(vec![cells(&keys), cells(&ips)], Vec::new);
+        let cols: Vec<Vec<&[u8]>> = cols.iter().map(|c| c.iter().map(|v| &v[..]).collect()).collect();
+        assert_eq!(field(&plan, 3), Some(1));
+        let tables = table();
+        let ctx = RelationContext {
+            tables: Some(&tables),
+            column: 3,
+            columns: &cols,
+            plan: &plan,
+            variant_ids: &vids,
+        };
+        let graph = HdfsRelations.try_encode(&ctx, &PackRegistry::default()).unwrap();
+        assert!(graph.nodes.iter().any(|n| matches!(n, GraphNode::RankedSum { .. })));
+        let dict = Dictionary::new(b"content".to_vec()).with_tables(table());
+        let _scope = Scope::enter(Some(Arc::new(dict)));
+        let got = decode_with(&plan, &vids, &cols, 3, &graph);
+        assert!(got.iter().eq(cols[3].iter().map(|v| v.to_vec()).collect::<Vec<_>>().iter()));
     }
 
     #[test]
