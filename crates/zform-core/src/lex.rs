@@ -75,13 +75,14 @@ pub fn parse_exact_int(src: &[u8]) -> Option<(i64, u8)> {
         sign_mode // 0 = normal, 1 = explicit '+', 2 = negative zero ("-0", "-00")
     };
     let fmt = (pad_width << 2) | eff_sign;
-    let mut check = [0u8; 24];
-    let n = format_exact_int_buf(val, fmt, &mut check);
-    if n == src.len() && short_eq(&check[..n], src) {
-        Some((val, fmt))
-    } else {
-        None
-    }
+    // Every spelling that parses this far reformats to itself: the sign is kept, and digits
+    // with a leading zero become exactly their own width of padding.
+    debug_assert!({
+        let mut check = [0u8; 24];
+        let n = format_exact_int_buf(val, fmt, &mut check);
+        check[..n] == *src
+    });
+    Some((val, fmt))
 }
 
 #[inline]
@@ -1058,6 +1059,29 @@ mod tests {
             let mut out = Vec::new();
             format_exact_decimal(m, sp, &mut out);
             assert_eq!(out, s.as_bytes());
+        }
+    }
+
+    #[test]
+    fn every_parsed_int_spelling_reformats_to_itself() {
+        let alphabet = b"019+-a";
+        let mut spellings: Vec<Vec<u8>> = vec![Vec::new()];
+        for _ in 0..5 {
+            let longer: Vec<Vec<u8>> = spellings
+                .iter()
+                .flat_map(|s| alphabet.iter().map(move |&c| [s.as_slice(), &[c]].concat()))
+                .collect();
+            spellings.extend(longer);
+        }
+        for edge in ["09223372036854775807", "-09223372036854775808", "+9223372036854775808"] {
+            spellings.push(edge.into());
+        }
+        for s in spellings {
+            if let Some((v, f)) = parse_exact_int(&s) {
+                let mut out = Vec::new();
+                format_exact_int(v, f, &mut out);
+                assert_eq!(out, s);
+            }
         }
     }
 
