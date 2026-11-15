@@ -42,10 +42,13 @@ instruction changes the decoder's contract; the format is experimental and is no
 
 A block of 16,384 records or more is searched in two steps. The writer runs the whole search
 on 4,096 records from the block's middle, then codes each column with the candidate that won
-there, and with the runner-up where that came within a quarter. A column gets the whole search
-when the sample held under 512 of its cells, or when its winner costs a cell a quarter more on
-the block than on the sample. Keyed lookups need 1,024 cells, so a smaller sample does not rule
-them out. On HDFS this removes a quarter of the encoding work for 0.003% more bytes.
+there, and with the runner-up where that came within a quarter. The candidate also repeats the
+sample's choices between integer codings (as they are, by difference, by recency) without
+building the alternatives. A choice more values could turn is made again: recency that lost
+only to its misses, a stream too short to judge. A column gets the whole search when the
+sample held under 512 of its cells, or when its winner costs a cell a quarter more on the
+block than on the sample; keyed lookups need 1,024 cells, so a smaller sample does not rule
+them out. On HDFS this removes 30% of the encoding work for 0.001% more bytes.
 
 Each model carries a library of shared programs, recurrences, and byte tables. Column graphs
 can name library entries and override a program's constants for the block, so code does not

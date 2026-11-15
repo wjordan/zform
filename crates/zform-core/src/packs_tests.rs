@@ -2711,7 +2711,12 @@ fn a_sample_pick_is_tried_alone_unless_it_does_not_apply() {
     // A pack the cells do not fit, a relation the block lacks, a sample too small for its
     // choice to count and a choice that cost the sample far less each leave the column to the
     // search.
-    let pick = |choice, cells, cost| Pick { choice, cells, cost };
+    let pick = |choice, cells, cost| Pick {
+        choice,
+        tapes: Default::default(),
+        cells,
+        cost,
+    };
     let cost = usize::MAX;
     let stray = [
         pick(picks[2].choice, PICK_CELLS, cost),
@@ -2719,6 +2724,46 @@ fn a_sample_pick_is_tried_alone_unless_it_does_not_apply() {
         pick(picks[0].choice, PICK_CELLS - 1, cost),
     ];
     assert_eq!(encode(&occ, Some(&stray)).col_blobs, full.col_blobs);
-    let cheap = [picks[0], picks[1], pick(Choice::Single(None, None), PICK_CELLS, 1)];
+    let cheap = [
+        picks[0].clone(),
+        picks[1].clone(),
+        pick(Choice::Single(None, None), PICK_CELLS, 1),
+    ];
     assert_eq!(encode(&occ, Some(&cheap)).col_blobs, full.col_blobs);
+}
+
+#[test]
+fn a_replayed_tape_codes_like_values_as_the_search_does_and_any_values_validly() {
+    use crate::payload::tape;
+    let mut r = Rng::new(5);
+    // Ids that come back, and a counter: recency wins the one, differences the other.
+    let ids = |n: usize, r: &mut Rng| texts((0..n).map(|_| 7_000_000 + 9973 * r.below(40) as i64));
+    let counter = |n: usize| texts((0..n as i64).map(|i| 500 + 17 * i));
+    let record = |rows: &[Vec<u8>]| {
+        let scope = tape::Scope::record();
+        let wire = ExactIntPack.try_encode(&refs(rows)).unwrap().encode();
+        (wire, scope.end())
+    };
+    let replay = |rows: &[Vec<u8>], tape: &[u8]| {
+        let scope = tape::Scope::replay(tape);
+        let wire = ExactIntPack.try_encode(&refs(rows)).unwrap().encode();
+        scope.end();
+        decode_and_compare(&wire, &refs(rows)).unwrap();
+        wire
+    };
+    let (sample_ids, sample_counter) = (ids(4096, &mut r), counter(4096));
+    let (_, t_ids) = record(&sample_ids);
+    let (_, t_counter) = record(&sample_counter);
+    // Recency, split, its codes as they are; and differences, too few bytes to say of what.
+    assert_eq!(t_ids, [0x31, 0x21, 0x10]);
+    assert_eq!(t_counter, [0x30, 0x10 | tape::OPEN]);
+
+    let (block_ids, block_counter) = (ids(16384, &mut r), counter(16384));
+    assert_eq!(replay(&block_ids, &t_ids), record(&block_ids).0);
+    assert_eq!(replay(&block_counter, &t_counter), record(&block_counter).0);
+    // A tape of other values costs bytes at most, as does one cut short or of no site.
+    assert!(replay(&block_ids, &t_counter).len() > record(&block_ids).0.len());
+    replay(&block_counter, &t_ids);
+    replay(&block_ids, &t_ids[..1]);
+    replay(&block_ids, &[0xff]);
 }

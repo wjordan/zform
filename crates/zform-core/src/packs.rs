@@ -22,6 +22,7 @@ use crate::payload::graph::{
 };
 use crate::payload::ir::{Builder, Len, Op, Program, V};
 use crate::payload::recur::RecurrenceSpec;
+use crate::payload::tape::{self, Site};
 use crate::wire::{EntropyBackend, compress_pages};
 
 mod bgl;
@@ -193,12 +194,36 @@ pub enum Choice {
 pub type Cand = Option<u16>;
 
 /// What coded a column on a sample of a block.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Pick {
     pub choice: Choice,
+    /// The choices made inside the candidate, and inside a single candidate's runner-up.
+    pub tapes: [Vec<u8>; 2],
     /// The sample's cells of the column, and the bytes they took.
     pub cells: usize,
     pub cost: usize,
+}
+
+/// A column's best single-column graph.
+struct Single {
+    graph: PayloadGraph,
+    /// Whether the graph is the raw fallback.
+    raw: bool,
+    won: Cand,
+    also: Option<Cand>,
+    tapes: [Vec<u8>; 2],
+}
+
+impl Single {
+    fn generic(graph: PayloadGraph) -> Self {
+        Self {
+            graph,
+            raw: false,
+            won: None,
+            also: None,
+            tapes: Default::default(),
+        }
+    }
 }
 
 /// Cells a sample needs of a column for its choice to stand for the block's.
@@ -428,28 +453,22 @@ impl PackRegistry {
     }
 
     fn encode_best_graph_inner(&self, rows: &[&[u8]], depth: usize) -> (PayloadGraph, bool) {
-        let (graph, raw, _) = self.encode_single(rows, depth, None);
-        (graph, raw)
+        let single = self.encode_single(rows, depth, None);
+        (single.graph, single.raw)
     }
 
-    /// The best single-column graph, whether it is the raw fallback, and the candidate that
-    /// won with its runner-up. `pick` names the candidates to try; the rest are searched only
-    /// where none of those applies.
-    fn encode_single(
-        &self,
-        rows: &[&[u8]],
-        depth: usize,
-        pick: Option<(Cand, Option<Cand>)>,
-    ) -> (PayloadGraph, bool, (Cand, Option<Cand>)) {
+    /// The best single-column graph. `pick` names the candidates to try, each making the
+    /// choices it made on the sample; the rest are searched only where none of those applies.
+    fn encode_single(&self, rows: &[&[u8]], depth: usize, pick: Option<&Pick>) -> Single {
         if rows.is_empty() {
-            return (PayloadGraph::empty(), false, (None, None));
+            return Single::generic(PayloadGraph::empty());
         }
         let n = rows.len();
         let first = rows[0];
         if rows.iter().all(|&r| r == first) {
             let mut gb = GraphBuilder::new(n);
             let root = gb.add_const_cells(first, n);
-            return (gb.finish(root), false, (None, None));
+            return Single::generic(gb.finish(root));
         }
 
         // JSON `"..."` / `null` wrapper peeling -> `GraphNode::QuoteOrNull` (decodes into lazy `Col::Quoted`!).
@@ -480,11 +499,14 @@ impl PackRegistry {
                     if !any_null {
                         let inner_rows: Vec<&[u8]> =
                             rows.iter().map(|r| &r[1..r.len() - 1]).collect();
-                        let (inner_g, raw_like, won) = self.encode_single(&inner_rows, 1, pick);
+                        let inner = self.encode_single(&inner_rows, 1, pick);
                         let mut gb = GraphBuilder::new(n);
-                        let inner_root = gb.merge_graph(&inner_g);
+                        let inner_root = gb.merge_graph(&inner.graph);
                         let q_root = gb.add_quote_or_null(inner_root, None);
-                        return (gb.finish(q_root), raw_like, won);
+                        return Single {
+                            graph: gb.finish(q_root),
+                            ..inner
+                        };
                     }
                     let mut non_null: Vec<&[u8]> = Vec::with_capacity(n);
                     let mut row_map: Vec<i64> = Vec::with_capacity(n);
@@ -498,12 +520,16 @@ impl PackRegistry {
                         }
                     }
                     if !non_null.is_empty() {
-                        let (inner_g, _, won) = self.encode_single(&non_null, 1, pick);
+                        let inner = self.encode_single(&non_null, 1, pick);
                         let mut gb = GraphBuilder::new(n);
-                        let inner_root = gb.merge_graph(&inner_g);
+                        let inner_root = gb.merge_graph(&inner.graph);
                         let map_node = gb.add_ints(&row_map);
                         let q_root = gb.add_quote_or_null(inner_root, Some(map_node));
-                        return (gb.finish(q_root), false, won);
+                        return Single {
+                            graph: gb.finish(q_root),
+                            raw: false,
+                            ..inner
+                        };
                     }
                 }
             }
@@ -516,9 +542,15 @@ impl PackRegistry {
             let raw = matches!(gb.nodes[root as usize], GraphNode::SliceBuf { .. });
             (gb.finish(root), raw)
         };
-        if let Some((first, also)) = pick {
+        if let Some(Pick {
+            choice: Choice::Single(first, also),
+            tapes,
+            ..
+        }) = pick
+        {
             let mut best: Option<(usize, PayloadGraph, bool, Cand)> = None;
-            for cand in std::iter::once(first).chain(also) {
+            for (&cand, tape) in std::iter::once(first).chain(also).zip(tapes) {
+                let scope = tape::Scope::replay(tape);
                 let got = match cand {
                     None => Some(base()),
                     Some(k) => self
@@ -528,6 +560,7 @@ impl PackRegistry {
                         .and_then(|p| p.try_encode(rows))
                         .map(|g| (g, false)),
                 };
+                scope.end();
                 if let Some((graph, raw)) = got {
                     let cost = graph.cost();
                     if best.as_ref().is_none_or(|b| cost < b.0) {
@@ -535,15 +568,23 @@ impl PackRegistry {
                     }
                 }
             }
-            if let Some((_, graph, raw, cand)) = best {
-                return (graph, raw, (cand, None));
+            if let Some((_, graph, raw, won)) = best {
+                return Single {
+                    graph,
+                    raw,
+                    won,
+                    also: None,
+                    tapes: Default::default(),
+                };
             }
         }
 
+        let scope = tape::Scope::record();
         let (mut best_graph, is_raw_fallback) = base();
+        let mut best_tape = scope.end();
         let mut best_len = best_graph.cost();
         let mut won = None;
-        let mut second: Option<(usize, Cand)> = None;
+        let mut second: Option<(usize, Cand, Vec<u8>)> = None;
 
         // Ultra-low-cardinality categorical columns (`<= 8` unique values across `>= 64` rows,
         // already <1 byte/row as a dictionary) cannot be meaningfully beaten by structural packs
@@ -563,30 +604,43 @@ impl PackRegistry {
             );
         let profile = ColumnProfile::sample(rows);
         if is_tiny_dict && !(profile.min_len == profile.max_len && profile.min_len <= 16) {
-            return (best_graph, false, (None, None));
+            return Single {
+                tapes: [best_tape, Vec::new()],
+                ..Single::generic(best_graph)
+            };
         }
 
         for (k, pack) in self.packs.iter().enumerate() {
             if !pack.precheck(&profile) {
                 continue;
             }
-            if let Some(cand) = pack.try_encode(rows) {
+            let scope = tape::Scope::record();
+            let cand = pack.try_encode(rows);
+            let tape = scope.end();
+            if let Some(cand) = cand {
                 let clen = cand.cost();
                 if clen < best_len {
-                    second = Some((best_len, won));
+                    second = Some((best_len, won, std::mem::replace(&mut best_tape, tape)));
                     best_len = clen;
                     best_graph = cand;
                     won = Some(k as u16);
-                } else if second.is_none_or(|s| clen < s.0) {
-                    second = Some((clen, Some(k as u16)));
+                } else if second.as_ref().is_none_or(|s| clen < s.0) {
+                    second = Some((clen, Some(k as u16), tape));
                 }
             }
         }
         // A runner-up this close on a sample may win on the block.
-        let also = second
-            .filter(|&(len, _)| len * 4 <= best_len * 5)
-            .map(|s| s.1);
-        (best_graph, is_raw_fallback && won.is_none(), (won, also))
+        let (also, also_tape) = second
+            .filter(|s| s.0 * 4 <= best_len * 5)
+            .map(|s| (s.1, s.2))
+            .unzip();
+        Single {
+            graph: best_graph,
+            raw: is_raw_fallback && won.is_none(),
+            won,
+            also,
+            tapes: [best_tape, also_tape.unwrap_or_default()],
+        }
     }
 }
 
@@ -1772,30 +1826,44 @@ impl CodecPack for ExactIntPack {
             return None;
         }
 
-        let mut deltas = Vec::with_capacity(vals.len());
-        deltas.push(0);
-        for w in vals.windows(2) {
-            deltas.push(w[1].wrapping_sub(w[0]));
-        }
-
-        let mut gb_dir = GraphBuilder::new(rows.len());
         // Ids that come back (an actor, a repository) are recent ones again.
-        let dir_in = gb_dir.add_mtf_ints(&vals);
-        let dir_cells = gb_dir.add_prog_cells(prog_fmt_int(false, 0), vec![dir_in], vec![]);
-        let dir_root = gb_dir.add_patch(dir_cells, &exc_idx, &exc_vals);
-        let g_dir = gb_dir.finish(dir_root);
-
-        let mut gb_del = GraphBuilder::new(rows.len());
-        let del_in = gb_del.add_ints(&deltas);
-        let del_cells = gb_del.add_prog_cells(prog_fmt_int(true, vals[0]), vec![del_in], vec![]);
-        let del_root = gb_del.add_patch(del_cells, &exc_idx, &exc_vals);
-        let g_del = gb_del.finish(del_root);
-
-        if g_del.cost() <= g_dir.cost() {
-            Some(g_del)
-        } else {
-            Some(g_dir)
+        let recent = || {
+            let mut gb = GraphBuilder::new(rows.len());
+            let ints = gb.add_mtf_ints(&vals);
+            let cells = gb.add_prog_cells(prog_fmt_int(false, 0), vec![ints], vec![]);
+            let root = gb.add_patch(cells, &exc_idx, &exc_vals);
+            gb.finish(root)
+        };
+        let stepped = || {
+            let mut gb = GraphBuilder::new(rows.len());
+            let ints = gb.add_ints(&crate::payload::graph::deltas(&vals));
+            let cells = gb.add_prog_cells(prog_fmt_int(true, vals[0]), vec![ints], vec![]);
+            let root = gb.add_patch(cells, &exc_idx, &exc_vals);
+            gb.finish(root)
+        };
+        match tape::recorded(Site::ExactInt) {
+            Some(1) => return Some(recent()),
+            Some(0) => return Some(stepped()),
+            _ => {}
         }
+        let scope = tape::Scope::record();
+        let g_dir = recent();
+        let t_dir = scope.end();
+        let scope = tape::Scope::record();
+        let g_del = stepped();
+        let t_del = scope.end();
+        let (c_del, c_dir) = (g_del.cost(), g_dir.cost());
+        // More values favour recency, whose misses thin out: differences are replayed from a
+        // clear win, or where recency is ruled out.
+        let ruled_out = t_dir.first() == Some(&((Site::Mtf as u8) << 4));
+        if c_del > c_dir {
+            tape::note(Site::ExactInt, 1, &t_dir);
+        } else if ruled_out || tape::clear(c_del, c_dir) {
+            tape::note(Site::ExactInt, 0, &t_del);
+        } else {
+            tape::note(Site::ExactInt, tape::OPEN, &[]);
+        }
+        Some(if c_del <= c_dir { g_del } else { g_dir })
     }
 }
 
@@ -4908,10 +4976,11 @@ impl PackRegistry {
             let mut summaries = Vec::with_capacity(n_cols);
             let unpicked = Pick {
                 choice: Choice::Search,
+                tapes: Default::default(),
                 cells: 0,
                 cost: 0,
             };
-            let mut chosen = vec![unpicked; n_cols];
+            let mut chosen = vec![unpicked.clone(); n_cols];
             let mut used_ext = vec![false; n_cols];
             let mut raw_backed = vec![false; n_cols];
             let mut fixed_id_widths = vec![None::<usize>; n_cols];
@@ -4967,30 +5036,36 @@ impl PackRegistry {
                 }
 
                 let must_standalone = standalone.get(cid).copied().unwrap_or(false);
-                let pick = picks
-                    .and_then(|p| p.get(cid).copied())
-                    .filter(|p| p.cells >= PICK_CELLS.min(occ_len))
-                    .unwrap_or(Pick {
-                        cells: occ_len,
-                        ..unpicked
-                    });
-                let single = |pick| {
-                    let (graph, raw, (won, also)) = self.encode_single(vals, 0, pick);
-                    (graph.priced(), raw, Choice::Single(won, also))
+                let whole = Pick {
+                    cells: occ_len,
+                    ..unpicked.clone()
                 };
-                let (mut best_blob, mut best_cost, mut is_raw_fb, mut choice);
+                let pick = picks
+                    .and_then(|p| p.get(cid))
+                    .filter(|p| p.cells >= PICK_CELLS.min(occ_len))
+                    .unwrap_or(&whole);
+                let (mut best_blob, mut best_cost, mut is_raw_fb, mut choice, mut tapes);
                 let mut want = pick.choice;
                 loop {
                     let all = want == Choice::Search;
                     (best_blob, best_cost, is_raw_fb, choice) = (Vec::new(), usize::MAX, false, want);
+                    tapes = Default::default();
                     used_ext[cid] = false;
-                    if all {
-                        ((best_blob, best_cost), is_raw_fb, choice) = single(None);
-                    } else if let Choice::Single(first, also) = want {
-                        ((best_blob, best_cost), is_raw_fb, choice) = single(Some((first, also)));
+                    if all || matches!(want, Choice::Single(..)) {
+                        let single = self.encode_single(vals, 0, (!all).then_some(pick));
+                        (best_blob, best_cost) = single.graph.priced();
+                        is_raw_fb = single.raw;
+                        choice = Choice::Single(single.won, single.also);
+                        tapes = single.tapes;
                     }
+                    // What a candidate chose on the sample it chooses again; another records.
+                    let scope = |c: Choice| match want == c {
+                        true => tape::Scope::replay(&pick.tapes[0]),
+                        false => tape::Scope::record(),
+                    };
 
                     if !must_standalone && occ_len >= 8 && (all || want == Choice::Horizontal) {
+                        let scope = scope(Choice::Horizontal);
                         let cands = horiz_cands.get(cid).map_or(&[][..], |v| v.as_slice());
 
                         // 1a. Equal-length `ExactCopy` & `SubstringInterp`.
@@ -5269,8 +5344,10 @@ impl PackRegistry {
                             }
                         }
 
+                        let tape = scope.end();
                         if used_ext[cid] {
                             choice = Choice::Horizontal;
+                            tapes = [tape, Vec::new()];
                         }
                     }
 
@@ -5279,8 +5356,9 @@ impl PackRegistry {
                     if !must_standalone && occ_len >= 8 && (all || unjudged || want == Choice::Keyed) {
                         // 1d. Keyed lookup: a value an earlier column holds in a record with the
                         // same key.
-                        if let Some((plan, vids)) = shaped
-                            && let Some((cand, cand_cost)) = keyed_lookup(
+                        let scope = scope(Choice::Keyed);
+                        let found = shaped.and_then(|(plan, vids)| {
+                            keyed_lookup(
                                 cid,
                                 occ_streams,
                                 preencoded_nested,
@@ -5292,12 +5370,16 @@ impl PackRegistry {
                                 |c| interned[c].get_or_init(|| Interned::of(&occ_streams[c])),
                                 |key, at| align_cells(plan, vids, key, at).ok(),
                             )
+                        });
+                        let tape = scope.end();
+                        if let Some((cand, cand_cost)) = found
                             && cand_cost + 12 < best_cost
                         {
                             best_blob = cand;
                             best_cost = cand_cost;
                             used_ext[cid] = true;
                             choice = Choice::Keyed;
+                            tapes = [tape, Vec::new()];
                         }
                     }
 
@@ -5320,7 +5402,10 @@ impl PackRegistry {
                             _ => ((p & !TABLE_PEER) as usize) < n_table,
                         };
                         for pack in &self.relations {
-                            if let Some(graph) = pack.try_encode(&context, self)
+                            let scope = scope(Choice::Relation);
+                            let graph = pack.try_encode(&context, self);
+                            let tape = scope.end();
+                            if let Some(graph) = graph
                                 && graph.rows as usize == occ_len
                                 && graph.ext_peers.iter().all(|&p| peer_ok(p))
                                 && !graph.ext_pool
@@ -5332,6 +5417,7 @@ impl PackRegistry {
                                     best_cost = cost;
                                     used_ext[cid] = true;
                                     choice = Choice::Relation;
+                                    tapes = [tape, Vec::new()];
                                 }
                             }
                         }
@@ -5348,6 +5434,7 @@ impl PackRegistry {
                 }
                 chosen[cid] = Pick {
                     choice,
+                    tapes,
                     cells: occ_len,
                     cost: best_cost,
                 };

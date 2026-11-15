@@ -16,6 +16,7 @@ pub mod ir;
 pub mod library;
 pub mod recur;
 mod rice;
+pub(crate) mod tape;
 
 #[cfg(test)]
 mod tests;

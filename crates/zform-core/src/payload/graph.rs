@@ -19,6 +19,7 @@ use super::engine::CompiledProgram;
 use super::ir::{Builder, Invalid, Len, Op, Program, TableBuf, Width};
 use super::library::{Code, Library, code_discount, table_bytes};
 use super::recur::{CompiledRecurrence, RecurrenceSpec};
+use super::tape::{self, Site};
 
 thread_local! {
     static ENC_OPTS: Cell<(EntropyBackend, i32)> =
@@ -238,6 +239,14 @@ pub(crate) type FastSet<K> =
 
 pub(crate) fn fast_map_with_capacity<K, V>(cap: usize) -> FastMap<K, V> {
     FastMap::with_capacity_and_hasher(cap, core::hash::BuildHasherDefault::default())
+}
+
+/// Each value less the one before it, the first less zero taken as zero.
+pub(crate) fn deltas(vals: &[i64]) -> Vec<i64> {
+    let mut out = Vec::with_capacity(vals.len());
+    out.push(0);
+    out.extend(vals.windows(2).map(|w| w[1].wrapping_sub(w[0])));
+    out
 }
 
 /// Domain-agnostic integer sequence transport.
@@ -2079,7 +2088,16 @@ impl GraphBuilder {
     }
 
     pub fn add_ints(&mut self, vals: &[i64]) -> u16 {
+        match tape::recorded(Site::Ints) {
+            Some(1) if !vals.is_empty() => {
+                return self.push_deltas(vals[0], IntStream::auto_encode(&deltas(vals)));
+            }
+            Some(0) => return self.push(GraphNode::IntStream(IntStream::auto_encode(vals))),
+            _ => {}
+        }
         let direct = IntStream::auto_encode(vals);
+        // Short streams and those whose head rules differences out say little of longer ones.
+        let mut chose = tape::OPEN;
         if vals.len() >= 16 {
             let mut b_dir = Vec::new();
             direct.encode(&mut b_dir);
@@ -2118,25 +2136,28 @@ impl GraphBuilder {
                     d_span < v_span || d_runs < v_runs || small_d * 4 >= k
                 };
                 if try_delta {
-                    let mut deltas = Vec::with_capacity(vals.len());
-                    deltas.push(0);
-                    for w in vals.windows(2) {
-                        deltas.push(w[1].wrapping_sub(w[0]));
-                    }
-                    let d_stream = IntStream::auto_encode(&deltas);
+                    let d_stream = IntStream::auto_encode(&deltas(vals));
                     let mut b_del = Vec::new();
                     d_stream.encode(&mut b_del);
                     if b_del.len() + 24 < b_dir.len() {
-                        let dn = self.push(GraphNode::IntStream(d_stream));
-                        let sb = Builder::new(1);
-                        let x = sb.input(0);
-                        let s = sb.scan_add(x, vals[0]);
-                        return self.add_prog_i64(sb.finish(&[(s, 8)]), vec![dn], vec![]);
+                        tape::note(Site::Ints, 1, &[]);
+                        return self.push_deltas(vals[0], d_stream);
                     }
+                    chose = 0;
                 }
             }
         }
+        tape::note(Site::Ints, chose, &[]);
         self.push(GraphNode::IntStream(direct))
+    }
+
+    /// Integers as a running sum of `d_stream` from `first`.
+    fn push_deltas(&mut self, first: i64, d_stream: IntStream) -> u16 {
+        let dn = self.push(GraphNode::IntStream(d_stream));
+        let sb = Builder::new(1);
+        let x = sb.input(0);
+        let s = sb.scan_add(x, first);
+        self.add_prog_i64(sb.finish(&[(s, 8)]), vec![dn], vec![])
     }
 
     /// Predicts signed lanes when their deltas need materially fewer bits. Prediction is
@@ -2322,8 +2343,37 @@ impl GraphBuilder {
     }
 
     pub fn add_mtf_ints(&mut self, vals: &[i64]) -> u16 {
+        // The graph, its root and the node of its codes.
+        let split = |codes: &[i64], misses: &[i64]| {
+            let mut gb = Self::new(vals.len());
+            let codes_id = gb.add_ints(codes);
+            // How the misses of a few values code says little of the misses of many.
+            let apart = tape::Scope::apart();
+            let misses_id = gb.add_ints(misses);
+            drop(apart);
+            let root = gb.push(GraphNode::MtfInts {
+                codes: codes_id,
+                misses: misses_id,
+            });
+            (gb, root, codes_id)
+        };
+        match tape::recorded(Site::Mtf) {
+            Some(1) => {
+                let (codes, misses) = mtf_split(vals);
+                let (gb, root, _) = split(&codes, &misses);
+                return self.merge_subgraph(gb, root);
+            }
+            Some(0) => return self.add_ints(vals),
+            _ => {}
+        }
+        // Whatever is not worth splitting is coded as it is. More values may be worth it.
+        let plain = |gb: &mut Self| {
+            tape::note(Site::Mtf, tape::OPEN, &[]);
+            let _apart = tape::Scope::apart();
+            gb.add_ints(vals)
+        };
         if vals.len() < 64 {
-            return self.add_ints(vals);
+            return plain(self);
         }
         let lookback = 512;
         let head = &vals[..vals.len().min(2048)];
@@ -2335,36 +2385,49 @@ impl GraphBuilder {
             .filter(|&(i, &v)| prior.insert(v, i).is_some_and(|j| j + lookback >= i))
             .count();
         if near_hits * 10 < head.len() {
-            return self.add_ints(vals);
+            if head.len() < 2048 {
+                return plain(self);
+            }
+            // Values that do not come back in a head this long do not later.
+            let scope = tape::Scope::record();
+            let mut tmp = Self::new(vals.len());
+            let root = tmp.add_ints(vals);
+            tape::note(Site::Mtf, 0, &scope.end());
+            return self.merge_subgraph(tmp, root);
         }
 
         let (codes, misses) = mtf_split(vals);
         if misses.len() * 8 >= vals.len() * 7 {
-            return self.add_ints(vals);
+            return plain(self);
         }
 
+        let wire_len = |nodes: &[GraphNode]| {
+            nodes.iter().fold(0usize, |acc, n| {
+                let mut b = Vec::new();
+                encode_node(n, &mut b);
+                acc + b.len()
+            })
+        };
+        let scope = tape::Scope::record();
         let mut tmp_dir = Self::new(vals.len());
         let r_dir = tmp_dir.add_ints(vals);
-        let mut tmp_mtf = Self::new(vals.len());
-        let c_id = tmp_mtf.add_ints(&codes);
-        let m_id = tmp_mtf.add_ints(&misses);
-        let r_mtf = tmp_mtf.push(GraphNode::MtfInts {
-            codes: c_id,
-            misses: m_id,
-        });
-        let dir_wire_len = tmp_dir.nodes.iter().fold(0usize, |acc, n| {
-            let mut b = Vec::new();
-            encode_node(n, &mut b);
-            acc + b.len()
-        });
-        let mtf_wire_len = tmp_mtf.nodes.iter().fold(0usize, |acc, n| {
-            let mut b = Vec::new();
-            encode_node(n, &mut b);
-            acc + b.len()
-        });
+        let t_dir = scope.end();
+        let scope = tape::Scope::record();
+        let (tmp_mtf, r_mtf, codes_id) = split(&codes, &misses);
+        let t_mtf = scope.end();
+        let dir_wire_len = wire_len(&tmp_dir.nodes);
+        let mtf_wire_len = wire_len(&tmp_mtf.nodes);
         if mtf_wire_len + 32 < dir_wire_len {
+            tape::note(Site::Mtf, 1, &t_mtf);
             self.merge_subgraph(tmp_mtf, r_mtf)
         } else {
+            // Among more values fewer are misses, and the values span more: the split loses
+            // for good only where its codes alone cost well over what the values do.
+            let codes_wire_len = wire_len(&tmp_mtf.nodes[..=codes_id as usize]);
+            match dir_wire_len * 10 <= codes_wire_len * 9 {
+                true => tape::note(Site::Mtf, 0, &t_dir),
+                false => tape::note(Site::Mtf, tape::OPEN, &[]),
+            }
             self.merge_subgraph(tmp_dir, r_dir)
         }
     }
