@@ -1,6 +1,7 @@
 //! Writer-side HDFS relationships. Readers execute only ordinary payload operations.
 use super::*;
 use memchr::memmem::Finder;
+use std::mem::take;
 use std::sync::LazyLock;
 
 // Prebuilt searchers: these run once or more per record.
@@ -162,7 +163,8 @@ impl RelationPack for HdfsRelations {
         for (g, &(_, other, n)) in groups.iter().enumerate() {
             if !other {
                 let e = end[g] as usize;
-                order[e - n as usize..e].sort_by_key(|&i| of_row[i as usize].1);
+                let rows = &mut order[e - n as usize..e];
+                rows.sort_by_key(|&i| of_row[i as usize].1);
             }
         }
         Some(order)
@@ -170,40 +172,77 @@ impl RelationPack for HdfsRelations {
 }
 
 /// The table of each block's replicas, from the NameNode's `addStoredBlock` lines: a row per
-/// block id, in allocation order, and its first [`REPLICAS`] datanodes at a fixed stride, in the
-/// order [`HdfsRelations::row_order`] stores them, so a block's rows find them in sequence.
+/// block id, in allocation order, and its first [`REPLICAS`] datanodes at a fixed stride, in
+/// pipeline order where the block's [`pipeline`] is clear and else as `addStoredBlock` lists them.
 #[derive(Default)]
 struct Replicas {
     rows: Vec<(Option<u64>, u64, Vec<u8>, Vec<u8>)>,
+    /// Datanodes' write rows: block id and nodes by [`hash`].
+    writes: Vec<(u64, Role, u64, Said<u64>)>,
 }
 
 const ADDED: &[u8] = b"addStoredBlock: blockMap updated: ";
 /// HDFS's default replication: datanodes past it are patched where a block names them.
 const REPLICAS: usize = 3;
 
+/// Each record of `raw` holding a match `hits` finds, `w` bytes long, with its offset in it.
+fn records_with<'a>(
+    hits: impl Iterator<Item = usize>,
+    raw: &'a [u8],
+    spans: &[(u32, u32)],
+    w: usize,
+    mut each: impl FnMut(&'a [u8], usize),
+) {
+    // One search over the chunk; hits lie a few records apart.
+    let mut next = 0;
+    for at in hits {
+        let i = next + spans[next..].iter().take_while(|&&(_, e)| e as usize <= at).count();
+        let Some(&(s, e)) = spans.get(i) else {
+            break;
+        };
+        next = i + 1;
+        let (s, e) = (s as usize, e as usize);
+        if at >= s && at + w <= e {
+            each(&raw[s..e], at - s);
+        }
+    }
+}
+
+/// Names compared by hash: a collision only misplaces a pipeline.
+fn hash(v: &[u8]) -> u64 {
+    use core::hash::Hasher;
+    let mut h = crate::payload::graph::FastHasher::default();
+    h.write(v);
+    h.finish()
+}
+
 impl TableBuilder for Replicas {
     fn push(&mut self, raw: &[u8], spans: &[(u32, u32)]) {
-        // One search over the chunk: few records match.
-        let mut next = 0;
-        for at in ADDED_AT.find_iter(raw) {
-            let i = next + spans[next..].partition_point(|&(_, e)| e as usize <= at);
-            let Some(&(s, e)) = spans.get(i) else {
-                break;
-            };
-            next = i + 1;
-            let (s, e) = (s as usize, e as usize);
-            if at < s || at + ADDED.len() > e {
-                continue;
-            }
-            let rec = &raw[s..e];
-            let ip = &raw[at + ADDED.len()..e];
+        records_with(ADDED_AT.find_iter(raw), raw, spans, ADDED.len(), |rec, at| {
+            let ip = &rec[at + ADDED.len()..];
             // The model holds the port in a template literal.
             let ip = &ip[..memchr::memchr2(b':', b' ', ip).unwrap_or(ip.len())];
             if let Some(blk) = block_token(rec) {
                 let row = (lcg_state(rec), thread_id(rec), blk[4..].to_vec(), ip.to_vec());
                 self.rows.push(row);
             }
-        }
+        });
+        // `Received` rows name every upstream `Receiving` rows do. `$` is rarer than the
+        // needle's letters.
+        let hits = memchr::memchr_iter(b'$', raw)
+            .filter(|&p| raw[p + 1..].starts_with(RESPONDER))
+            .map(|p| p + 1);
+        records_with(hits, raw, spans, RESPONDER.len(), |rec, at| {
+            let said = said_at(rec, false, at).and_then(|s| with_thread(rec, s));
+            let (Some(blk), Some((role, t, s))) = (block_token(rec), said) else {
+                return;
+            };
+            let s = match s {
+                Said::Node(v) => Said::Node(hash(v)),
+                Said::Responder(n) => Said::Responder(n),
+            };
+            self.writes.push((hash(&blk[4..]), role, t, s));
+        });
     }
 
     fn finish(self: Box<Self>) -> Vec<Vec<Vec<u8>>> {
@@ -222,6 +261,30 @@ impl TableBuilder for Replicas {
             let at = (keys.len() - 1) * REPLICAS;
             if let Some(slot) = ips[at..].iter_mut().find(|v| v.is_empty()) {
                 *slot = ip;
+            }
+        }
+        // Each block's replicas in pipeline order where its writes tell it.
+        let mut writes = self.writes;
+        writes.sort_unstable_by_key(|w| w.0);
+        let mut rows = Vec::new();
+        for (k, blk) in keys.iter().enumerate() {
+            let b = hash(blk);
+            let s = writes.partition_point(|w| w.0 < b);
+            let e = s + writes[s..].partition_point(|w| w.0 == b);
+            if s == e {
+                continue;
+            }
+            rows.clear();
+            rows.extend(writes[s..e].iter().map(|w| (w.1, w.2, w.3)));
+            let reps = &mut ips[k * REPLICAS..(k + 1) * REPLICAS];
+            // An empty replica is no node.
+            let ids: [u64; REPLICAS] =
+                std::array::from_fn(|i| if reps[i].is_empty() { i as u64 } else { hash(&reps[i]) });
+            if let Some(c) = pipeline(&ids, &rows) {
+                let mut old: [Vec<u8>; REPLICAS] = std::array::from_fn(|i| take(&mut reps[i]));
+                for (r, &i) in reps.iter_mut().zip(&c) {
+                    *r = take(&mut old[i]);
+                }
             }
         }
         vec![keys, ips]
@@ -673,10 +736,99 @@ fn threads(ctx: &RelationContext<'_, '_>, key: usize) -> Option<PayloadGraph> {
     Some(gb.finish(root))
 }
 
+const RESPONDER: &[u8] = b"PacketResponder: ";
+
+/// What a datanode's write row names: an upstream node (`Receiving`, `Received`) or its
+/// responder number (`Responder`). `at` is the offset of `Receiving block` or, unless
+/// `receiving`, of `PacketResponder`.
+fn said_at(r: &[u8], receiving: bool, at: usize) -> Option<(Role, &[u8])> {
+    // The token from `s` to a `:` or space.
+    let token = |s: usize| {
+        let n = r[s..].iter().take_while(|&&b| b != b':' && b != b' ').count();
+        (n > 0).then(|| &r[s..s + n])
+    };
+    // The token after the first `/` past `at`: block ids hold none.
+    let node = |at: usize, w: &[u8]| {
+        let s = at + memchr::memchr(b'/', &r[at..])?;
+        r[..s].ends_with(w).then(|| token(s + 1)).flatten()
+    };
+    if receiving {
+        let dn = r[..at].ends_with(b"DataXceiver: ");
+        return Some((Role::Receiving, dn.then(|| node(at, b"src: ")).flatten()?));
+    }
+    let at = at + 17;
+    let t = r.get(at - 2..)?.strip_prefix(b": ")?;
+    if t.starts_with(b"Received block ") {
+        Some((Role::Received, node(at, b" from ")?))
+    } else if t.starts_with(b"PacketResponder ") && r.ends_with(b"terminating") {
+        Some((Role::Responder, token(at + 16)?))
+    } else {
+        None
+    }
+}
+
+/// A block's replicas `reps` in pipeline order, as indices, from its write rows (role, thread,
+/// what the row names): the last replica is no row's upstream, and `PacketResponder N`
+/// shares its thread with its node's `Received` row naming the node before. `None` unless one
+/// order fits best.
+fn pipeline<T: PartialEq + Copy>(reps: &[T], rows: &[(Role, u64, Said<T>)]) -> Option<[usize; 3]> {
+    if reps.len() != REPLICAS || reps[0] == reps[1] || reps[1] == reps[2] || reps[0] == reps[2] {
+        return None;
+    }
+    let received = |t: u64, up: T| {
+        (rows.iter()).any(|&(r, u, s)| r == Role::Received && u == t && s == Said::Node(up))
+    };
+    let score = |c: &[usize; 3]| {
+        let mut s = 0i32;
+        for &(_, t, said) in rows {
+            match said {
+                Said::Node(v) => s -= i32::from(v == reps[c[2]]),
+                // Responders 1 and 0 run on the second and third nodes.
+                Said::Responder(n @ 0..=1) => s += i32::from(received(t, reps[c[1 - n as usize]])),
+                Said::Responder(_) => {}
+            }
+        }
+        s
+    };
+    let (mut best, mut tied) = ((i32::MIN, 0), false);
+    for (k, c) in CHAINS.iter().enumerate() {
+        let s = score(c);
+        if s == best.0 {
+            tied = true;
+        } else if s > best.0 {
+            (best, tied) = ((s, k), false);
+        }
+    }
+    (!tied).then_some(CHAINS[best.1])
+}
+
+/// What a write row names: a node, or its responder number.
+#[derive(Clone, Copy, PartialEq)]
+enum Said<T> {
+    Node(T),
+    Responder(i64),
+}
+
+/// A record's [`said_at`] with its thread.
+fn with_thread<'a>(r: &[u8], (role, v): (Role, &'a [u8])) -> Option<(Role, u64, Said<&'a [u8]>)> {
+    let s = match role {
+        Role::Responder => Said::Responder(unsigned(v)?),
+        _ => Said::Node(v),
+    };
+    Some((role, thread_id(r), s))
+}
+
 /// Whether a record says one of [`WRITES`], found from the letters they hold.
 fn is_write(r: &[u8]) -> bool {
-    memchr::memchr2_iter(b'R', b'B', r)
-        .any(|p| WRITES.iter().any(|&(w, at)| p >= at && r[p - at..].starts_with(w)))
+    write_at(r).is_some()
+}
+
+/// The first of [`WRITES`] a record says, and its offset.
+fn write_at(r: &[u8]) -> Option<(usize, usize)> {
+    memchr::memchr2_iter(b'R', b'B', r).find_map(|p| {
+        let k = WRITES.iter().position(|&(w, at)| p >= at && r[p - at..].starts_with(w))?;
+        Some((k, p - WRITES[k].1))
+    })
 }
 
 /// The first `blk_<id>` token of a record.
@@ -870,6 +1022,35 @@ mod tests {
         for (w, at) in WRITES {
             assert!(matches!(w[at], b'R' | b'B'));
         }
+    }
+
+    #[test]
+    fn replicas_go_in_pipeline_order() {
+        let recs: [&[u8]; 13] = [
+            b"081109 203518 143 INFO dfs.DataNode$DataXceiver: Receiving block blk_-16 src: /10.250.19.102:54106 dest: /10.250.19.102:50010",
+            b"081109 203518 35 INFO dfs.FSNamesystem: BLOCK* NameSystem.allocateBlock: /x/job.jar. blk_-16",
+            b"081109 203519 143 INFO dfs.DataNode$DataXceiver: Receiving block blk_-16 src: /10.250.10.6:40524 dest: /10.250.10.6:50010",
+            b"081109 203519 145 INFO dfs.DataNode$DataXceiver: Receiving block blk_-16 src: /10.250.14.224:42420 dest: /10.250.14.224:50010",
+            b"081109 203519 145 INFO dfs.DataNode$PacketResponder: PacketResponder 1 for block blk_-16 terminating",
+            b"081109 203519 145 INFO dfs.DataNode$PacketResponder: PacketResponder 2 for block blk_-16 terminating",
+            b"081109 203519 145 INFO dfs.DataNode$PacketResponder: Received block blk_-16 of size 91178 from /10.250.10.6",
+            b"081109 203519 145 INFO dfs.DataNode$PacketResponder: Received block blk_-16 of size 91178 from /10.250.19.102",
+            b"081109 203519 147 INFO dfs.DataNode$PacketResponder: PacketResponder 0 for block blk_-16 terminating",
+            b"081109 203519 147 INFO dfs.DataNode$PacketResponder: Received block blk_-16 of size 91178 from /10.250.14.224",
+            b"081109 203519 29 INFO dfs.FSNamesystem: BLOCK* NameSystem.addStoredBlock: blockMap updated: 10.250.10.6:50010 is added to blk_-16 size 91178",
+            b"081109 203519 30 INFO dfs.FSNamesystem: BLOCK* NameSystem.addStoredBlock: blockMap updated: 10.251.111.209:50010 is added to blk_-16 size 91178",
+            b"081109 203519 31 INFO dfs.FSNamesystem: BLOCK* NameSystem.addStoredBlock: blockMap updated: 10.250.14.224:50010 is added to blk_-16 size 91178",
+        ];
+        let mut b = Replicas::default();
+        let raw = recs.join(&b"\n"[..]);
+        let mut spans = Vec::new();
+        for r in &recs {
+            let s = spans.last().map_or(0, |&(_, e): &(u32, u32)| e + 1);
+            spans.push((s, s + r.len() as u32));
+        }
+        b.push(&raw, &spans);
+        let ips = Box::new(b).finish().remove(1);
+        assert_eq!(ips, [&b"10.250.10.6"[..], b"10.250.14.224", b"10.251.111.209"]);
     }
 
     fn check_graph(plan: &ModelPlan, vids: &[u32], cols: &[Vec<&[u8]>], graph: PayloadGraph) {
