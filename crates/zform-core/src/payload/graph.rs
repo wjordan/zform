@@ -2224,24 +2224,40 @@ impl GraphBuilder {
                 return self.add_bytes(flat_items);
             }
         }
-        let mut table: Vec<Vec<u8>> = Vec::with_capacity(64);
         let mut codes = Vec::with_capacity(count);
         let mut fallback = Vec::new();
-
-        for chunk in flat_items.chunks_exact(w) {
-            if let Some(pos) = table.iter().position(|x| x.as_slice() == chunk) {
-                codes.push((pos + 1) as i64);
-                if pos > 0 {
-                    let item = table.remove(pos);
-                    table.insert(0, item);
+        if w <= 16 {
+            // Items as integers: comparing a few bytes through `memcmp` dominated the search.
+            let key = |c: &[u8]| c.iter().rev().fold(0u128, |k, &b| k << 8 | u128::from(b));
+            let mut table: Vec<u128> = Vec::with_capacity(64);
+            for chunk in flat_items.chunks_exact(w) {
+                let k = key(chunk);
+                if let Some(pos) = table.iter().position(|&x| x == k) {
+                    codes.push((pos + 1) as i64);
+                    table[..=pos].rotate_right(1);
+                } else {
+                    codes.push(0);
+                    fallback.extend_from_slice(chunk);
+                    if table.len() == 64 {
+                        table.pop();
+                    }
+                    table.insert(0, k);
                 }
-            } else {
-                codes.push(0);
-                fallback.extend_from_slice(chunk);
-                if table.len() == 64 {
-                    table.pop();
+            }
+        } else {
+            let mut table: Vec<&[u8]> = Vec::with_capacity(64);
+            for chunk in flat_items.chunks_exact(w) {
+                if let Some(pos) = table.iter().position(|&x| x == chunk) {
+                    codes.push((pos + 1) as i64);
+                    table[..=pos].rotate_right(1);
+                } else {
+                    codes.push(0);
+                    fallback.extend_from_slice(chunk);
+                    if table.len() == 64 {
+                        table.pop();
+                    }
+                    table.insert(0, chunk);
                 }
-                table.insert(0, chunk.to_vec());
             }
         }
         if fallback.len() == flat_items.len()
