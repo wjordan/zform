@@ -2578,6 +2578,24 @@ fn recency_codes_survive_eviction_and_deep_ranks() {
     let evicted = misses.len() - vals.iter().collect::<std::collections::HashSet<_>>().len();
     assert!(evicted > 1000);
     assert_eq!(mtf_roundtrip(&codes, &misses).unwrap(), vals);
+    assert_eq!((codes, misses), crate::payload::graph::mtf_split_searched(&vals));
+}
+
+#[test]
+fn recency_ranks_match_a_searched_list() {
+    // Hot values between far repeats put small ranks at long distances, across spans.
+    let mut x = 0x2545_f491_4f6c_dd1du64;
+    for distinct in [3u64, 300, 5000, 20_000] {
+        let vals: Vec<i64> = (0..40_000)
+            .map(|i| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                if i % 4 == 0 { (x % distinct) as i64 } else { (x % 3) as i64 - 10 }
+            })
+            .collect();
+        assert_eq!(mtf_split(&vals), crate::payload::graph::mtf_split_searched(&vals));
+    }
 }
 
 #[test]

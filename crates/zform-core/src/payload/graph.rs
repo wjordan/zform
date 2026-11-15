@@ -1769,6 +1769,7 @@ impl Recency {
         }
     }
 
+    #[cfg(test)]
     fn rank(&self, v: i64) -> Option<usize> {
         self.buf[self.head..self.head + self.len]
             .iter()
@@ -1806,15 +1807,92 @@ pub(crate) const MTF_WINDOW: usize = 4096;
 /// Move-to-front codes of `vals` over the last [`MTF_WINDOW`] distinct values: `0` takes the
 /// next of the returned misses, `k` the value `k - 1` places back.
 pub(crate) fn mtf_split(vals: &[i64]) -> (Vec<i64>, Vec<i64>) {
+    // A value's place in the list is how many distinct values were used since its own last
+    // use, counted over a bitmap of last-use times instead of searched for in the list.
+    let mut uses = LastUses::new(vals.len());
+    let mut last: FastMap<i64, u32> = FastMap::default();
+    let mut codes = Vec::with_capacity(vals.len());
+    let mut misses = Vec::new();
+    for (t, &v) in vals.iter().enumerate() {
+        let rank = last.insert(v, t as u32).map(|prev| {
+            uses.clear(prev as usize);
+            uses.between(prev as usize, t)
+        });
+        match rank {
+            Some(r) if r < MTF_WINDOW => codes.push(r as i64 + 1),
+            _ => {
+                codes.push(0);
+                misses.push(v);
+            }
+        }
+        uses.set(t);
+    }
+    (codes, misses)
+}
+
+/// Times that are some value's last use, with a count per span of [`SPAN_BITS`] times.
+struct LastUses {
+    words: Vec<u64>,
+    spans: Vec<u32>,
+}
+
+const SPAN_BITS: usize = 4096;
+
+impl LastUses {
+    fn new(n: usize) -> Self {
+        Self {
+            words: vec![0; n.div_ceil(64)],
+            spans: vec![0; n.div_ceil(SPAN_BITS)],
+        }
+    }
+
+    fn set(&mut self, t: usize) {
+        self.words[t / 64] |= 1 << (t % 64);
+        self.spans[t / SPAN_BITS] += 1;
+    }
+
+    fn clear(&mut self, t: usize) {
+        self.words[t / 64] &= !(1 << (t % 64));
+        self.spans[t / SPAN_BITS] -= 1;
+    }
+
+    /// Set times strictly between `a` and `b`.
+    fn between(&self, a: usize, b: usize) -> usize {
+        let (lo, hi) = (a + 1, b);
+        if lo >= hi {
+            return 0;
+        }
+        let (wl, wh) = (lo / 64, (hi - 1) / 64);
+        let lo_mask = !0u64 << (lo % 64);
+        let hi_mask = !0u64 >> (63 - (hi - 1) % 64);
+        if wl == wh {
+            return (self.words[wl] & lo_mask & hi_mask).count_ones() as usize;
+        }
+        let mut n =
+            (self.words[wl] & lo_mask).count_ones() + (self.words[wh] & hi_mask).count_ones();
+        const SPAN_WORDS: usize = SPAN_BITS / 64;
+        let mut w = wl + 1;
+        while w < wh {
+            if w % SPAN_WORDS == 0 && w + SPAN_WORDS <= wh {
+                n += self.spans[w / SPAN_WORDS];
+                w += SPAN_WORDS;
+            } else {
+                n += self.words[w].count_ones();
+                w += 1;
+            }
+        }
+        n as usize
+    }
+}
+
+/// [`mtf_split`] by searching the list itself, as a reader keeps it.
+#[cfg(test)]
+pub(crate) fn mtf_split_searched(vals: &[i64]) -> (Vec<i64>, Vec<i64>) {
     let mut ring = Recency::new(MTF_WINDOW, vals.len());
     let mut codes = Vec::with_capacity(vals.len());
     let mut misses = Vec::new();
-    // A value seen for the first time is a miss without a search of the window.
-    let mut seen: FastSet<i64> = FastSet::default();
     for &v in vals {
-        if !seen.insert(v)
-            && let Some(pos) = ring.rank(v)
-        {
+        if let Some(pos) = ring.rank(v) {
             codes.push((pos + 1) as i64);
             ring.hit(pos);
         } else {
