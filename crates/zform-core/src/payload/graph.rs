@@ -4292,17 +4292,19 @@ fn bitpack_u64(vals: impl Iterator<Item = u64>, bits: u8, len: usize) -> Vec<u8>
     let mask = if b == 64 { u64::MAX } else { (1u64 << b) - 1 };
     // A register accumulator keeps each lane off the bytes the previous lane just stored.
     let mut out = Vec::with_capacity((len * b as usize).div_ceil(8) + 8);
-    let (mut acc, mut held) = (0u128, 0u32);
+    let (mut acc, mut held) = (0u64, 0u32);
     for v in vals {
-        acc |= u128::from(v & mask) << held;
+        let v = v & mask;
+        acc |= v << held;
         held += b;
         if held >= 64 {
-            out.extend_from_slice(&(acc as u64).to_le_bytes());
-            acc >>= 64;
+            out.extend_from_slice(&acc.to_le_bytes());
             held -= 64;
+            // The lane's top `held` bits did not fit in the word just written.
+            acc = v.checked_shr(b - held).unwrap_or(0);
         }
     }
-    out.extend_from_slice(&(acc as u64).to_le_bytes()[..held.div_ceil(8) as usize]);
+    out.extend_from_slice(&acc.to_le_bytes()[..held.div_ceil(8) as usize]);
     out
 }
 
@@ -4346,4 +4348,27 @@ fn decode_lane_program(bytes: &[u8]) -> Result<Program> {
         return Err(Error::Format("numeric lane program shape mismatch".into()));
     }
     Ok(prog)
+}
+
+#[cfg(test)]
+#[test]
+fn bitpack_roundtrips_every_width() {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    for bits in 1..=64u8 {
+        let mask = u64::MAX >> (64 - bits);
+        for len in [1, 7, 64, 65, 333] {
+            let vals: Vec<u64> = (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state & mask
+                })
+                .collect();
+            let packed = bitpack_u64(vals.iter().copied(), bits, len);
+            assert_eq!(packed.len(), (len * bits as usize).div_ceil(8));
+            let back = bitunpack_u64(&packed, bits, len, 0);
+            assert!(back.iter().zip(&vals).all(|(&a, &b)| a as u64 == b), "{bits}");
+        }
+    }
 }
