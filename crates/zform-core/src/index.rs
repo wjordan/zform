@@ -110,7 +110,6 @@ pub fn needle_tokens(needle: &[u8], whole: bool) -> Option<Vec<u64>> {
 
 pub struct FilterBuilder {
     bits: Vec<u64>,
-    mask: u64,
 }
 
 impl FilterBuilder {
@@ -119,14 +118,15 @@ impl FilterBuilder {
         let n = max_bits.max(64).next_power_of_two();
         Self {
             bits: vec![0u64; n / 64],
-            mask: n as u64 - 1,
         }
     }
 
     #[inline]
     pub fn add(&mut self, token: u64) {
-        for p in [token & self.mask, (token >> 32) & self.mask] {
-            self.bits[(p >> 6) as usize] |= 1u64 << (p & 63);
+        // A power-of-two word count masks the index, which also spares its bounds check.
+        let words = self.bits.len() - 1;
+        for p in [token, token >> 32] {
+            self.bits[(p >> 6) as usize & words] |= 1u64 << (p & 63);
         }
     }
 
