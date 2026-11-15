@@ -372,18 +372,25 @@ impl IntStream {
         }
         let target = wire.len() - 32.max(wire.len() / 50);
         let table_bits = (usize::BITS - vals.len().leading_zeros()).clamp(8, 14) as u8;
+        let mut enc = super::context_mix::Encoder::new(min, bits, table_bits);
+        let mut rest = vals;
         if vals.len() > 2048 {
-            let sample = &vals[..2048];
+            let sample;
+            (sample, rest) = vals.split_at(2048);
             let sample_base = Self::auto_encode_inner(sample, true);
             wire.clear();
             sample_base.encode(&mut wire);
             // A small warm-up loss can recover on a longer lane; clear losses stop here.
             let limit = wire.len() + wire.len() / 8;
-            if super::context_mix::encode(sample, min, bits, table_bits, limit).is_none() {
+            // The full lane goes on from the sample's state, which must fit `target` too.
+            if !enc.push(sample, limit) || !enc.fits(limit) || !enc.fits(target) {
                 return base;
             }
         }
-        let Some(bytes) = super::context_mix::encode(vals, min, bits, table_bits, target) else {
+        if !enc.push(rest, target) {
+            return base;
+        }
+        let Some(bytes) = enc.finish(target) else {
             return base;
         };
         let candidate = Self::ContextMix {

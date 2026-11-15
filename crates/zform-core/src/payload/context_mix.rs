@@ -109,48 +109,93 @@ impl Model {
     }
 }
 
-pub(super) fn encode(vals: &[i64], min: i64, bits: u8, tb: u8, limit: usize) -> Option<Vec<u8>> {
-    assert!((1..=16).contains(&bits) && (8..=14).contains(&tb));
-    let mut model = Model::new(tb);
-    let (mut lo, mut hi) = (0u32, u32::MAX);
-    let (mut prev, mut prev2) = (0u32, 0u32);
-    let mut out = Vec::new();
-    for &value in vals {
-        let x = value.wrapping_sub(min) as u32;
-        assert!((x as u64) < (1u64 << bits));
-        let mut prefix = 1u32;
-        for depth in 0..bits as usize {
-            let ids = model.indexes(prefix, prev, prev2);
-            let p = model.predict(&ids, depth);
-            let bit = x & (1 << (bits as usize - 1 - depth)) != 0;
-            let mid = lo + (((hi - lo) as u64 * p as u64) >> 16) as u32;
-            if bit {
-                hi = mid;
-            } else {
-                lo = mid + 1;
-            }
-            while (lo ^ hi) < 1 << 24 {
-                if out.len().saturating_add(5) > limit {
-                    return None;
-                }
-                out.push((hi >> 24) as u8);
-                lo <<= 8;
-                hi = (hi << 8) | 255;
-            }
-            model.update(&ids, depth, bit);
-            prefix = prefix * 2 + bit as u32;
+#[cfg(test)]
+fn encode(vals: &[i64], min: i64, bits: u8, tb: u8, limit: usize) -> Option<Vec<u8>> {
+    let mut enc = Encoder::new(min, bits, tb);
+    enc.push(vals, limit).then_some(())?;
+    enc.finish(limit)
+}
+
+/// An [`encode`] that can stop after a prefix and go on, so a trial on a prefix is not redone.
+pub(super) struct Encoder {
+    model: Model,
+    min: i64,
+    bits: u8,
+    lo: u32,
+    hi: u32,
+    prev: u32,
+    prev2: u32,
+    out: Vec<u8>,
+}
+
+impl Encoder {
+    pub(super) fn new(min: i64, bits: u8, tb: u8) -> Self {
+        assert!((1..=16).contains(&bits) && (8..=14).contains(&tb));
+        Self {
+            model: Model::new(tb),
+            min,
+            bits,
+            lo: 0,
+            hi: u32::MAX,
+            prev: 0,
+            prev2: 0,
+            out: Vec::new(),
         }
-        prev2 = prev;
-        prev = x;
     }
-    if out.len().saturating_add(4) > limit {
-        return None;
+
+    /// Whether the bytes so far and the final flush fit in `limit`. A prefix that fits was
+    /// also written within it, so it may go on under that limit.
+    pub(super) fn fits(&self, limit: usize) -> bool {
+        self.out.len() + 4 <= limit
     }
-    for _ in 0..4 {
-        out.push((lo >> 24) as u8);
-        lo <<= 8;
+
+    /// Codes `vals`; false once a byte would pass `limit`, after which the encoder is spent.
+    pub(super) fn push(&mut self, vals: &[i64], limit: usize) -> bool {
+        let (bits, min) = (self.bits, self.min);
+        let (mut lo, mut hi, mut prev, mut prev2) = (self.lo, self.hi, self.prev, self.prev2);
+        let (model, out) = (&mut self.model, &mut self.out);
+        for &value in vals {
+            let x = value.wrapping_sub(min) as u32;
+            assert!((x as u64) < (1u64 << bits));
+            let mut prefix = 1u32;
+            for depth in 0..bits as usize {
+                let ids = model.indexes(prefix, prev, prev2);
+                let p = model.predict(&ids, depth);
+                let bit = x & (1 << (bits as usize - 1 - depth)) != 0;
+                let mid = lo + (((hi - lo) as u64 * p as u64) >> 16) as u32;
+                if bit {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+                while (lo ^ hi) < 1 << 24 {
+                    if out.len().saturating_add(5) > limit {
+                        return false;
+                    }
+                    out.push((hi >> 24) as u8);
+                    lo <<= 8;
+                    hi = (hi << 8) | 255;
+                }
+                model.update(&ids, depth, bit);
+                prefix = prefix * 2 + bit as u32;
+            }
+            prev2 = prev;
+            prev = x;
+        }
+        (self.lo, self.hi, self.prev, self.prev2) = (lo, hi, prev, prev2);
+        true
     }
-    Some(out)
+
+    pub(super) fn finish(mut self, limit: usize) -> Option<Vec<u8>> {
+        if !self.fits(limit) {
+            return None;
+        }
+        for _ in 0..4 {
+            self.out.push((self.lo >> 24) as u8);
+            self.lo <<= 8;
+        }
+        Some(self.out)
+    }
 }
 
 pub(super) fn decode(
