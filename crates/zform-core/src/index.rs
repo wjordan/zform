@@ -31,7 +31,6 @@ pub const KIND_SHAPE_CELL: u16 = 1 << 3;
 // GitHub events, about 30,000 distinct tokens each, 128 Kbit with two bits lets through 2% of
 // the blocks that lack a ten-letter needle, and with one bit 11%.
 const WORD_MIN: usize = 3;
-const WORD_MAX: usize = GRAM - 1;
 const GRAM: usize = 8;
 
 /// Every bit of the result depends on every bit of `h`: a token's two filter bits come from its
@@ -43,11 +42,6 @@ fn mix(h: u64) -> u64 {
     h ^ (h >> 33)
 }
 
-#[inline]
-fn letter(b: u8) -> Option<u8> {
-    b.is_ascii_alphabetic().then_some(b)
-}
-
 /// Calls `f(token, complete)` for the tokens of `text`: each run of ASCII letters of 3 to 7
 /// letters, and every 8 consecutive letters of a longer run, case kept. `complete` is false for a
 /// run that touches an end of `text`, where the text it was cut from may continue the run.
@@ -55,27 +49,26 @@ pub fn tokens(text: &[u8], mut f: impl FnMut(u64, bool)) {
     let n = text.len();
     let mut i = 0usize;
     while i < n {
-        let Some(first) = letter(text[i]) else {
+        if !text[i].is_ascii_alphabetic() {
             i += 1;
             continue;
-        };
+        }
         let start = i;
-        let mut word = 0xcbf2_9ce4_8422_2325u64;
-        let mut window = 0u64;
-        let mut l = first;
-        loop {
-            word = (word ^ l as u64).wrapping_mul(0x0000_0100_0000_01b3);
-            window = (window >> 8) | ((l as u64) << 56);
+        i += 1;
+        while i < n && text[i].is_ascii_alphabetic() {
             i += 1;
-            if i - start >= GRAM {
+        }
+        let run = &text[start..i];
+        if run.len() >= GRAM {
+            // A gram is its eight letters read as one little-endian word.
+            for w in run.windows(GRAM) {
+                let window = u64::from_le_bytes(w.try_into().unwrap());
                 f(mix(window ^ 0x6772_616d), true);
             }
-            match text.get(i).and_then(|&b| letter(b)) {
-                Some(next) => l = next,
-                None => break,
-            }
-        }
-        if (WORD_MIN..=WORD_MAX).contains(&(i - start)) {
+        } else if run.len() >= WORD_MIN {
+            let word = run.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &l| {
+                (h ^ l as u64).wrapping_mul(0x0000_0100_0000_01b3)
+            });
             f(mix(word), start > 0 && i < n);
         }
     }
@@ -840,6 +833,57 @@ impl Root {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The letter-at-a-time form `tokens` must match: the tokens are stored in every filter.
+    fn tokens_reference(text: &[u8], mut f: impl FnMut(u64, bool)) {
+        let letter = |b: u8| b.is_ascii_alphabetic().then_some(b);
+        let n = text.len();
+        let mut i = 0usize;
+        while i < n {
+            let Some(first) = letter(text[i]) else {
+                i += 1;
+                continue;
+            };
+            let start = i;
+            let mut word = 0xcbf2_9ce4_8422_2325u64;
+            let mut window = 0u64;
+            let mut l = first;
+            loop {
+                word = (word ^ l as u64).wrapping_mul(0x0000_0100_0000_01b3);
+                window = (window >> 8) | ((l as u64) << 56);
+                i += 1;
+                if i - start >= GRAM {
+                    f(mix(window ^ 0x6772_616d), true);
+                }
+                match text.get(i).and_then(|&b| letter(b)) {
+                    Some(next) => l = next,
+                    None => break,
+                }
+            }
+            if (WORD_MIN..GRAM).contains(&(i - start)) {
+                f(mix(word), start > 0 && i < n);
+            }
+        }
+    }
+
+    #[test]
+    fn tokens_match_the_reference() {
+        let mut state = 7u64;
+        for len in 0..300 {
+            let text: Vec<u8> = (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    b"abcXYZ  .9"[(state % 10) as usize]
+                })
+                .collect();
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            tokens(&text, |t, c| a.push((t, c)));
+            tokens_reference(&text, |t, c| b.push((t, c)));
+            assert_eq!(a, b);
+        }
+    }
 
     #[test]
     fn filter_keeps_what_a_needle_needs() {
