@@ -47,7 +47,7 @@ OPTIONS:
   --order-by <F1,F2,...>    Store JSON lines sorted on these fields, a run at a time; unpack restores
                             their order, and `grep` and `select` answer in the stored order
   --run-bytes <BYTES>       Most bytes sorted as one run, which pack and unpack hold in memory
-                            (default: 536870912 = 512 MiB)
+                            (default and most: 536870912 = 512 MiB)
   --framing <MODE>          Record framing: auto (default), lf, crlf, nul, u32le, json, stride:<N>[:<HDR>]
   --no-checksum             Omit per-frame XXH64 content checksum
   --no-index                Omit the trailing index region (`grep` / `select` need it)

@@ -341,7 +341,8 @@ impl<R: Read> OrderReader<R> {
         Self {
             inner,
             paths: order_by.iter().map(|p| parse_path(p)).collect(),
-            cap: cap.max(1),
+            // A reader's default budget refuses a longer run.
+            cap: cap.clamp(1, DecodeBudget::default().max_block_decoded_bytes),
             backend,
             level,
             sink,
@@ -362,10 +363,14 @@ impl<R: Read> OrderReader<R> {
                 n => self.carry.extend_from_slice(&buf[..n]),
             }
         }
-        let cut = memchr::memrchr(b'\n', &self.carry).map_or(self.carry.len(), |p| p + 1);
+        // A run is the whole lines within `cap`. With none, a longer line or the unterminated
+        // end, what was read passes as it is.
+        let within = &self.carry[..self.carry.len().min(self.cap)];
+        let end = memchr::memrchr(b'\n', within).map(|p| p + 1);
+        let cut = end.unwrap_or(self.carry.len());
         let run = &self.carry[..cut];
         let json = run.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'{');
-        let ordered = (json && run.ends_with(b"\n"))
+        let ordered = (json && end.is_some())
             .then(|| order_run(run, &self.paths, self.backend, self.level))
             .flatten();
         self.at = 0;
@@ -579,6 +584,7 @@ mod tests {
         assert_eq!(stored.len(), input.len());
         let mut back = Restore::new(Vec::new());
         for (start, run) in sink.lock().unwrap().iter() {
+            assert!(Cursor::new(run).uvar().unwrap() <= cap as u64);
             back.order(&payload(*start, run), &DecodeBudget::default())
                 .unwrap();
         }
@@ -624,6 +630,11 @@ mod tests {
             round_trip(&input, &["type", "repo.id"], cap);
             round_trip(&open, &["repo.id"], cap);
         }
+        // A line longer than a run passes between the runs around it.
+        let long = format!("{{\"id\":\"1\",\"type\":\"{}\"}}\n", "x".repeat(3000));
+        let cut = lines(&input)[..100].concat().len();
+        let mixed = [&input[..cut], long.as_bytes(), &input[cut..]].concat();
+        round_trip(&mixed, &["type"], 1000);
     }
 
     #[test]
