@@ -294,33 +294,33 @@ pub struct BlockDecodeCtx<'a> {
 /// Only shape variants place cells by the variant alone, so any other variant is an error, as is
 /// a record holding an `at` cell and no `key` cell.
 pub fn align_cells(plan: &ModelPlan, variant_ids: &[u32], key: usize, at: usize) -> Result<Vec<i64>> {
-    // Per variant, key and `at` cells per record; `u32::MAX` marks a variant that is no shape.
-    let counts: Vec<(u32, u32)> = plan
+    // Per variant, key and `at` cells per record, `at` cells `u32::MAX` for a variant whose
+    // record is an error.
+    let counts: Vec<(i64, u32)> = plan
         .variants
         .iter()
         .map(|v| match v {
             PlanVariant::Shape(s) => {
                 let n = |c: usize| s.slots.iter().filter(|&&x| x as usize == c).count() as u32;
-                (n(key), n(at))
+                let (nk, na) = (n(key), n(at));
+                (i64::from(nk), if na > 0 && nk == 0 { u32::MAX } else { na })
             }
-            _ => (u32::MAX, 0),
+            _ => (0, u32::MAX),
         })
         .collect();
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(variant_ids.len());
     let mut k = 0i64;
     for &v in variant_ids {
         let &(nk, na) = counts
             .get(v as usize)
             .ok_or_else(|| Error::Format("variant id out of range".into()))?;
-        if na > 0 || nk == u32::MAX {
-            if nk == 0 || nk == u32::MAX {
+        if na != 0 {
+            if na == u32::MAX {
                 return Err(Error::Format("ExtAlign record has no placed key cell".into()));
             }
-            for _ in 0..na {
-                out.push(k);
-            }
+            out.extend(std::iter::repeat_n(k, na as usize));
         }
-        k += i64::from(nk);
+        k += nk;
     }
     Ok(out)
 }
