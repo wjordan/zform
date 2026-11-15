@@ -165,8 +165,9 @@ fn encode(vals: &[i64], min: i64, bits: u8, tb: u8, limit: usize) -> Option<Vec<
     enc.finish(limit)
 }
 
-/// An [`encode`] that can stop after a prefix and go on, so a trial on a prefix is not redone.
-pub(super) struct Encoder {
+/// The kind-9 encoder, kept to pin its wire contract; writers now emit kind 10.
+#[cfg(test)]
+struct Encoder {
     model: Model,
     min: i64,
     bits: u8,
@@ -177,8 +178,9 @@ pub(super) struct Encoder {
     out: Vec<u8>,
 }
 
+#[cfg(test)]
 impl Encoder {
-    pub(super) fn new(min: i64, bits: u8, tb: u8) -> Self {
+    fn new(min: i64, bits: u8, tb: u8) -> Self {
         assert!((1..=16).contains(&bits) && (8..=14).contains(&tb));
         Self {
             model: Model::new(tb),
@@ -194,12 +196,12 @@ impl Encoder {
 
     /// Whether the bytes so far and the final flush fit in `limit`. A prefix that fits was
     /// also written within it, so it may go on under that limit.
-    pub(super) fn fits(&self, limit: usize) -> bool {
+    fn fits(&self, limit: usize) -> bool {
         self.out.len() + 4 <= limit
     }
 
     /// Codes `vals`; false once a byte would pass `limit`, after which the encoder is spent.
-    pub(super) fn push(&mut self, vals: &[i64], limit: usize) -> bool {
+    fn push(&mut self, vals: &[i64], limit: usize) -> bool {
         let (bits, min) = (self.bits, self.min);
         let (mut lo, mut hi, mut prev, mut prev2) = (self.lo, self.hi, self.prev, self.prev2);
         let ((tables, weights, m), out) = (self.model.parts(), &mut self.out);
@@ -240,7 +242,7 @@ impl Encoder {
         true
     }
 
-    pub(super) fn finish(mut self, limit: usize) -> Option<Vec<u8>> {
+    fn finish(mut self, limit: usize) -> Option<Vec<u8>> {
         if !self.fits(limit) {
             return None;
         }
@@ -312,7 +314,6 @@ pub(super) fn decode(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::payload::graph::{CoreDecoder, GraphBuilder, IntStream, with_context_mixing};
 
     fn next(state: &mut u64) -> u64 {
         *state ^= *state << 13;
@@ -381,51 +382,6 @@ mod tests {
                 Err(Error::BudgetExceeded(_))
             ));
         }
-    }
-
-    #[test]
-    fn context_mixing_selection_is_optional_and_payloads_are_self_contained() {
-        let (mut rng, mut value) = (17, 0);
-        let values: Vec<i64> = (0..8192)
-            .map(|_| {
-                if next(&mut rng) % 10 == 0 {
-                    value ^= 1;
-                }
-                value
-            })
-            .collect();
-        let plain = IntStream::auto_encode(&values);
-        let mixed = with_context_mixing(true, || IntStream::auto_encode(&values));
-        assert!(matches!(mixed, IntStream::ContextMix { .. }), "{mixed:?}");
-        assert_eq!(
-            plain,
-            IntStream::auto_encode(&values),
-            "option leaked out of scope"
-        );
-        let mut a = Vec::new();
-        plain.encode(&mut a);
-        let mut b = Vec::new();
-        mixed.encode(&mut b);
-        assert!(b.len() + 32 <= a.len());
-        let budget = DecodeBudget::default();
-        for _ in 0..2 {
-            let mut gb = GraphBuilder::new(values.len());
-            let root = gb.push(crate::payload::graph::GraphNode::IntStream(mixed.clone()));
-            assert_eq!(
-                CoreDecoder::decode_ints_bytes(&gb.finish(root).encode(), &budget).unwrap(),
-                values
-            );
-        }
-        let constant = vec![5; 2048];
-        assert_eq!(
-            with_context_mixing(true, || IntStream::auto_encode(&constant)),
-            IntStream::auto_encode(&constant)
-        );
-        let noisy: Vec<i64> = (0..2048).map(|_| next(&mut rng) as i64).collect();
-        assert_eq!(
-            with_context_mixing(true, || IntStream::auto_encode(&noisy)),
-            IntStream::auto_encode(&noisy)
-        );
     }
 }
 

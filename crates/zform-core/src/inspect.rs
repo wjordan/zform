@@ -691,6 +691,9 @@ fn int_kind(s: &IntStream) -> String {
         IntStream::ContextMix {
             bits, table_bits, ..
         } => format!("ContextMix/{bits}b/t{table_bits}"),
+        IntStream::NibbleMix {
+            bits, table_bits, ..
+        } => format!("NibbleMix/{bits}b/t{table_bits}"),
         IntStream::Const { .. } => "Const".into(),
         IntStream::Rice { .. } => "Rice".into(),
         IntStream::Rle { leaf, .. } => format!("Rle/{}", backend(leaf)),

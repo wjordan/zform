@@ -156,7 +156,7 @@ A new writer-side pack can use existing primitives without changing readers. A n
 Writer-side `RelationPack`s use the same graph representation. The optional HDFS pack emits
 peer references, integer parsing and formatting, keyed lookups, and exact patches. No HDFS
 identifier or additional node kind appears on the wire; only enabling context mixing can add
-the integer transport kind `9` described below.
+the integer transport kinds `9` and `10` described below.
 
 ### worked example
 
@@ -296,6 +296,7 @@ An `IntStream` starts with `kind: u8`, then `length: uvarint`, followed by the o
 | `7` | Shifted constant | `shift: u8`, `coefficient: ivarint` |
 | `8` | Centered Rice | `bytes: blob` |
 | `9` | Context mixture | `min: ivarint`, `bits: u8`, `table_bits: u8`, `bytes: blob` |
+| `10` | Nibble context mixture | `min: ivarint`, `bits: u8`, `table_bits: u8`, `escape: u8`, `bytes: blob` |
 
 - **Constant:** repeat `value`. A shifted constant repeats `coefficient << shift`; the shift is 1–63 and must preserve the signed coefficient without overflow.
 - **Run length:** the expanded leaf holds `n_runs: uvarint`, then `(value: ivarint, count: uvarint)` pairs. Counts sum to `length`.
@@ -325,6 +326,15 @@ Assign rounding remainder to the third weight. Then update the model counters. N
 carries into another integer stream. Decoder limits cover parameters, compressed bytes, output
 allocation, and model memory; truncated or trailing arithmetic bytes are errors. Predictions
 are part of this wire kind: a different model requires a different kind, not an encoder tweak.
+
+Kind `10` has the same parameters and bounds, and its reference implementation is
+[`payload/nibble_mix.rs`](crates/zform-core/src/payload/nibble_mix.rs). It codes each offset
+most-significant nibble first with a 15-bit multi-symbol range coder. When `escape` is 1 (only for
+`bits` above 4), a first symbol codes offsets 0–14 directly, and symbol 15 is followed by the
+offset minus 15. Two models are mixed: one indexed by the nibble prefix, and one hashed from the
+preceding pair. Each has a 16-symbol cumulative-frequency node per context, and the two-weight
+mixture adapts per nibble depth. The stream drops the flush's three trailing zero bytes. Decoders
+reject truncation, trailing bytes, and offsets wider than `bits`.
 
 Delta reconstruction, common integer factors, floating-point scaling, and formatting are programs around these transports. They have no separate `IntStream` mode or domain tag.
 

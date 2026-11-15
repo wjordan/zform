@@ -81,10 +81,12 @@ streams also participate. Programs, peer dependencies, dictionary views, and blo
 not change; a selective read still fetches only its declared parts.
 
 This generalizes the experiment's prediction of dictionary IDs, flags, and small residuals.
-Three binary models predict from the current bit prefix, the preceding integer, and the preceding
-pair. Their mixture adapts using integer arithmetic. The transport has no log-format names,
-hardware topology, field parser, floating-point math, or state shared between payloads.
-Each stream uses at most 192 KiB of counter tables and resets at its boundary.
+Writers emit kind `10`, which codes a value a nibble at a time: two 16-symbol models, one on
+the nibble prefix and one hashed from the preceding pair, are mixed and range-coded. That is
+about two coding steps per value instead of kind `9`'s one per bit. It costs a third of kind
+`9`'s instructions in both directions, and its streams come out slightly smaller. The transport
+has no log-format names, hardware topology, field parser, or state shared between payloads.
+Each stream uses at most 1.5 MiB of model tables and resets at its boundary.
 
 Candidates need at least 512 values and an offset width of 1–16 bits. A prefix probe rejects
 clear losses; a complete candidate must save at least 32 bytes and approximately 2% of its
@@ -93,8 +95,9 @@ skip the trial. Timestamps, numeric reconstruction, and byte formatting remain o
 programs. The latency-oriented `add_ints_fast` path does not run this search.
 
 Context mixing trades decode speed for density, so it is opt-in even with `--best`.
-The reader implements one bounded integer transport, kind `9`; the lane VM gains no mutable
-hash tables or arbitrary loops. Older readers cannot decode a payload that selects this kind.
+Readers implement two bounded integer transports: kind `10`, and kind `9` for older files.
+The lane VM gains no mutable hash tables or arbitrary loops. Older readers cannot decode a
+payload that selects either kind.
 Cross-field contexts could be a later extension with explicit graph dependencies, but the
 current transport uses only its own preceding values.
 

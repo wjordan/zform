@@ -14,6 +14,7 @@ pub mod engine;
 pub mod graph;
 pub mod ir;
 pub mod library;
+mod nibble_mix;
 pub mod recur;
 mod rice;
 pub(crate) mod tape;

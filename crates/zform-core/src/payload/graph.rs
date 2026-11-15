@@ -281,6 +281,14 @@ pub enum IntStream {
         table_bits: u8,
         bytes: Vec<u8>,
     },
+    NibbleMix {
+        len: u32,
+        min: i64,
+        bits: u8,
+        table_bits: u8,
+        escape: bool,
+        bytes: Vec<u8>,
+    },
     ForPlanes {
         len: u32,
         min: i64,
@@ -316,7 +324,10 @@ impl IntStream {
                 *head_leaf = relevel_leaf(head_leaf, backend, level, false)?;
                 tail.relevel(backend, level)?;
             }
-            Self::Const { .. } | Self::Rice { .. } | Self::ContextMix { .. } => {}
+            Self::Const { .. }
+            | Self::Rice { .. }
+            | Self::ContextMix { .. }
+            | Self::NibbleMix { .. } => {}
         }
         Ok(())
     }
@@ -381,7 +392,8 @@ impl IntStream {
         }
         let target = wire.len() - 32.max(wire.len() / 50);
         let table_bits = (usize::BITS - vals.len().leading_zeros()).clamp(8, 14) as u8;
-        let mut enc = super::context_mix::Encoder::new(min, bits, table_bits);
+        let escape = super::nibble_mix::escapes(vals, min, bits);
+        let mut enc = super::nibble_mix::Encoder::new(min, bits, table_bits, escape);
         let mut rest = vals;
         if vals.len() > 2048 {
             let sample;
@@ -402,11 +414,12 @@ impl IntStream {
         let Some(bytes) = enc.finish(target) else {
             return base;
         };
-        let candidate = Self::ContextMix {
+        let candidate = Self::NibbleMix {
             len: vals.len() as u32,
             min,
             bits,
             table_bits,
+            escape,
             bytes,
         };
         wire.clear();
@@ -647,6 +660,7 @@ impl IntStream {
             | Self::Rle { len, .. }
             | Self::Rice { len, .. }
             | Self::ContextMix { len, .. }
+            | Self::NibbleMix { len, .. }
             | Self::ForBitpack { len, .. }
             | Self::ZigZagVarint { len, .. }
             | Self::ForPlanes { len, .. }
@@ -672,6 +686,21 @@ impl IntStream {
                 put_uvarint(out, *len as u64);
                 put_ivarint(out, *min);
                 out.extend_from_slice(&[*bits, *table_bits]);
+                put_uvarint(out, bytes.len() as u64);
+                out.extend_from_slice(bytes);
+            }
+            Self::NibbleMix {
+                len,
+                min,
+                bits,
+                table_bits,
+                escape,
+                bytes,
+            } => {
+                out.push(10);
+                put_uvarint(out, *len as u64);
+                put_ivarint(out, *min);
+                out.extend_from_slice(&[*bits, *table_bits, *escape as u8]);
                 put_uvarint(out, bytes.len() as u64);
                 out.extend_from_slice(bytes);
             }
@@ -776,6 +805,34 @@ impl IntStream {
         }
         let len = len_u64 as u32;
         match kind {
+            10 => {
+                let min = cur.ivar()?;
+                let bits = cur.u8()?;
+                let table_bits = cur.u8()?;
+                let escape = match cur.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(Error::Format("invalid nibble escape flag".into())),
+                };
+                let bytes = cur.bytes()?;
+                super::nibble_mix::validate(
+                    len as usize,
+                    bits,
+                    table_bits,
+                    escape,
+                    bytes.len(),
+                    budget,
+                )?;
+                budget.check_alloc(bytes.len(), "nibble mixing bytes")?;
+                Ok(Self::NibbleMix {
+                    len,
+                    min,
+                    bits,
+                    table_bits,
+                    escape,
+                    bytes: bytes.to_vec(),
+                })
+            }
             9 => {
                 let min = cur.ivar()?;
                 let bits = cur.u8()?;
@@ -884,6 +941,22 @@ impl IntStream {
                 table_bits,
                 bytes,
             } => super::context_mix::decode(bytes, *len as usize, *min, *bits, *table_bits, budget),
+            Self::NibbleMix {
+                len,
+                min,
+                bits,
+                table_bits,
+                escape,
+                bytes,
+            } => super::nibble_mix::decode(
+                bytes,
+                *len as usize,
+                *min,
+                *bits,
+                *table_bits,
+                *escape,
+                budget,
+            ),
             Self::Rle { len, leaf } => {
                 let n = *len as usize;
                 let raw = unpack_leaf(leaf, budget)?;
@@ -1423,7 +1496,9 @@ impl PayloadGraph {
             if stream.len() < 512
                 || matches!(
                     stream,
-                    IntStream::Const { .. } | IntStream::ContextMix { .. }
+                    IntStream::Const { .. }
+                        | IntStream::ContextMix { .. }
+                        | IntStream::NibbleMix { .. }
                 )
             {
                 continue;
