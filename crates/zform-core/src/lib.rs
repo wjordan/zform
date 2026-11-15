@@ -14,6 +14,7 @@ pub mod index;
 pub mod inspect;
 pub mod json_tree;
 pub mod lex;
+pub mod order;
 pub mod packs;
 pub mod payload;
 pub mod plan;

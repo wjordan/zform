@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::tables::TABLE_PEER;
 use crate::container::{
-    BlockParts, FLAG_DICTIONARY, FLAG_HAS_CHECKSUM, FLAG_PASSTHROUGH, FLAG_REUSE_PREV_MODEL,
+    BlockParts, FLAG_DICTIONARY, FLAG_ORDER, FLAG_HAS_CHECKSUM, FLAG_PASSTHROUGH, FLAG_REUSE_PREV_MODEL,
     FLAG_SYNC_POINT, InspectReport, NextFrameKind, Structure, parse_frame_blocks,
     read_next_frame_header,
 };
@@ -94,6 +94,18 @@ fn walk<R: Read>(
                     .push(("$dictionary".into(), hdr.payload_len as u64));
                 if let Some(t) = tree.as_deref_mut() {
                     t.child("$dictionary").bytes += hdr.payload_len as u64;
+                }
+            }
+            NextFrameKind::Data(hdr) if (hdr.flags & FLAG_ORDER) != 0 => {
+                std::io::copy(
+                    &mut (&mut reader).take(hdr.payload_len as u64 + 8),
+                    &mut std::io::sink(),
+                )?;
+                rep.total_compressed_bytes += hdr.payload_len as u64 + 32;
+                rep.column_bytes
+                    .push(("$order".into(), hdr.payload_len as u64));
+                if let Some(t) = tree.as_deref_mut() {
+                    t.child("$order").bytes += hdr.payload_len as u64;
                 }
             }
             NextFrameKind::Data(hdr) => {

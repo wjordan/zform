@@ -185,6 +185,18 @@ decoded the first time a block reads it, so queries that do not touch those colu
 for the table's bytes. A relation pack builds its table in a pass before writing; the CLI makes
 one for a file of over a block whose packs keep one.
 
+**Row order is the stream writer's to choose, a run at a time.** Sorting an event log on its
+entity fields puts the records that repeat each other in the same blocks, which a column needs
+before it can code one from another; a table reaches across blocks only for the relations a
+pack models. `pack_stream` given `order_by` fields sorts each run of JSON lines (512 MiB by
+default) on them and stores the lines in that order. Blocks, the index and queries see only the
+stored order, so row numbers and query results follow it. An order frame ahead of each run
+restores the original on unpack, which holds one run in memory; it codes the original order as
+ranks counted over the stored lines sorted on a field that nearly ascends in the input, such as
+an event id, and so costs about a bit a line. One hour of GitHub Archive sorted on
+`type,repo.id` packs 14% smaller with `--best` and 22% smaller without a dictionary, and the
+gain grows with the run: 6%, 8% and 10% for runs of 32, 64 and 128 MiB.
+
 **The index region is derived data.** Scanning the data region rebuilds it.
 
 - The **root** holds every model and each block's row count, byte range, model and page
@@ -259,7 +271,8 @@ zstd contexts. `DecodeBudget` bounds decoding of untrusted bytes.
 
 ## writing
 
-The writer takes records in their final order. `cut()` ends a block early, and `finish()`
+The writer takes records in their final order; only `pack_stream` reorders them, before any
+block is cut. `cut()` ends a block early, and `finish()`
 returns the index region. Data region bytes are emitted in order as blocks complete and never
 revisited.
 

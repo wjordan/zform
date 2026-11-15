@@ -43,6 +43,10 @@ OPTIONS:
   --dict-bytes <BYTES>      File dictionary budget, for a file input of over one block whose text
                             values recur across blocks (default: 0 = none; with --best, 1/32 of
                             the file, 8 to 32 MiB). Levels 1-4 use at most 16 MiB
+  --order-by <F1,F2,...>    Store JSON lines sorted on these fields, a run at a time; unpack restores
+                            their order, and `grep` and `select` answer in the stored order
+  --run-bytes <BYTES>       Most bytes sorted as one run, which pack and unpack hold in memory
+                            (default: 536870912 = 512 MiB)
   --framing <MODE>          Record framing: auto (default), lf, crlf, nul, u32le, json, stride:<N>[:<HDR>]
   --no-checksum             Omit per-frame XXH64 content checksum
   --no-index                Omit the trailing index region (`grep` / `select` need it)
@@ -301,6 +305,19 @@ fn cmd_pack(args: &[String]) -> Result<(), String> {
                     .map_err(|_| "invalid --threads")?;
             }
             "--no-index" => opts.index = false,
+            "--order-by" => {
+                i += 1;
+                let v = args.get(i).ok_or("missing value for --order-by")?;
+                opts.order_by = v.split(',').map(str::to_string).collect();
+            }
+            "--run-bytes" => {
+                i += 1;
+                opts.order_run_bytes = args
+                    .get(i)
+                    .ok_or("missing value for --run-bytes")?
+                    .parse()
+                    .map_err(|_| "invalid --run-bytes")?;
+            }
             "-f" | "--force" | "-q" | "--quiet" | "-k" | "--keep" | "-c" | "--stdout" => {}
             _ if a.starts_with('-')
                 && a.len() >= 2

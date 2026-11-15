@@ -29,11 +29,13 @@ use crate::wire::{
     Cursor, DecodeBudget, EntropyBackend, Error, Result, compress_leaf, crc32, decompress_leaf,
     leaf_raw_len, put_bytes, put_uvarint, xxh64,
 };
+use crate::order::{OrderReader, OrderSink, Restore};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 pub const FRAME_MAGIC: &[u8; 4] = b"ZFM1";
+const ORDER_SEED: u64 = 0x5a46_4d6f;
 
 pub const FLAG_HAS_CHECKSUM: u16 = 1 << 0;
 pub const FLAG_PASSTHROUGH: u16 = 1 << 1;
@@ -43,6 +45,9 @@ pub const FLAG_DICTIONARY: u16 = 1 << 4;
 /// Each block stores its rows in any order; the reader restores them by sorting on
 /// [`collation_key`]. The frame's records are its blocks' records in block order.
 pub const FLAG_SORTED_ROWS: u16 = 1 << 5;
+/// An order frame: the payload restores the original order of a run of the records that the
+/// frames after it decode to. See [`crate::order`].
+pub const FLAG_ORDER: u16 = 1 << 6;
 
 /// The key a sorted-rows block's records ascend by: ASCII letters and digits only, letters folded
 /// to lowercase.
@@ -218,6 +223,11 @@ pub struct PackOptions {
     pub packs: PackRegistry,
     /// Frames `pack_stream` encodes at once; the output is the same for any count.
     pub threads: usize,
+    /// Fields, as dotted paths, that `pack_stream` sorts each run of JSON lines on before
+    /// storing it; order frames restore the runs on unpack. Empty stores records as they come.
+    pub order_by: Vec<String>,
+    /// Most bytes in a run sorted for `order_by`. Packing and unpacking hold a run in memory.
+    pub order_run_bytes: usize,
 }
 
 impl Default for PackOptions {
@@ -241,6 +251,8 @@ impl Default for PackOptions {
             pool_page_bytes: DEFAULT_POOL_PAGE_BYTES,
             packs: PackRegistry::default(),
             threads: std::thread::available_parallelism().map_or(1, |n| n.get()),
+            order_by: Vec::new(),
+            order_run_bytes: 512 << 20,
         }
     }
 }
@@ -294,6 +306,10 @@ pub struct StreamEncoder {
     /// A slice of the rows the plan was trained on: a retrain sees them too, so it keeps the
     /// layouts that the new chunk lacks.
     trained_rows: Vec<Vec<u8>>,
+    /// Sorted runs to write order frames for ahead of the next frame decided.
+    orders: Vec<(u64, Vec<u8>)>,
+    /// Bytes the frames written so far decode to.
+    raw_offset: u64,
 }
 
 impl StreamEncoder {
@@ -310,6 +326,8 @@ impl StreamEncoder {
             comp_offset: 0,
             seeds: Seeds::default(),
             trained_rows: Vec::new(),
+            orders: Vec::new(),
+            raw_offset: 0,
         }
     }
 
@@ -352,6 +370,23 @@ impl StreamEncoder {
         let off = self.comp_offset + hdr.len() as u64;
         self.index.dictionary(off, payload.len() as u64, dict.id());
         self.comp_offset = off + payload.len() as u64 + 8;
+        Ok(())
+    }
+
+    /// Writes an order frame: its payload, then the payload's XXH64.
+    fn write_order<W: Write>(&mut self, payload: &[u8], mut out: W) -> Result<()> {
+        let hdr = frame_header(
+            FLAG_ORDER | FLAG_HAS_CHECKSUM,
+            self.opts.backend,
+            0,
+            0,
+            ResolvedFraming::LengthU32Le,
+            payload.len(),
+        );
+        out.write_all(&hdr)?;
+        out.write_all(payload)?;
+        out.write_all(&xxh64(payload, ORDER_SEED).to_le_bytes())?;
+        self.comp_offset += (hdr.len() + payload.len() + 8) as u64;
         Ok(())
     }
 
@@ -500,6 +535,7 @@ impl StreamEncoder {
             reuse,
             code,
             plan_changed,
+            orders: std::mem::take(&mut self.orders),
         }
     }
 
@@ -524,6 +560,13 @@ impl StreamEncoder {
             verbatim_filter,
             ..
         } = enc;
+        for (start, run) in &task.orders {
+            // The chunker reads into a run only for the chunk the run starts in or just after.
+            let skip = start.checked_sub(self.raw_offset).expect("a run starts in a later frame");
+            let payload = crate::order::payload(skip, run);
+            self.write_order(&payload, &mut out)?;
+        }
+        self.raw_offset += raw_len as u64;
         if let Some(raw_plan) = &raw_plan
             && self.opts.index
         {
@@ -640,6 +683,8 @@ pub(crate) struct FrameTask {
     code: CodeSharing,
     /// The model was trained for this frame.
     plan_changed: bool,
+    /// Sorted runs whose order frames go ahead of this one.
+    orders: Vec<(u64, Vec<u8>)>,
 }
 
 /// A frame's payload, encoded on any thread, to be written in stream order.
@@ -2004,8 +2049,12 @@ pub fn decode_frame_payload<W: Write>(
 
 pub fn pack_stream<R: Read, W: Write>(reader: R, mut writer: W, opts: &PackOptions) -> Result<()> {
     let mut enc = StreamEncoder::new(opts.clone());
+    // The reader has sorted a run by the time its first chunk comes, so its order frame goes
+    // ahead of that chunk's frame.
+    let orders = OrderSink::default();
     if opts.threads <= 1 {
-        for_each_chunk(reader, opts, |fc| {
+        for_each_chunk(reader, opts, Some(&orders), |fc| {
+            enc.orders.append(&mut orders.lock().unwrap());
             enc.encode_framed(fc, &mut writer).map(drop)
         })?;
         return enc.finish(&mut writer);
@@ -2027,7 +2076,8 @@ pub fn pack_stream<R: Read, W: Write>(reader: R, mut writer: W, opts: &PackOptio
         if let Some(d) = fl.dict {
             s.spawn(|| d.id());
         }
-        for_each_chunk(reader, opts, |fc| {
+        for_each_chunk(reader, opts, Some(&orders), |fc| {
+            enc.orders.append(&mut orders.lock().unwrap());
             let task = enc.decide(fc);
             if task.plan_changed || plan.is_none() {
                 plan = enc.active_plan.clone().map(Arc::new);
@@ -2181,7 +2231,7 @@ pub fn build_dictionary<R: Read>(
     let Some(mut b) = DictionaryBuilder::new(opts, max_bytes) else {
         return Ok(None);
     };
-    for_each_chunk(reader, opts, |fc| {
+    for_each_chunk(reader, opts, None, |fc| {
         (0..fc.len()).for_each(|i| b.push(fc.record(i)));
         Ok(())
     })?;
@@ -2194,7 +2244,7 @@ pub fn build_tables<R: Read>(reader: R, opts: &PackOptions) -> Result<Option<Tab
     let Some(mut b) = opts.packs.table_builder() else {
         return Ok(None);
     };
-    for_each_chunk(reader, opts, |fc| {
+    for_each_chunk(reader, opts, None, |fc| {
         b.push(fc.raw, &fc.spans);
         Ok(())
     })?;
@@ -2207,6 +2257,20 @@ pub fn build_tables<R: Read>(reader: R, opts: &PackOptions) -> Result<Option<Tab
 
 /// Cuts `reader` into the framed chunks `pack_stream` encodes, in order.
 fn for_each_chunk<R: Read>(
+    reader: R,
+    opts: &PackOptions,
+    orders: Option<&OrderSink>,
+    f: impl FnMut(&FramedChunk<'_>) -> Result<()>,
+) -> Result<()> {
+    if opts.order_by.is_empty() {
+        return chunks(reader, opts, f);
+    }
+    let (by, cap) = (&opts.order_by, opts.order_run_bytes);
+    let sorted = OrderReader::new(reader, by, cap, opts.backend, opts.level, orders.cloned());
+    chunks(sorted, opts, f)
+}
+
+fn chunks<R: Read>(
     mut reader: R,
     opts: &PackOptions,
     mut f: impl FnMut(&FramedChunk<'_>) -> Result<()>,
@@ -2295,14 +2359,15 @@ fn for_each_chunk<R: Read>(
 
 pub fn unpack_stream<R: Read, W: Write>(
     mut reader: R,
-    mut writer: W,
+    writer: W,
     budget: &DecodeBudget,
 ) -> Result<()> {
     let mut prev_plan: Option<ModelPlan> = None;
     let mut dict = Scope::enter(None);
+    let mut writer = Restore::new(writer);
     loop {
         match read_next_frame_header(&mut reader, budget)? {
-            NextFrameKind::Eof => return Ok(()),
+            NextFrameKind::Eof => return writer.finish(),
             NextFrameKind::Index { skip_bytes } => {
                 std::io::copy(
                     &mut (&mut reader).take(skip_bytes as u64),
@@ -2326,6 +2391,13 @@ pub fn unpack_stream<R: Read, W: Write>(
                     let id = exp_xxh
                         .ok_or_else(|| Error::Format("dictionary frame has no id".into()))?;
                     dict.set(Some(Arc::new(Dictionary::read(&payload, id, budget)?)));
+                    continue;
+                }
+                if (hdr.flags & FLAG_ORDER) != 0 {
+                    if budget.verify_checksums && exp_xxh != Some(xxh64(&payload, ORDER_SEED)) {
+                        return Err(Error::ChecksumMismatch("ZFM1 order frame XXH64"));
+                    }
+                    writer.order(&payload, budget)?;
                     continue;
                 }
                 decode_frame_payload(&hdr, &payload, exp_xxh, &mut prev_plan, budget, &mut writer)?;
