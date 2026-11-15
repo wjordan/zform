@@ -317,10 +317,14 @@ impl TableBuilder for Replicas {
         let mut writes = self.writes;
         writes.sort_unstable_by_key(|w| w.0);
         let mut rows = Vec::new();
-        for (k, blk) in keys.iter().enumerate() {
-            let b = hash(blk);
-            let s = writes.partition_point(|w| w.0 < b);
-            let e = s + writes[s..].partition_point(|w| w.0 == b);
+        // Blocks in hash order meet their writes in one pass over them.
+        let mut order: Vec<(u64, usize)> =
+            keys.iter().enumerate().map(|(k, blk)| (hash(blk), k)).collect();
+        order.sort_unstable();
+        let mut s = 0;
+        for (b, k) in order {
+            s += writes[s..].iter().take_while(|w| w.0 < b).count();
+            let e = s + writes[s..].iter().take_while(|w| w.0 == b).count();
             if s == e {
                 continue;
             }
