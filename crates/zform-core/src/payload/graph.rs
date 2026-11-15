@@ -4168,25 +4168,21 @@ fn bitpack_u64(vals: impl Iterator<Item = u64>, bits: u8, len: usize) -> Vec<u8>
     if bits == 0 {
         return Vec::new();
     }
-    let b = bits as usize;
-    let mut out = vec![0u8; (len * b).div_ceil(8)];
-    let mut bit_pos = 0usize;
+    let b = bits as u32;
     let mask = if b == 64 { u64::MAX } else { (1u64 << b) - 1 };
+    // A register accumulator keeps each lane off the bytes the previous lane just stored.
+    let mut out = Vec::with_capacity((len * b as usize).div_ceil(8) + 8);
+    let (mut acc, mut held) = (0u128, 0u32);
     for v in vals {
-        let x = v & mask;
-        let byte_idx = bit_pos >> 3;
-        let shift = bit_pos & 7;
-        let lo = x << shift;
-        let n_lo = (out.len() - byte_idx).min(8);
-        let mut cur = [0u8; 8];
-        cur[..n_lo].copy_from_slice(&out[byte_idx..byte_idx + n_lo]);
-        let merged = u64::from_le_bytes(cur) | lo;
-        out[byte_idx..byte_idx + n_lo].copy_from_slice(&merged.to_le_bytes()[..n_lo]);
-        if shift + b > 64 {
-            out[byte_idx + 8] |= (x >> (64 - shift)) as u8;
+        acc |= u128::from(v & mask) << held;
+        held += b;
+        if held >= 64 {
+            out.extend_from_slice(&(acc as u64).to_le_bytes());
+            acc >>= 64;
+            held -= 64;
         }
-        bit_pos += b;
     }
+    out.extend_from_slice(&(acc as u64).to_le_bytes()[..held.div_ceil(8) as usize]);
     out
 }
 
