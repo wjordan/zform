@@ -263,10 +263,9 @@ impl Model {
         let w = self.weights[d & 7] as u64;
         let la = w * freq1(a, s);
         let lb = (65536 - w) * freq1(b, s);
-        // Exactly floor((la << 16) / (la + lb)): the operands are exact, the quotient (at
-        // most 2^16) rounds by at most 2^-37, and a fractional one is over 2^-32 from an
-        // integer because the divisor is below 2^32.
-        let share = ((la << 16) as f64 / (la + lb) as f64) as u32;
+        // When a value takes one step, this is the decoder's serial path to the next symbol:
+        // an integer division is shorter than a floating one with its two conversions.
+        let share = ((la << 16) / (la + lb)) as u32;
         self.weights[d & 7] = ((share * 31 + 32768) >> 5) as u16;
         // SAFETY: as in `nodes`.
         unsafe {
@@ -727,21 +726,6 @@ mod tests {
             assert_eq!(
                 unsafe { decode_v3(&wire, n, -5, bits, 10, esc) }.unwrap(),
                 values
-            );
-        }
-    }
-
-    #[test]
-    fn nibble_share_matches_integer_division() {
-        let mut rng = 3;
-        for _ in 0..100_000 {
-            let w = 1024 + next(&mut rng) % 63489;
-            let fa = 1 + next(&mut rng) % (MTOT as u64 + 1);
-            let fb = 1 + next(&mut rng) % (MTOT as u64 + 1);
-            let (la, lb) = (w * fa, (65536 - w) * fb);
-            assert_eq!(
-                ((la << 16) as f64 / (la + lb) as f64) as u64,
-                (la << 16) / (la + lb)
             );
         }
     }
