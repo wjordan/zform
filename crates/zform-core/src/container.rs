@@ -1702,7 +1702,23 @@ pub(crate) fn parse_frame_blocks<'a>(
 }
 
 /// Column `cid` of an open block, decoded on first use.
+#[inline(always)]
 pub(crate) fn block_col<'c>(
+    cid: usize,
+    plan: &ModelPlan,
+    ctx: &'c mut BlockDecodeCtx<'_>,
+    budget: &DecodeBudget,
+) -> Result<&'c Col> {
+    // Rows read a column cell after cell: keep the decode path's frame out of their way.
+    if let Some(Some(_)) = ctx.cache.get(cid) {
+        return Ok(ctx.cache[cid].as_ref().unwrap());
+    }
+    decode_block_col(cid, plan, ctx, budget)
+}
+
+#[cold]
+#[inline(never)]
+fn decode_block_col<'c>(
     cid: usize,
     plan: &ModelPlan,
     ctx: &'c mut BlockDecodeCtx<'_>,
