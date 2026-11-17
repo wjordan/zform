@@ -1018,46 +1018,13 @@ impl IntStream {
                 if raw.len() != need {
                     return Err(Error::Format("ForPlanes payload length mismatch".into()));
                 }
-                let mut out = Vec::with_capacity(n);
-                let base = *min as u64;
-                match w {
-                    1 => {
-                        for &b0 in &raw[..n] {
-                            out.push(base.wrapping_add(b0 as u64) as i64);
-                        }
+                let mut out = vec![*min; n];
+                // One pass per plane: each is a simple loop that vectorizes, where gathering
+                // a lane's bytes from all planes at once does not.
+                for (k, plane) in raw.chunks_exact(n.max(1)).enumerate() {
+                    for (o, &b) in out.iter_mut().zip(plane) {
+                        *o = o.wrapping_add(((b as u64) << (8 * k)) as i64);
                     }
-                    2 => {
-                        let (p0, p1) = raw.split_at(n);
-                        for i in 0..n {
-                            let u = u16::from_le_bytes([p0[i], p1[i]]) as u64;
-                            out.push(base.wrapping_add(u) as i64);
-                        }
-                    }
-                    4 => {
-                        let (p0, rest) = raw.split_at(n);
-                        let (p1, rest) = rest.split_at(n);
-                        let (p2, p3) = rest.split_at(n);
-                        for i in 0..n {
-                            let u = u32::from_le_bytes([p0[i], p1[i], p2[i], p3[i]]) as u64;
-                            out.push(base.wrapping_add(u) as i64);
-                        }
-                    }
-                    8 => {
-                        let (p0, rest) = raw.split_at(n);
-                        let (p1, rest) = rest.split_at(n);
-                        let (p2, rest) = rest.split_at(n);
-                        let (p3, rest) = rest.split_at(n);
-                        let (p4, rest) = rest.split_at(n);
-                        let (p5, rest) = rest.split_at(n);
-                        let (p6, p7) = rest.split_at(n);
-                        for i in 0..n {
-                            let u = u64::from_le_bytes([
-                                p0[i], p1[i], p2[i], p3[i], p4[i], p5[i], p6[i], p7[i],
-                            ]);
-                            out.push(base.wrapping_add(u) as i64);
-                        }
-                    }
-                    _ => unreachable!(),
                 }
                 Ok(out)
             }
