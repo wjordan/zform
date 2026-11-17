@@ -1332,7 +1332,9 @@ pub fn decode_json_struct_streams(
 pub struct JsonTreeBlockReconstructor {
     pub struct_streams: Vec<Vec<u32>>,
     pub struct_pos: Vec<usize>,
-    scope_ranges: Vec<Option<(usize, usize)>>,
+    /// By path: where its value stands in the output, valid on the row numbered `row`.
+    scope_ranges: Vec<(u32, usize, usize)>,
+    row: u32,
     tmp: Vec<u8>,
     /// `skip_order` of the tree, once a skip needs it.
     order: Option<Option<Vec<u16>>>,
@@ -1346,25 +1348,24 @@ impl JsonTreeBlockReconstructor {
         Self {
             struct_streams,
             struct_pos: vec![0usize; ns],
-            scope_ranges: vec![None; n_paths],
+            scope_ranges: vec![(0, 0, 0); n_paths],
+            row: 0,
             tmp: Vec::new(),
             order: None,
             visits: Default::default(),
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn next_u32(&mut self, stream_idx: u16) -> Result<u32> {
         let si = stream_idx as usize;
-        let pos = self
-            .struct_pos
-            .get_mut(si)
-            .ok_or_else(|| Error::Format("json struct stream index out of bounds".into()))?;
-        let &v = self.struct_streams[si]
-            .get(*pos)
-            .ok_or_else(|| Error::Format("json struct stream underflow".into()))?;
-        *pos += 1;
-        Ok(v)
+        if let (Some(pos), Some(s)) = (self.struct_pos.get_mut(si), self.struct_streams.get(si))
+            && let Some(&v) = s.get(*pos)
+        {
+            *pos += 1;
+            return Ok(v);
+        }
+        Err(stream_underflow())
     }
 
     pub fn reconstruct_row(
@@ -1376,26 +1377,143 @@ impl JsonTreeBlockReconstructor {
         out: &mut Vec<u8>,
         budget: &DecodeBudget,
     ) -> Result<()> {
-        self.scope_ranges.fill(None);
+        self.row = self.row.wrapping_add(1);
+        if self.row == 0 {
+            self.scope_ranges.fill((0, 0, 0));
+            self.row = 1;
+        }
         let start_len = out.len();
-        self.emit_path(0, jt, plan, ctx, col_pos, out, budget, 0)?;
+        self.emit_child(0, jt, plan, ctx, col_pos, out, budget, 0)?;
         if out.len() - start_len > budget.max_block_decoded_bytes {
             return Err(Error::BudgetExceeded("json reconstructed row size"));
         }
         Ok(())
     }
 
+    /// Where in `out` the value of `r` on this row stands.
+    #[inline]
+    fn scope_ref(&self, r: u16) -> Result<(usize, usize)> {
+        match self.scope_ranges[r as usize] {
+            (row, rs, re) if row == self.row => Ok((rs, re)),
+            _ => Err(Error::Format("JsonTree candidate missing scope ref".into())),
+        }
+    }
+
     /// Where in `out` the value of `r` on this row stands, without its quotes.
     #[inline]
     fn unquoted_ref(&self, r: u16, out: &[u8]) -> Result<(usize, usize)> {
-        let (rs, re) = self.scope_ranges[r as usize]
-            .ok_or_else(|| Error::Format("JsonTree candidate missing scope ref".into()))?;
+        let (rs, re) = self.scope_ref(r)?;
         if re >= rs + 2 && out[rs] == b'"' && out[re - 1] == b'"' {
             return Ok((rs + 1, re - 1));
         }
         Ok((rs, re))
     }
 
+    /// Emits path `p`: a leaf in place, which is most paths, any other through `emit_path`.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn emit_child(
+        &mut self,
+        p: usize,
+        jt: &JsonTreePlan,
+        plan: &ModelPlan,
+        ctx: &mut BlockDecodeCtx<'_>,
+        col_pos: &mut [usize],
+        out: &mut Vec<u8>,
+        budget: &DecodeBudget,
+        depth: usize,
+    ) -> Result<()> {
+        let pdef = &jt.paths[p];
+        if !pdef.shapes.is_empty() {
+            return self.emit_path(p, jt, plan, ctx, col_pos, out, budget, depth);
+        }
+        let start = out.len();
+        let sel = match pdef.cands.is_empty() {
+            true => 0,
+            false => self.next_u32(pdef.sel_stream)? as usize,
+        };
+        if sel == 0 {
+            emit_json_stored_cell(pdef.value_col as usize, plan, ctx, col_pos, out, budget)?;
+        } else {
+            self.emit_cand(p, sel, jt, plan, ctx, col_pos, out, budget)?;
+        }
+        self.scope_ranges[p] = (self.row, start, out.len());
+        Ok(())
+    }
+
+    /// Emits leaf `path_idx` from its candidate `sel`.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn emit_cand(
+        &mut self,
+        path_idx: usize,
+        sel: usize,
+        jt: &JsonTreePlan,
+        plan: &ModelPlan,
+        ctx: &mut BlockDecodeCtx<'_>,
+        col_pos: &mut [usize],
+        out: &mut Vec<u8>,
+        budget: &DecodeBudget,
+    ) -> Result<()> {
+        let pdef = &jt.paths[path_idx];
+        let cand = pdef
+            .cands
+            .get(sel - 1)
+            .ok_or_else(|| Error::Format("JsonTree sel out of range".into()))?;
+        match cand {
+            JsonCand::Copy { ref_path } => {
+                let (rs, re) = self.scope_ref(*ref_path)?;
+                out.extend_from_within(rs..re);
+            }
+            JsonCand::Affix {
+                prefix,
+                ref_path,
+                suffix,
+            } => {
+                let (rs, re) = self.unquoted_ref(*ref_path, out)?;
+                out.extend_from_slice(prefix);
+                out.extend_from_within(rs..re);
+                out.extend_from_slice(suffix);
+            }
+            JsonCand::MultiConcat {
+                lits,
+                refs,
+                b64: false,
+            } => {
+                out.extend_from_slice(&lits[0]);
+                for (i, &r) in refs.iter().enumerate() {
+                    if r as usize == path_idx {
+                        let cid = pdef.value_col as usize;
+                        emit_json_stored_cell(cid, plan, ctx, col_pos, out, budget)?;
+                    } else {
+                        let (rs, re) = self.unquoted_ref(r, out)?;
+                        out.extend_from_within(rs..re);
+                    }
+                    out.extend_from_slice(&lits[i + 1]);
+                }
+            }
+            JsonCand::MultiConcat { lits, refs, .. } => {
+                let mut text = std::mem::take(&mut self.tmp);
+                text.clear();
+                text.extend_from_slice(&lits[0]);
+                for (i, &r) in refs.iter().enumerate() {
+                    let (rs, re) = self.unquoted_ref(r, out)?;
+                    text.extend_from_slice(&out[rs..re]);
+                    text.extend_from_slice(&lits[i + 1]);
+                }
+                if !b64_text_ok(&text) {
+                    return Err(Error::Format("Base64 candidate text not printable".into()));
+                }
+                out.push(b'"');
+                crate::lex::format_base64(&text, out);
+                out.push(b'"');
+                self.tmp = text;
+            }
+        }
+        Ok(())
+    }
+
+    /// Emits path `path_idx`, which has shapes.
     #[allow(clippy::too_many_arguments)]
     fn emit_path(
         &mut self,
@@ -1412,79 +1530,6 @@ impl JsonTreeBlockReconstructor {
             return Err(Error::Format("JsonTree decode recursion limit".into()));
         }
         let pdef = &jt.paths[path_idx];
-
-        if pdef.shapes.is_empty() {
-            let val_start = out.len();
-            let sel = if !pdef.cands.is_empty() {
-                self.next_u32(pdef.sel_stream)? as usize
-            } else {
-                0
-            };
-            if sel == 0 {
-                emit_json_stored_cell(pdef.value_col as usize, plan, ctx, col_pos, out, budget)?;
-            } else {
-                let cand = pdef
-                    .cands
-                    .get(sel - 1)
-                    .ok_or_else(|| Error::Format("JsonTree sel out of range".into()))?;
-                match cand {
-                    JsonCand::Copy { ref_path } => {
-                        let (rs, re) = self.scope_ranges[*ref_path as usize].ok_or_else(|| {
-                            Error::Format("JsonTree Copy missing scope ref".into())
-                        })?;
-                        out.extend_from_within(rs..re);
-                    }
-                    JsonCand::Affix {
-                        prefix,
-                        ref_path,
-                        suffix,
-                    } => {
-                        let (rs, re) = self.unquoted_ref(*ref_path, out)?;
-                        out.extend_from_slice(prefix);
-                        out.extend_from_within(rs..re);
-                        out.extend_from_slice(suffix);
-                    }
-                    JsonCand::MultiConcat {
-                        lits,
-                        refs,
-                        b64: false,
-                    } => {
-                        out.extend_from_slice(&lits[0]);
-                        for (i, &r) in refs.iter().enumerate() {
-                            if r as usize == path_idx {
-                                let cid = pdef.value_col as usize;
-                                emit_json_stored_cell(cid, plan, ctx, col_pos, out, budget)?;
-                            } else {
-                                let (rs, re) = self.unquoted_ref(r, out)?;
-                                out.extend_from_within(rs..re);
-                            }
-                            out.extend_from_slice(&lits[i + 1]);
-                        }
-                    }
-                    JsonCand::MultiConcat { lits, refs, .. } => {
-                        let mut text = std::mem::take(&mut self.tmp);
-                        text.clear();
-                        text.extend_from_slice(&lits[0]);
-                        for (i, &r) in refs.iter().enumerate() {
-                            let (rs, re) = self.unquoted_ref(r, out)?;
-                            text.extend_from_slice(&out[rs..re]);
-                            text.extend_from_slice(&lits[i + 1]);
-                        }
-                        if !b64_text_ok(&text) {
-                            return Err(Error::Format("Base64 candidate text not printable".into()));
-                        }
-                        out.push(b'"');
-                        crate::lex::format_base64(&text, out);
-                        out.push(b'"');
-                        self.tmp = text;
-                    }
-                }
-            }
-            let val_end = out.len();
-            self.scope_ranges[path_idx] = Some((val_start, val_end));
-            return Ok(());
-        }
-
         let shape_id = self.next_u32(pdef.shape_stream)? as usize;
         if shape_id == 0 {
             emit_json_stored_cell(pdef.value_col as usize, plan, ctx, col_pos, out, budget)?;
@@ -1500,16 +1545,8 @@ impl JsonTreeBlockReconstructor {
             match part.kind {
                 SlotKind::None => {}
                 SlotKind::Scalar | SlotKind::Text | SlotKind::Object => {
-                    self.emit_path(
-                        part.path_idx as usize,
-                        jt,
-                        plan,
-                        ctx,
-                        col_pos,
-                        out,
-                        budget,
-                        depth + 1,
-                    )?;
+                    let p = part.path_idx as usize;
+                    self.emit_child(p, jt, plan, ctx, col_pos, out, budget, depth + 1)?;
                 }
                 SlotKind::Array => {
                     let arr_p = part.path_idx as usize;
@@ -1522,7 +1559,7 @@ impl JsonTreeBlockReconstructor {
                         if ei > 0 {
                             out.extend_from_slice(&part.sep);
                         }
-                        self.emit_path(elem_p, jt, plan, ctx, col_pos, out, budget, depth + 1)?;
+                        self.emit_child(elem_p, jt, plan, ctx, col_pos, out, budget, depth + 1)?;
                     }
                 }
             }
@@ -1774,8 +1811,13 @@ fn skip_order(jt: &JsonTreePlan) -> Option<Vec<u16>> {
     (order.len() == n).then_some(order)
 }
 
+#[cold]
+fn stream_underflow() -> Error {
+    Error::Format("json struct stream underflow".into())
+}
+
 /// Appends the next unread cell of value column `cid` as it appears in the record.
-#[inline]
+#[inline(always)]
 fn emit_json_stored_cell(
     cid: usize,
     plan: &ModelPlan,
