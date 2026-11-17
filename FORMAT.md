@@ -6,6 +6,8 @@
 2. **`ZFIX` / `ZFIE`**: the index region over a data region, appended to it or stored apart.
 3. **`ZFP1`**: a trained model saved as a profile (`.zfp`).
 
+None of them is released or carries a compatibility promise: the format changes in place, and a reader decodes what its own writer produces.
+
 The container holds structural models and self-describing column payloads. [§4](#4-model-and-column-payloads) describes how those payloads reconstruct values, with a worked example, graph operands, integer encodings, lane instructions, recurrences, and shared code. The serialized structural model is defined by the implementation in [`grammar.rs`](crates/zform-core/src/grammar.rs) and [`json_tree.rs`](crates/zform-core/src/json_tree.rs). The format is experimental and changes without notice.
 
 Fixed-width integers are little-endian (`LE`). `uvarint` is 7-bit LEB128 (up to 10 bytes for a `u64`); `ivarint` is the `uvarint` of the ZigZag mapping `(x << 1) ^ (x >> 63)`.

@@ -13,6 +13,8 @@ Its peers are compressed log stores (CLP, LogGrep) and seekable zstd. It has no 
 bytes rather than typed vectors, and has no aggregation kernels, so against Parquet or Vortex the
 comparison that applies is file size and the bytes and round trips of a selective read.
 
+Nothing depends on the format yet, so it changes in place with no compatibility path.
+
 ## layers
 
 | Layer | Owns | API |
