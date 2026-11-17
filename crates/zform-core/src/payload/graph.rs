@@ -988,7 +988,7 @@ impl IntStream {
                 if raw.len() < need_bytes {
                     return Err(Error::Format("truncated bitpack payload".into()));
                 }
-                Ok(bitunpack_u64(&raw, *bits, n, *min))
+                Ok(bitunpack_u64(raw, *bits, n, *min))
             }
             Self::ZigZagVarint { len, leaf } => {
                 let n = *len as usize;
@@ -4715,33 +4715,20 @@ fn bitpack_u64(vals: impl Iterator<Item = u64>, bits: u8, len: usize) -> Vec<u8>
     out
 }
 
-fn bitunpack_u64(bytes: &[u8], bits: u8, len: usize, min: i64) -> Vec<i64> {
+fn bitunpack_u64(mut bytes: Vec<u8>, bits: u8, len: usize, min: i64) -> Vec<i64> {
     if bits == 0 {
         return vec![min; len];
     }
-    let b = bits as usize;
-    let mask = if b == 64 { u64::MAX } else { (1u64 << b) - 1 };
-    let mut out = Vec::with_capacity(len);
-    let mut bit_pos = 0usize;
-    for _ in 0..len {
-        let byte_idx = bit_pos >> 3;
-        let shift = bit_pos & 7;
-        let word = if byte_idx + 8 <= bytes.len() {
-            u64::from_le_bytes(bytes[byte_idx..byte_idx + 8].try_into().unwrap())
-        } else {
-            let mut tail = [0u8; 8];
-            let rest = &bytes[byte_idx..];
-            tail[..rest.len()].copy_from_slice(rest);
-            u64::from_le_bytes(tail)
-        };
-        let mut x = word >> shift;
-        if shift + b > 64 && byte_idx + 8 < bytes.len() {
-            x |= (bytes[byte_idx + 8] as u64) << (64 - shift);
-        }
-        out.push((min as u64).wrapping_add(x & mask) as i64);
-        bit_pos += b;
-    }
-    out
+    let (b, mask) = (bits as usize, u64::MAX >> (64 - bits));
+    // Zero padding gives every lane a whole 16-byte window, so no lane takes a tail path.
+    bytes.resize(bytes.len() + 16, 0);
+    (0..len)
+        .map(|i| {
+            let at = i * b / 8;
+            let w = u128::from_le_bytes(bytes[at..at + 16].try_into().unwrap());
+            (min as u64).wrapping_add((w >> (i * b % 8)) as u64 & mask) as i64
+        })
+        .collect()
 }
 
 fn decode_lane_program(bytes: &[u8]) -> Result<Program> {
@@ -4774,7 +4761,7 @@ fn bitpack_roundtrips_every_width() {
                 .collect();
             let packed = bitpack_u64(vals.iter().copied(), bits, len);
             assert_eq!(packed.len(), (len * bits as usize).div_ceil(8));
-            let back = bitunpack_u64(&packed, bits, len, 0);
+            let back = bitunpack_u64(packed, bits, len, 0);
             assert!(back.iter().zip(&vals).all(|(&a, &b)| a as u64 == b), "{bits}");
         }
     }
