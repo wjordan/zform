@@ -820,12 +820,12 @@ fn verbatim_records(
         BlockKind::Verbatim { framing } => framing,
         BlockKind::Sorted { model } => {
             let plan = &plans[model as usize];
-            let mut recs = decode_single_block_records(bytes, e.rows as usize, plan, budget)?;
-            sort_records(&mut recs);
-            let (mut raw, mut spans) = (Vec::new(), Vec::with_capacity(recs.len()));
-            for r in recs {
+            let recs = decode_single_block_records(bytes, e.rows as usize, plan, budget)?;
+            let mut raw = Vec::with_capacity(recs.bytes().len());
+            let mut spans = Vec::with_capacity(recs.len());
+            for i in sort_records(&recs) {
                 let s = raw.len() as u32;
-                raw.extend_from_slice(&r);
+                raw.extend_from_slice(recs.get(i as usize).unwrap());
                 spans.push((s, raw.len() as u32));
             }
             return Ok((raw, spans));

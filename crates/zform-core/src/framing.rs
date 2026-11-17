@@ -407,43 +407,35 @@ pub fn detect_binary_stride(raw: &[u8]) -> Option<(u32, u32)> {
     Some((best_stride as u32, hdr))
 }
 
-/// Emits a decoded record along with its exact delimiter into `out`.
+/// Appends one record with its exact delimiter to `out`; `body` appends the record's bytes. For
+/// `JsonArray` the caller writes the frame's separator between records.
 #[inline]
-pub fn emit_framed_record(
+pub fn frame_record(
     out: &mut Vec<u8>,
-    rec: &[u8],
     framing: ResolvedFraming,
     is_last_in_frame: bool,
-) {
-    match framing {
-        ResolvedFraming::Lf { open_end } => {
-            out.extend_from_slice(rec);
-            if !(is_last_in_frame && open_end) {
-                out.push(b'\n');
-            }
-        }
-        ResolvedFraming::Crlf { open_end } => {
-            out.extend_from_slice(rec);
-            if !(is_last_in_frame && open_end) {
-                out.extend_from_slice(b"\r\n");
-            }
-        }
-        ResolvedFraming::Nul { open_end } => {
-            out.extend_from_slice(rec);
-            if !(is_last_in_frame && open_end) {
-                out.push(0);
-            }
-        }
-        ResolvedFraming::LengthU32Le => {
-            out.extend_from_slice(&(rec.len() as u32).to_le_bytes());
-            out.extend_from_slice(rec);
-        }
-        ResolvedFraming::FixedStride { .. } => {
-            out.extend_from_slice(rec);
-        }
-        // The caller writes the frame's separator between records.
-        ResolvedFraming::JsonArray => out.extend_from_slice(rec),
+    body: impl FnOnce(&mut Vec<u8>) -> Result<()>,
+) -> Result<()> {
+    let at = out.len();
+    if framing == ResolvedFraming::LengthU32Le {
+        out.extend_from_slice(&[0; 4]);
     }
+    body(out)?;
+    let (open_end, delim): (bool, &[u8]) = match framing {
+        ResolvedFraming::Lf { open_end } => (open_end, b"\n"),
+        ResolvedFraming::Crlf { open_end } => (open_end, b"\r\n"),
+        ResolvedFraming::Nul { open_end } => (open_end, b"\0"),
+        ResolvedFraming::LengthU32Le => {
+            let len = (out.len() - at - 4) as u32;
+            out[at..at + 4].copy_from_slice(&len.to_le_bytes());
+            return Ok(());
+        }
+        ResolvedFraming::FixedStride { .. } | ResolvedFraming::JsonArray => return Ok(()),
+    };
+    if !(is_last_in_frame && open_end) {
+        out.extend_from_slice(delim);
+    }
+    Ok(())
 }
 
 // --- JSON document framing ---
@@ -671,7 +663,12 @@ mod tests {
             if i > 0 {
                 out.extend_from_slice(fc.sep());
             }
-            emit_framed_record(&mut out, fc.record(i), fc.framing, i + 1 == fc.len());
+            let rec = fc.record(i);
+            frame_record(&mut out, fc.framing, i + 1 == fc.len(), |o| {
+                o.extend_from_slice(rec);
+                Ok(())
+            })
+            .unwrap();
         }
         out.extend_from_slice(fc.suffix);
         out
@@ -682,6 +679,22 @@ mod tests {
         assert_eq!(rejoin(&fc), raw, "split must be exact");
         (fc.framing == ResolvedFraming::JsonArray)
             .then(|| (0..fc.len()).map(|i| fc.record(i)).collect())
+    }
+
+    #[test]
+    fn split_records_rejoin_exactly() {
+        let lines = b"ab\r\ncd\r\n\r\nlast".as_slice();
+        for spec in [FramingSpec::Lf, FramingSpec::Crlf, FramingSpec::Nul] {
+            assert_eq!(rejoin(&split_chunk(lines, spec)), lines);
+        }
+        let mut lp = Vec::new();
+        for r in [b"xyz".as_slice(), b"", b"0123456789"] {
+            lp.extend_from_slice(&(r.len() as u32).to_le_bytes());
+            lp.extend_from_slice(r);
+        }
+        let fc = split_chunk(&lp, FramingSpec::LengthU32Le);
+        assert_eq!((fc.framing, fc.len()), (ResolvedFraming::LengthU32Le, 3));
+        assert_eq!(rejoin(&fc), lp);
     }
 
     #[test]

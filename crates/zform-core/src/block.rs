@@ -90,5 +90,6 @@ pub fn decode_block(
     n_rows: usize,
     budget: &DecodeBudget,
 ) -> Result<Vec<Vec<u8>>> {
-    decode_single_block_records(bytes, n_rows, model, budget)
+    let recs = decode_single_block_records(bytes, n_rows, model, budget)?;
+    Ok(recs.iter().map(<[u8]>::to_vec).collect())
 }

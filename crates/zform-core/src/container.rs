@@ -9,7 +9,7 @@ use crate::codecs::{
 };
 use crate::dictionary::{Dictionary, DictionaryBuilder, Scope};
 use crate::framing::{
-    FramedChunk, FramingSpec, ResolvedFraming, emit_framed_record, split_chunk, split_json_array,
+    FramedChunk, FramingSpec, ResolvedFraming, frame_record, split_chunk, split_json_array,
 };
 use crate::grammar::{
     BlockReconstructor, ModelPlan, OccRef, PlanVariant, SplitResult, split_records_with_plan,
@@ -80,16 +80,18 @@ fn collation_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     key(&a[same..]).cmp(key(&b[same..]))
 }
 
-/// Restores a sorted-rows block's record order. Records sort as integers on 12 key bytes at a
-/// time, after skipping raw bytes a run of them shares; records still tied go again from where
-/// each stopped, and short runs of them by comparison from there. Order among equal keys is
-/// free: the writer only sorts records whose equal keys are equal.
-pub(crate) fn sort_records(recs: &mut Vec<Vec<u8>>) {
+/// The order that restores a sorted-rows block's records. Records sort as integers on 12 key
+/// bytes at a time, after skipping raw bytes a run of them shares; records still tied go again
+/// from where each stopped, and short runs of them by comparison from there. Order among equal
+/// keys is free: the writer only sorts records whose equal keys are equal.
+pub(crate) fn sort_records(recs: &Cells) -> Vec<u32> {
     let n = recs.len();
     if n < 2 {
-        return;
+        return (0..n as u32).collect();
     }
     assert!(n <= u32::MAX as usize);
+    let (buf, ends) = (recs.bytes(), recs.ends());
+    let rec = |i: usize| &buf[if i == 0 { 0 } else { ends[i - 1] as usize }..ends[i] as usize];
     let idx = |k: &u128| *k as u32 as usize;
     // Digest above record index; `at[i]`: how far record `i`'s raw bytes are accounted for.
     let (mut keys, mut at): (Vec<u128>, _) = ((0..n as u128).collect(), vec![0; n]);
@@ -98,27 +100,27 @@ pub(crate) fn sort_records(recs: &mut Vec<Vec<u8>>) {
         // Tied records sit apart in memory: fetch the next run's while this one sorts.
         if let Some(&(s, e)) = work.last() {
             for k in &keys[s..e] {
-                prefetch(recs[idx(k)][at[idx(k)]..].as_ptr());
+                prefetch(rec(idx(k))[at[idx(k)]..].as_ptr());
             }
         }
         let run = &mut keys[s..e];
         if run.len() <= 8 {
             run.sort_unstable_by(|a, b| {
                 let (a, b) = (idx(a), idx(b));
-                collation_cmp(&recs[a][at[a]..], &recs[b][at[b]..])
+                collation_cmp(&rec(a)[at[a]..], &rec(b)[at[b]..])
             });
             continue;
         }
-        let (r0, a0) = (&recs[idx(&run[0])], at[idx(&run[0])]);
+        let (r0, a0) = (rec(idx(&run[0])), at[idx(&run[0])]);
         if run.iter().all(|k| at[idx(k)] == a0) {
             let shared = run[1..].iter().fold(r0.len() - a0, |l, k| {
-                lcp(&r0[a0..a0 + l], &recs[idx(k)][a0..])
+                lcp(&r0[a0..a0 + l], &rec(idx(k))[a0..])
             });
             run.iter().for_each(|k| at[idx(k)] += shared);
         }
         for k in run.iter_mut() {
             let i = idx(k);
-            *k = digest(&recs[i], &mut at[i]) | i as u128;
+            *k = digest(rec(i), &mut at[i]) | i as u128;
         }
         run.sort_unstable();
         let mut s1 = 0;
@@ -132,10 +134,7 @@ pub(crate) fn sort_records(recs: &mut Vec<Vec<u8>>) {
             s1 = e1;
         }
     }
-    *recs = keys
-        .iter()
-        .map(|k| std::mem::take(&mut recs[idx(k)]))
-        .collect();
+    keys.iter().map(|k| *k as u32).collect()
 }
 
 fn prefetch(p: *const u8) {
@@ -1966,13 +1965,15 @@ pub(crate) fn decode_single_block_records(
     n_rows: usize,
     plan: &ModelPlan,
     budget: &DecodeBudget,
-) -> Result<Vec<Vec<u8>>> {
+) -> Result<Cells> {
     let mut rows = BlockRows::open(block_bytes, n_rows, plan, budget)?;
-    let mut out = Vec::with_capacity(n_rows);
+    let mut out = Cells::with_capacity(n_rows, n_rows.saturating_mul(128));
     for _ in 0..n_rows {
-        let mut rec = Vec::with_capacity(128);
-        rows.emit(&mut rec, budget)?;
-        out.push(rec);
+        rows.emit(out.tail(), budget)?;
+        if out.bytes().len() > budget.max_block_decoded_bytes.min(u32::MAX as usize) {
+            return Err(Error::BudgetExceeded("block decoded bytes"));
+        }
+        out.seal();
     }
     Ok(out)
 }
@@ -2022,18 +2023,29 @@ fn decode_frame(
 
     frame_out.extend_from_slice(&bdir.prefix);
     let mut emitted_recs = 0usize;
-    for (nrows, bslice) in &bdir.blocks {
-        let mut recs = decode_single_block_records(bslice, *nrows, plan, budget)?;
-        if (hdr.flags & FLAG_SORTED_ROWS) != 0 {
-            sort_records(&mut recs);
+    let mut put = |out: &mut Vec<u8>, body: &mut dyn FnMut(&mut Vec<u8>) -> Result<()>| {
+        if emitted_recs > 0 {
+            out.extend_from_slice(&bdir.sep);
         }
-        for rec in &recs {
-            if emitted_recs > 0 {
-                frame_out.extend_from_slice(&bdir.sep);
+        emitted_recs += 1;
+        frame_record(out, hdr.framing, emitted_recs == hdr.record_count, body)
+    };
+    for (nrows, bslice) in &bdir.blocks {
+        if (hdr.flags & FLAG_SORTED_ROWS) != 0 {
+            let recs = decode_single_block_records(bslice, *nrows, plan, budget)?;
+            for i in sort_records(&recs) {
+                let rec = recs.get(i as usize).unwrap();
+                put(&mut frame_out, &mut |o| Ok(o.extend_from_slice(rec)))?;
             }
-            emitted_recs += 1;
-            let is_last = emitted_recs == hdr.record_count;
-            emit_framed_record(&mut frame_out, rec, hdr.framing, is_last);
+        } else {
+            // Rows go straight into the frame, each byte copied once.
+            let mut rows = BlockRows::open(bslice, *nrows, plan, budget)?;
+            for _ in 0..*nrows {
+                put(&mut frame_out, &mut |o| rows.emit(o, budget))?;
+            }
+        }
+        if frame_out.len() > hdr.raw_len {
+            return Err(Error::Format("frame decodes past header raw_len".into()));
         }
     }
     frame_out.extend_from_slice(&bdir.suffix);
@@ -2565,6 +2577,34 @@ mod nested_tests {
     }
 
     #[test]
+    fn framed_rows_unpack_exactly() {
+        let lines: String = (0..300).map(|i| format!("id={i} k=v{}\r\n", i % 7)).collect();
+        let mut lp = Vec::new();
+        for i in 0..300 {
+            let r = format!("rec {i} {}", "x".repeat(i % 5));
+            lp.extend_from_slice(&(r.len() as u32).to_le_bytes());
+            lp.extend_from_slice(r.as_bytes());
+        }
+        let cases = [
+            (lines.as_bytes(), FramingSpec::Crlf),
+            (&lines.as_bytes()[..lines.len() - 2], FramingSpec::Crlf),
+            (&lp[..], FramingSpec::LengthU32Le),
+        ];
+        for (raw, framing) in cases {
+            let opts = PackOptions {
+                framing,
+                index: false,
+                ..Default::default()
+            };
+            let mut packed = Vec::new();
+            pack_stream(raw, &mut packed, &opts).unwrap();
+            let mut back = Vec::new();
+            unpack_stream(&packed[..], &mut back, &DecodeBudget::default()).unwrap();
+            assert_eq!(back, raw);
+        }
+    }
+
+    #[test]
     fn sort_records_orders_by_key() {
         let mut state = 11u64;
         let mut next = |m: u64| {
@@ -2605,7 +2645,11 @@ mod nested_tests {
             recs.extend(dups);
             let mut want = recs.clone();
             want.sort_by_cached_key(|r| collation_key(r));
-            sort_records(&mut recs);
+            let mut cells = Cells::default();
+            recs.iter().for_each(|r| cells.push(r));
+            let mut recs: Vec<Vec<u8>> = (sort_records(&cells).iter())
+                .map(|&i| cells.get(i as usize).unwrap().to_vec())
+                .collect();
             let keys = |v: &[Vec<u8>]| v.iter().map(|r| collation_key(r)).collect::<Vec<_>>();
             assert_eq!(keys(&recs), keys(&want));
             recs.sort();
