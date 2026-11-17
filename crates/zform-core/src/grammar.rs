@@ -1453,7 +1453,7 @@ impl BlockReconstructor {
     }
 
     /// Appends the next unread cell of column `cid` to `out`.
-    #[inline]
+    #[inline(always)]
     fn emit(
         col_pos: &mut [usize],
         plan: &ModelPlan,
