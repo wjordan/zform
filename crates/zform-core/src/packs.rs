@@ -1567,32 +1567,40 @@ pub(crate) fn two_digits(b: &Builder, val: V) -> V {
     b.ri(Op::AddI, raw, 0x3030)
 }
 
+/// The eight decimal digits of `val < 10^8`, most significant in the low byte, as digit values
+/// and as ASCII. Fields of the lane are divided together: the two halves by 100, then the four
+/// pairs by 10.
 #[inline]
 pub(crate) fn eight_digits_raw_and_ascii(b: &Builder, val: V) -> (V, V) {
-    let (d7654, d3210) = div_mod_const(b, val, 10_000);
-    let (d76, d54) = div_mod_const(b, d7654, 100);
-    let (d32, d10) = div_mod_const(b, d3210, 100);
-
-    let pair_raw = |v: V| -> V {
-        let q = b.ri(Op::ShrI, b.ri(Op::MulI, v, 103), 10);
-        let r = b.rr(Op::Add, v, b.ri(Op::MulI, q, -10));
-        b.rr(Op::Or, q, b.ri(Op::ShlI, r, 8))
+    // The fields of `x`, each as its quotient `q` by `d` and above it the remainder.
+    let split = |x: V, q: V, d: i64, half: i64| {
+        b.rr(Op::Add, b.ri(Op::ShlI, x, half), b.ri(Op::MulI, q, 1 - (d << half)))
     };
-
-    let p0 = pair_raw(d76);
-    let p1 = pair_raw(d54);
-    let p2 = pair_raw(d32);
-    let p3 = pair_raw(d10);
-
-    let lo32 = b.rr(Op::Or, p0, b.ri(Op::ShlI, p1, 16));
-    let hi32 = b.rr(Op::Or, p2, b.ri(Op::ShlI, p3, 16));
-    let raw = b.rr(Op::Or, lo32, b.ri(Op::ShlI, hi32, 32));
+    let quot = |x: V, mul: i64, shr: i64, mask: i64| {
+        b.ri(Op::AndI, b.ri(Op::ShrI, b.ri(Op::MulI, x, mul), shr), mask)
+    };
+    let fours = split(val, b.ri(Op::ShrI, b.ri(Op::MulI, val, 109_951_163), 40), 10_000, 32);
+    let pairs = split(fours, quot(fours, 10_486, 20, 0x7f_0000_007f), 100, 16);
+    let raw = split(pairs, quot(pairs, 103, 10, 0x000f_000f_000f_000f), 10, 8);
     let ascii = b.ri(Op::AddI, raw, 0x3030_3030_3030_3030u64 as i64);
     (raw, ascii)
 }
 
 /// Formats variable-length signed `i64` values as canonical decimal text.
 pub fn prog_fmt_int(is_deltas: bool, seed: i64) -> Program {
+    fmt_int(is_deltas, seed, 3)
+}
+
+/// [`prog_fmt_int`] with only the digits `vals` have; a delta program starts from the first.
+pub(crate) fn prog_fmt_ints(vals: &[i64], is_deltas: bool) -> Program {
+    let max = vals.iter().map(|v| v.unsigned_abs()).max().unwrap_or(0);
+    let blocks = 1 + usize::from(max >= 10u64.pow(8)) + usize::from(max >= 10u64.pow(16));
+    let seed = if is_deltas { vals.first().copied().unwrap_or(0) } else { 0 };
+    fmt_int(is_deltas, seed, blocks)
+}
+
+/// Decimal text of values whose magnitude is below `10^(8 * blocks)`.
+fn fmt_int(is_deltas: bool, seed: i64, blocks: usize) -> Program {
     let b = Builder::new(1);
     let inp = b.input(0);
     let val = if is_deltas {
@@ -1606,48 +1614,37 @@ pub fn prog_fmt_int(is_deltas: bool, seed: i64) -> Program {
     let sign_ch = b.konst(b'-' as i64);
     let abs = b.rr(Op::Sub, b.rr(Op::Xor, val, sign_mask), sign_mask);
 
+    // Eight digits a part, the least significant first.
     let inv_1e8 = 12_379_400_392_853_802_749u64 as i64;
-    let hi1 = b.ri(Op::ShrI, b.ri(Op::MulHiI, abs, inv_1e8), 26);
-    let lo8 = b.rr(Op::Add, abs, b.ri(Op::MulI, hi1, -100_000_000));
+    let mut parts = vec![abs];
+    for _ in 1..blocks {
+        let rest = parts.pop().unwrap();
+        let hi = b.ri(Op::ShrI, b.ri(Op::MulHiI, rest, inv_1e8), 26);
+        parts.push(b.rr(Op::Add, rest, b.ri(Op::MulI, hi, -100_000_000)));
+        parts.push(hi);
+    }
 
-    let hi2 = b.ri(Op::ShrI, b.ri(Op::MulHiI, hi1, inv_1e8), 26);
-    let mid8 = b.rr(Op::Add, hi1, b.ri(Op::MulI, hi2, -100_000_000));
-
-    let (raw_hi, asc_hi) = eight_digits_raw_and_ascii(&b, hi2);
-    let (raw_mid, asc_mid) = eight_digits_raw_and_ascii(&b, mid8);
-    let (raw_lo, asc_lo) = eight_digits_raw_and_ascii(&b, lo8);
-
-    let z_hi = b.ri(Op::ShrI, b.r(Op::Ctz, raw_hi), 3);
-    let z_mid = b.ri(Op::ShrI, b.r(Op::Ctz, raw_mid), 3);
-    let z_lo = b.ri(Op::ShrI, b.r(Op::Ctz, raw_lo), 3);
-
-    let eight = b.konst(8);
-    let one = b.konst(1);
-    let zero = b.konst(0);
-
-    let len_hi = b.rr(Op::Sub, eight, z_hi);
-    let shift_hi = b.ri(Op::ShlI, z_hi, 3);
-    let bytes_hi = b.rr(Op::Shr, asc_hi, shift_hi);
-
-    let mid_trimmed_len = b.rr(Op::Sub, eight, z_mid);
-    let len_mid_no_hi = b.select(mid8, mid_trimmed_len, zero);
-    let len_mid = b.select(hi2, eight, len_mid_no_hi);
-    let shift_mid = b.select(hi2, zero, b.ri(Op::ShlI, z_mid, 3));
-    let bytes_mid = b.rr(Op::Shr, asc_mid, shift_mid);
-
-    let has_upper = b.rr(Op::Or, hi2, mid8);
-    let lo_trimmed_len = b.select(lo8, b.rr(Op::Sub, eight, z_lo), one);
-    let len_lo = b.select(has_upper, eight, lo_trimmed_len);
-    let z_lo_clamped = b.select(lo8, z_lo, b.konst(7));
-    let shift_lo = b.select(has_upper, zero, b.ri(Op::ShlI, z_lo_clamped, 3));
-    let bytes_lo = b.rr(Op::Shr, asc_lo, shift_lo);
-
-    b.finish_sinks(&[
-        (sign_ch, Len::Lane(sign_len.0)),
-        (bytes_hi, Len::Lane(len_hi.0)),
-        (bytes_mid, Len::Lane(len_mid.0)),
-        (bytes_lo, Len::Lane(len_lo.0)),
-    ])
+    let (eight, zero) = (b.konst(8), b.konst(0));
+    let mut sinks = vec![(sign_ch, Len::Lane(sign_len.0))];
+    // Whether a more significant part is nonzero: this one is then written whole.
+    let mut upper: Option<V> = None;
+    for (i, &part) in parts.iter().rev().enumerate() {
+        let (raw, asc) = eight_digits_raw_and_ascii(&b, part);
+        // Leading zeros are dropped, but for the last digit of the last part.
+        let mut zeros = b.ri(Op::ShrI, b.r(Op::Ctz, raw), 3);
+        if i + 1 == blocks {
+            zeros = b.select(part, zeros, b.konst(7));
+        }
+        let mut len = b.rr(Op::Sub, eight, zeros);
+        let mut shift = b.ri(Op::ShlI, zeros, 3);
+        if let Some(upper) = upper {
+            len = b.select(upper, eight, len);
+            shift = b.select(upper, zero, shift);
+        }
+        sinks.push((b.rr(Op::Shr, asc, shift), Len::Lane(len.0)));
+        upper = Some(upper.map_or(part, |u| b.rr(Op::Or, u, part)));
+    }
+    b.finish_sinks(&sinks)
 }
 
 /// Formats fixed-width zero-padded unsigned integers (`width` in `2..=16`).
@@ -1856,14 +1853,14 @@ impl CodecPack for ExactIntPack {
         let recent = || {
             let mut gb = GraphBuilder::new(rows.len());
             let ints = gb.add_mtf_ints(&vals);
-            let cells = gb.add_prog_cells(prog_fmt_int(false, 0), vec![ints], vec![]);
+            let cells = gb.add_prog_cells(prog_fmt_ints(&vals, false), vec![ints], vec![]);
             let root = gb.add_patch(cells, &exc_idx, &exc_vals);
             gb.finish(root)
         };
         let stepped = || {
             let mut gb = GraphBuilder::new(rows.len());
             let ints = gb.add_ints(&crate::payload::graph::deltas(&vals));
-            let cells = gb.add_prog_cells(prog_fmt_int(true, vals[0]), vec![ints], vec![]);
+            let cells = gb.add_prog_cells(prog_fmt_ints(&vals, true), vec![ints], vec![]);
             let root = gb.add_patch(cells, &exc_idx, &exc_vals);
             gb.finish(root)
         };
@@ -2332,7 +2329,7 @@ impl CodecPack for PythonMtPack {
                     let rbuf =
                         gb.add_recur_u32(recur_mt19937(true), &pre_seed, vec![], n as u32, false);
                     let col = gb.add_byte_chunks(rbuf, 4);
-                    let cells = gb.add_prog_cells(prog_fmt_int(false, 0), vec![col], vec![]);
+                    let cells = gb.add_prog_cells(fmt_int(false, 0, 2), vec![col], vec![]);
                     return Some(gb.finish(cells));
                 }
             }
@@ -4144,7 +4141,7 @@ impl CodecPack for NumericTemplatePack {
                 }
                 let mut sgb_del = GraphBuilder::new(rows.len());
                 let dn = sgb_del.add_ints(&deltas);
-                let dc = sgb_del.add_prog_cells(prog_fmt_int(true, vals[0]), vec![dn], vec![]);
+                let dc = sgb_del.add_prog_cells(prog_fmt_ints(vals, true), vec![dn], vec![]);
                 let g_del = sgb_del.finish(dc);
                 let len_del = g_del.cost();
                 if best_slot_g.as_ref().is_none_or(|(bl, _)| len_del < *bl) {
@@ -4153,7 +4150,7 @@ impl CodecPack for NumericTemplatePack {
 
                 let mut sgb_mtf = GraphBuilder::new(rows.len());
                 let mn = sgb_mtf.add_mtf_ints(vals);
-                let mc = sgb_mtf.add_prog_cells(prog_fmt_int(false, 0), vec![mn], vec![]);
+                let mc = sgb_mtf.add_prog_cells(prog_fmt_ints(vals, false), vec![mn], vec![]);
                 let g_mtf = sgb_mtf.finish(mc);
                 let len_mtf = g_mtf.cost();
                 if best_slot_g.as_ref().is_none_or(|(bl, _)| len_mtf < *bl) {

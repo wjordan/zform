@@ -2670,7 +2670,7 @@ fn a_sample_pick_is_tried_alone_unless_it_does_not_apply() {
     let mut r = Rng::new(11);
     // A counter, a category and addresses: an integer pack, the dictionary and the IPv4 pack.
     let cols: Vec<Vec<String>> = vec![
-        (0..2000).map(|i| (1000 + 3 * i).to_string()).collect(),
+        (0..2000).map(|i| (3 * i).to_string()).collect(),
         (0..2000).map(|_| ["GET", "PUT", "HEAD"][r.below(3) as usize].to_string()).collect(),
         (0..2000)
             .map(|_| format!("10.{}.{}.{}", r.below(250), r.below(250), r.below(250)))
@@ -2767,4 +2767,37 @@ fn a_replayed_tape_codes_like_values_as_the_search_does_and_any_values_validly()
     replay(&block_counter, &t_ids);
     replay(&block_ids, &t_ids[..1]);
     replay(&block_ids, &[0xff]);
+}
+
+#[test]
+fn integers_format_with_only_the_digit_blocks_their_magnitude_needs() {
+    use crate::payload::engine::CompiledProgram;
+    use crate::payload::ir::eval_reference;
+    let mut vals = vec![0, 6997, 12_345_678, i64::MAX, i64::MIN, i64::MIN + 1];
+    for p in 0..19 {
+        let t = 10i64.pow(p);
+        vals.extend([t - 1, t, t + 1, -t, 1 - t, 7 * t / 3, -(9 * t / 7)]);
+    }
+    let mut r = Rng::new(5);
+    vals.extend((0..4000).map(|i| (r.next() >> (i % 64)) as i64));
+    let mut ops = 0;
+    for blocks in 1..=3 {
+        let limit = 10u128.pow(8 * blocks as u32);
+        let fit: Vec<i64> =
+            vals.iter().copied().filter(|v| u128::from(v.unsigned_abs()) < limit).collect();
+        let prog = prog_fmt_ints(&fit, false);
+        assert_eq!(prog, fmt_int(false, 0, blocks));
+        assert!(prog.ops.len() > ops);
+        ops = prog.ops.len();
+        let want: Vec<Vec<u8>> = fit.iter().map(|v| v.to_string().into_bytes()).collect();
+        assert_eq!(eval_reference(&prog, &[&fit], &[]), want, "{blocks} blocks");
+        let (mut ends, mut text) = (vec![0; fit.len()], vec![0; fit.len() * prog.row_bytes() + 8]);
+        let cp = CompiledProgram::compile(&prog);
+        let n = cp.eval_cells(&[&fit], &[], fit.len(), &mut ends, &mut text);
+        assert_eq!(text[..n], want.concat());
+    }
+    // A delta program starts from the first value.
+    let prog = prog_fmt_ints(&[-5, 20, 20], true);
+    let want = [&b"-5"[..], b"20", b"20"];
+    assert_eq!(eval_reference(&prog, &[&[0, 25, 0]], &[]), want);
 }
