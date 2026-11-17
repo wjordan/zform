@@ -4,7 +4,7 @@
 
 | Corpus | Raw | `zstd -3` | `zstd -19` | `xz -6` | `zform` |
 |---|---:|---:|---:|---:|---:|
-| HDFS DataNode logs | 8.00 MiB | 0.72 MiB (11.1x) | 0.47 MiB (17.0x) | 0.49 MiB (16.2x) | **0.15 MiB (52.9x)** |
+| HDFS DataNode logs | 8.00 MiB | 0.72 MiB (11.1x) | 0.47 MiB (17.0x) | 0.49 MiB (16.2x) | **0.15 MiB (53.1x)** |
 | GitHub Archive NDJSON | 8.00 MiB | 0.89 MiB (8.9x) | 0.69 MiB (11.6x) | 0.69 MiB (11.6x) | **0.55 MiB (14.5x)** |
 | Silesia `sao` star catalog (binary) | 6.92 MiB | 5.29 MiB (1.31x) | 4.77 MiB (1.45x) | 4.21 MiB (1.64x) | **3.57 MiB (1.94x)** |
 
@@ -164,14 +164,14 @@ Single-core throughput and peak memory on the two log corpora:
 
 | Codec | Compress MB/s | Decompress MB/s | Compress RSS MiB | Decompress RSS MiB |
 |---|---:|---:|---:|---:|
-| `zstd -3` | 580–680 | 1,500 | 6.6–6.8 | 5.7–6.0 |
-| `zstd -19` | 3.6–6.3 | 1,100–1,200 | 92 | 11 |
-| `xz -6` | 8.7–9.4 | 380–440 | 79–91 | 10 |
-| `zform` | 25–92 | 360–430 | 38–250 | 26–30 |
+| `zstd -3` | 570–640 | 1,500 | 6.7 | 5.7–5.9 |
+| `zstd -19` | 3.8–6.7 | 1,200 | 92–93 | 11–12 |
+| `xz -6` | 9.3–10 | 350–450 | 79–90 | 10 |
+| `zform` | 26–97 | 580–610 | 38–240 | 17 |
 
 Larger inputs give every compressor more context. On a full hour of GitHub Archive (499 MB), `zform pack --best` writes 21.4 MB (23.3x), against 37.8 MB for `zstd -19` and 26.6 MB for `zstd --ultra -22 --long=31`; the default setting writes 30.4 MB. `--best` adds a file dictionary of values that recur across blocks, so blocks stay small and independently readable. `--order-by type,repo.id` stores the events sorted by type and repository, which brings `--best` to 18.3 MB (27.2x) and the default to 23.7 MB; unpacking restores the original order and holds a run of up to 512 MiB in memory, and `grep` and `select` answer in the stored order.
 
-On the whole Loghub HDFS log (1.58 GB), `zform pack` writes 35.0 MB (45x) in 12.2 s on one core and unpacks it in 1.4 s. `gzip -6` takes 13.1 s for 155.7 MB; `zstd -19` and `xz -9` write 98.3 MB and 96.3 MB. Adding `-l 6 --hdfs-predictors --context-mixing`, which models how HDFS hands out block ids, builds write pipelines, numbers threads and deletes blocks, brings the file to 17.6 MB (90x) in 18.4 s, unpacked in 3.7 s. `pack` and `unpack` work on every core by default, and pack writes the same bytes: on 24 cores, 2.3 s and 5.1 s to pack, 0.3 s and 0.9 s to unpack.
+On the whole Loghub HDFS log (1.58 GB), `zform pack` writes 35.0 MB (45x) in 12.2 s on one core and unpacks it in 1.4 s. `gzip -6` takes 13.1 s for 155.7 MB; `zstd -19` and `xz -9` write 98.3 MB and 96.3 MB. Adding `-l 6 --hdfs-predictors --context-mixing`, which models how HDFS hands out block ids, builds write pipelines, numbers threads and deletes blocks, brings the file to 17.7 MB (89x) in 18.4 s, unpacked in 3.7 s. `pack` and `unpack` work on every core by default, and pack writes the same bytes: on 24 cores, 2.3 s and 5.1 s to pack, 0.3 s and 0.9 s to unpack.
 
 [`bench/README.md`](bench/README.md) has the commands for these tables, cold-query measurements and a CloudTrail comparison.
 
