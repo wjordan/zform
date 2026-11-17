@@ -10,6 +10,7 @@
 
 mod chain;
 mod context_mix;
+mod legacy;
 pub mod engine;
 pub mod graph;
 pub mod ir;

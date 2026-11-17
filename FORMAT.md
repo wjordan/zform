@@ -216,13 +216,14 @@ fn main() -> zform::Result<()> {
 rows: uvarint | flags: u8 | [dict_id: uvarint] | [n_src: uvarint | src: [uvarint; n_src]] | n_nodes: uvarint | nodes | root: uvarint
 ```
 
-A graph with no rows is exactly one byte, `0`, with no flags or nodes. Nonempty general graphs have 1–4,096 nodes. Their dependency flags combine as follows:
+A graph with no rows is exactly one byte, `0`, with no flags or nodes. Nonempty general graphs have 1–4,096 nodes. Their dependency and capability flags combine as follows:
 
-| Flag | Following header fields | Dependency |
+| Flag | Following header fields | Meaning |
 |---:|---|---|
 | `0x01` | None | The block's prose pool |
 | `0x02` | `dict_id: uvarint` | One shared dictionary of cells in the block |
 | `0x04` | `n_src: uvarint`, then `src: [uvarint; n_src]` | 1–64 peer column ids in the block |
+| `0x20` | None | Extended `KeyedSum` operands are permitted |
 
 A `src` entry with bit 31 set names column `src & 0x7fffffff` of the file's tables, which it must have. `ExtPeer.slot` indexes the header's `src` list; it is not a column id. `ExtDict.dict_id` must match the header's dictionary id. These declarations let a reader fetch dependencies without evaluating nodes. The model's library supplies code references separately. A missing external input returns `Error::NotLoaded`; an undeclared input is a format error.
 
@@ -240,7 +241,7 @@ These forms have inline code and no external dependencies or library references.
 
 ### node operands
 
-Each node starts with `tag: u8`. The low seven bits select its kind. Bit `0x80` means `include_seed` for `RecurBuf` and `has_map` for `QuoteOrNull`; writers leave it clear for other kinds.
+Each node starts with `tag: u8`. The low seven bits select its kind. Bit `0x80` means `include_seed` for `RecurBuf`, `has_map` for `QuoteOrNull`, and `has_options` for `KeyedSum`; writers leave it clear for other kinds.
 
 Unless typed otherwise, operands are `uvarint`. `ref` names an earlier node; `refs` is a count followed by that many references. `blob` is a byte length followed by those bytes. A `leaf_blob` is a `blob` containing one complete entropy leaf (§1). `IntStream` and code references have their own layouts below.
 
@@ -268,11 +269,24 @@ Unless typed otherwise, operands are `uvarint`. `ref` names an earlier node; `re
 | `22` | `ExtAlign` | `key`, `at` | Integers: for each cell of `at`, the value id of the first `key` cell in its record |
 | `23` | `MatchIndex` | `needles: ref`, `hay: ref`, `codes: ref` | Integers: positions in `hay` matched by key |
 | `24` | `PagedSlice` | `buf: ref`, `lens: ref`, `pages: ref`, `bases: ref` | Cell `i` of `lens[i]` bytes in page `pages[i]`; page `p`'s cells follow one another from offset `bases[p]` of `buf`; the pages' runs must not overlap |
-| `25` | `KeyedSum` | `keys: ref`, `deltas: ref` | Integers: `state[keys[i]] += deltas[i]`, wrapping; a new key's state starts at the last sum yielded (0 at first); key `0` yields `deltas[i]`; keys `0..=rows` |
+| `25` | `KeyedSum` | `keys: ref`, `deltas: ref`, `[options: u8, [order: ref]]` | Integers: a wrapping running sum per key, with optional ordering and seed policy (below); key `0` yields `deltas[i]`; keys bounded by the input row count |
 | `26` | `ExtVariant` | None | Integers: for each cell of this column, its record's variant id |
 | `27` | `CellIds` | `cells: ref` | Integers: each cell's value id, the rank of its value's first occurrence |
 | `28` | `Interleave` | `sel: ref`, `streams: refs` | Integers: row `i` is the next unread value of `streams[sel[i]]`; every stream is read to its end |
-| `29` | `RankedSum` | `at: ref`, `picks: ref`, `deltas: ref`, `order: ref`, `cands: ref`, `width: u8` | Integers: a row with pick `0` yields `deltas[i]`. The others are taken in order of the integer in cell `at[i]` of `order` (parsed as by `ParseAsciiInt`), ties in row order. Rows of one order share the candidates of its first row: the distinct nonempty cells among `cands[width * at[i]..][..width]`, those that were picked in the last order they were candidates of first, each group in cell order. Pick `p` takes the `p`-th candidate that no earlier row of the order took and yields its sum plus `deltas[i]`, wrapping; a candidate's sum starts at the last sum yielded (0 at first) |
+| `29` | `RankedSum` (legacy) | `at: ref`, `picks: ref`, `deltas: ref`, `order: ref`, `cands: ref`, `width: u8` | Integers: a row with pick `0` yields `deltas[i]`. The others are taken in order of the integer in cell `at[i]` of `order` (parsed as by `ParseAsciiInt`), ties in row order. Rows of one order share the candidates of its first row: the distinct nonempty cells among `cands[width * at[i]..][..width]`, those that were picked in the last order they were candidates of first, each group in cell order. Pick `p` takes the `p`-th candidate that no earlier row of the order took and yields its sum plus `deltas[i]`, wrapping; a candidate's sum starts at the last sum yielded (0 at first) |
+
+`KeyedSum` without `has_options` retains its original operands and behavior: process input
+rows in order, initializing a new key from the last nonzero-key sum (initially zero).
+With `has_options`, `options` must be nonzero and contain only bits `0x01` and `0x02`.
+Bit `0x01` initializes each key independently at zero; otherwise the original seed policy
+applies. Bit `0x02` adds an integer `order` reference: process rows by signed order value,
+break ties by input position, and put each result back at its input position. Keys, deltas,
+and ordering values must have equal lengths. Key zero passes through without changing
+any state. Ordered scans require all input rows even for a prefix read.
+
+An extended `KeyedSum` requires graph flag `0x20`. Earlier readers reject this flag before
+reading node operands; they cannot read the extended form. Current readers still accept
+original `KeyedSum` and `RankedSum` payloads. Built-in writers no longer emit `RankedSum`.
 
 `MtfFixed` keeps the last 64 items, most recent first. Code `0` consumes the next `width` fallback bytes and inserts that item. Code `k > 0` selects rank `k - 1` and moves it to the front. `MtfInts` uses the same code convention with integer misses.
 

@@ -116,22 +116,28 @@ and `MatchIndex` locate the block's first occurrence; `IndexCells` reads its tab
 Changes become exact patches. Missing keys or ambiguous multi-key records decline the candidate.
 
 Counters a log keeps per entity are coded as keyed running sums: `KeyedSum` adds each delta to
-the state its key names and yields the sum (a new key starts from the last sum yielded), and
-key 0 passes the delta through. Keys come from the record's template (`ExtVariant` through a
-table) or from a value (`CellIds`, each value's first-occurrence rank); `Interleave` gives each
+the state its key names and yields the sum. A key starts at zero or, for the original seed
+policy, at the last sum yielded; key 0 passes the delta through. An optional integer input
+orders the scan, with ties in input order and results kept in their original positions.
+Keys come from the record's template (`ExtVariant` through a table) or from a value (`CellIds`, each value's first-occurrence rank); `Interleave` gives each
 template its own delta stream. HDFS times keep one clock for rows that start a block's write,
 one for rows that finish it and one for reads; other rows code their time by recency. Thread
 ids keep a counter per datanode: the writer infers which replica logged a write row from the
 pipeline (a `Receiving` row names its upstream, `PacketResponder N` its place) and codes it as
 an index into the replica table, which lists each block's replicas in pipeline order; with
 write rows stored by template and pipeline place, those codes and the IP columns' repeat block
-after block. A datanode deletes its blocks in id order and its deletion rows do not name it, so
-`RankedSum` takes those rows in id order, each a step on the clock of one of its block's
-replicas: the reader ranks first the replicas that deleted the last block they held, and the
-writer picks from that ranking the one whose clock is nearest. A keyed relation that loses a
-sample by under a half is tried again on the block, where its keys' first steps weigh less. On
-a 256 MB HDFS slice the write clocks and counters cut threads 25% and times 20%, the file 12%;
-on the whole log the deletion clocks cut times 18%, the file 3.5%.
+after block.
+
+A datanode deletes its blocks in id order and its deletion rows do not name it. The writer
+infers the replica from its clock and recent use, then stores its explicit position in the
+block's replica table. Ordinary table lookups and `CellIds` produce keys; ordered, zero-seeded
+`KeyedSum` reconstructs the clocks. The reader does no candidate ranking. `RankedSum` remains
+only for decoding older archives, in `payload/legacy.rs`.
+
+A keyed relation that loses a sample by under a half is tried again on the block, where its
+keys' first steps weigh less. On a 256 MB HDFS slice the write clocks and counters cut threads
+25% and times 20%, the file 12%. The deletion-clock ablation and production validation are
+recorded in [the benchmark notes](bench/README.md#rankedsum-ablation).
 
 The registry accepts only graphs with earlier peer dependencies and at least 32 bytes of savings
 over the current choice, including graph and shared-code costs. Standalone columns skip relation
@@ -142,6 +148,33 @@ read needs.
 The HDFS pack remains opt-in. Task/partition reuse saved more than the per-block size model on
 the measured samples. Emitter- and operation-keyed recent-block caches did not reliably improve
 the existing block-ID encoding, so they remain benchmark experiments rather than decoder features.
+
+## payload node scope
+
+The graph has 25 active node kinds plus legacy `RankedSum`; the lane program still has 35
+operations. Ordered `KeyedSum` adds options to an existing node, not another opcode or a
+second sorting/permutation language. The full node sweep found these boundaries worth keeping:
+
+| Nodes | Why the distinction exists |
+|---|---|
+| `Bytes` (inline or `LibraryBytes`), `IntStream` | Entropy leaves, native integer transports, and shared model bytes have different storage and lifetime rules. |
+| `ByteChunks`, `ParseAsciiInt` | Typed adapters from packed binary words or text cells into integers; neither embeds a corpus vocabulary. |
+| `ProgramI64`, `ProgramCells` | The same lane language with native integer or byte-cell outputs. |
+| `RecurBuf` | A bounded recurrence expressed as code, used for multiple generator families; no generator-specific reader opcode. |
+| `MtfFixed`, `MtfInts` | The same recency idea for 1–64-byte items versus native integers, with different caches and miss storage. A tagged union would retain both implementations. |
+| `SliceBuf`, `PagedSlice`, `IndexCells`, `ConstCells` | Consecutive slices, independently paged slices, indexed cell views, and repeated literals. These preserve lazy output and selective reads; lowering them to materializing programs would lose those properties. |
+| `TemplateCells`, `PatchCells` | Variable-length assembly and sparse exact exceptions, respectively. Positional indexing alone does neither. |
+| `QuoteOrNull` | An intentional JSON-oriented convenience, preserving lazy quoted/dictionary views. This is the clearest remaining format specialization; replacing it with templates and indexing needs a query/memory ablation first. |
+| `ExtPool`, `ExtDict`, `ExtPeer` | External buffer, block dictionary cells, and peer/table cells. Their declarations drive dependency loading. Combining tags would still require the same source distinctions. |
+| `ExtAlign`, `ExtVariant` | Record alignment and variant metadata supplied by the host; no HDFS template or field names. |
+| `MatchIndex`, `CellIds` | Keyed occurrence lookup versus value interning. `IndexCells` is a positional lookup, so it does not replace either. |
+| `Interleave`, `KeyedSum` | Stable multiplexing of integer streams and per-key accumulation, composable with explicit keys and ordering values. |
+| `RankedSum` | Compatibility only. Candidate ranking, elimination, ordering and clock state made it the over-specialized node; new graphs express the relationship using the simpler nodes above. |
+
+Integer transports are a separate layer. The older bitwise `ContextMix` remains a reader
+compatibility form; writers choose `NibbleMix`. The other transports encode constant,
+run-length, bit-packed, sparse, Rice, varint, or byte-plane distributions without corpus
+semantics. Similar names alone are not evidence that two representations are redundant.
 
 ## file layout
 

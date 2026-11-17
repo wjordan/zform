@@ -1,0 +1,421 @@
+{
+  "commit": "fc5e9458fbdf368e4890076ccfbabf3f4b18943f",
+  "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.42",
+  "method": "Same whole CRLF input and indexed level-6 HDFS-predictor/context-mixing archives as the first ablation; one encoding thread. Whole-file screening once each; zero-seeded confirmation three sequential repeats. Every archive roundtripped against SHA256 and grep output checked. Screening timings may overlap compilation; use confirmation samples for timing. Physical row order is a broader experiment that can change column sampling and candidate selection.",
+  "raw_bytes": 1577982906,
+  "raw_sha256": "0783096174d7832c618337f9609e06e04abd86ddd7089b3c12b407e63bfebc52",
+  "references": {
+    "ranked": 17599245,
+    "off": 18235313,
+    "previous_replica_argsort": 17725378
+  },
+  "variants": [
+    {
+      "mode": "replica-split",
+      "bytes": 17704190,
+      "encode_seconds": 17.96202370338142,
+      "decode_seconds": 5.541403334587812,
+      "encode_samples": [
+        17.96202370338142
+      ],
+      "decode_samples": [
+        5.541403334587812
+      ],
+      "compressed_sha256": "15a09624d92bc399a311669862951dec0f9fab9208ff21f334437efedd658665",
+      "roundtrip": true,
+      "grep": true,
+      "determinism_checked": false,
+      "contains_ranked_sum": false,
+      "contains_sort_indices": true,
+      "timing_repeats": 1,
+      "extra_bytes_over_ranked": 104945,
+      "change_percent_over_ranked": 0.5963039891768052,
+      "savings_retained_percent": 83.50097788286787,
+      "contains_ordered_sum": false,
+      "clock_payload_bytes": 2936085
+    },
+    {
+      "mode": "replica-physical",
+      "bytes": 21472105,
+      "encode_seconds": 19.324842600151896,
+      "decode_seconds": 5.4275137558579445,
+      "encode_samples": [
+        19.324842600151896
+      ],
+      "decode_samples": [
+        5.4275137558579445
+      ],
+      "compressed_sha256": "60668b71622f7072b2ab5b94e5866fbc29ca95821498b25c054dcfd7e47f3b49",
+      "roundtrip": true,
+      "grep": true,
+      "determinism_checked": false,
+      "contains_ranked_sum": false,
+      "contains_sort_indices": false,
+      "timing_repeats": 1,
+      "extra_bytes_over_ranked": 3872860,
+      "change_percent_over_ranked": 22.005830363745726,
+      "savings_retained_percent": -508.8751517133388,
+      "contains_ordered_sum": false,
+      "clock_payload_bytes": 2943944
+    },
+    {
+      "mode": "replica-ordered",
+      "bytes": 17722305,
+      "encode_seconds": 18.26545885950327,
+      "decode_seconds": 5.4578948598355055,
+      "encode_samples": [
+        18.26545885950327
+      ],
+      "decode_samples": [
+        5.4578948598355055
+      ],
+      "compressed_sha256": "49669c86ba631fe3f3ffb8350db6476838c5d19615d5fae313d35f4bb9f71854",
+      "roundtrip": true,
+      "grep": true,
+      "determinism_checked": false,
+      "contains_ranked_sum": false,
+      "contains_sort_indices": false,
+      "timing_repeats": 1,
+      "extra_bytes_over_ranked": 123060,
+      "change_percent_over_ranked": 0.6992345410271827,
+      "savings_retained_percent": 80.65301194211939,
+      "contains_ordered_sum": true,
+      "clock_payload_bytes": 2954244
+    },
+    {
+      "mode": "replica-ordered-split",
+      "bytes": 17701119,
+      "encode_seconds": 18.18086706660688,
+      "decode_seconds": 5.482113923877478,
+      "encode_samples": [
+        18.18086706660688
+      ],
+      "decode_samples": [
+        5.482113923877478
+      ],
+      "compressed_sha256": "05c78385a8784c845a34f29c571c799d0baf489110526fb11157432571f41885",
+      "roundtrip": true,
+      "grep": true,
+      "determinism_checked": false,
+      "contains_ranked_sum": false,
+      "contains_sort_indices": false,
+      "timing_repeats": 1,
+      "extra_bytes_over_ranked": 101874,
+      "change_percent_over_ranked": 0.5788543769917442,
+      "savings_retained_percent": 83.98378789689153,
+      "contains_ordered_sum": true,
+      "clock_payload_bytes": 2933060
+    },
+    {
+      "mode": "replica-ordered-zero",
+      "bytes": 17703621,
+      "encode_seconds": 17.972080796957016,
+      "decode_seconds": 5.443325400352478,
+      "encode_samples": [
+        17.95956478267908,
+        18.13341207616031,
+        17.972080796957016
+      ],
+      "decode_samples": [
+        5.4507529232650995,
+        5.443325400352478,
+        5.428298840299249
+      ],
+      "compressed_sha256": "d11016342e9ad7dc4edf103eed0d1247c6e67c025ffa74c9d1332938a28de710",
+      "roundtrip": true,
+      "grep": true,
+      "determinism_checked": true,
+      "contains_ranked_sum": false,
+      "contains_sort_indices": false,
+      "contains_ordered_sum": true,
+      "timing_repeats": 3,
+      "extra_bytes_over_ranked": 104376,
+      "change_percent_over_ranked": 0.5930708959390074,
+      "savings_retained_percent": 83.59043372721156,
+      "clock_payload_bytes": 2935561
+    }
+  ],
+  "windows": {
+    "other_modes": [
+      {
+        "source": "/tmp/zform-ranked-ablation/inputs/middle.log",
+        "raw_bytes": 33554316,
+        "raw_sha256": "dbec2df16d5d7d0c2bda2665fdfedad2da8519e28f12b421faa0c2db920d6cb7",
+        "variants": [
+          {
+            "mode": "replica-argsort",
+            "bytes": 562269,
+            "encode_seconds": 0.530007503926754,
+            "decode_seconds": 0.1341272946447134,
+            "encode_samples": [
+              0.530007503926754
+            ],
+            "decode_samples": [
+              0.1341272946447134
+            ],
+            "compressed_sha256": "2abdddf64ca04827d514cc5fb2d5ca5ced1eadab6e61d6bccd6e5dd02b545fba",
+            "roundtrip": true,
+            "grep": true,
+            "determinism_checked": false,
+            "contains_ranked_sum": false,
+            "contains_sort_indices": true
+          },
+          {
+            "mode": "replica-split",
+            "bytes": 562075,
+            "encode_seconds": 0.4839717112481594,
+            "decode_seconds": 0.13902992568910122,
+            "encode_samples": [
+              0.4839717112481594
+            ],
+            "decode_samples": [
+              0.13902992568910122
+            ],
+            "compressed_sha256": "5cf82e7bb7f34867bdcd5e26cb812f33fd032c7db55a2df2ea23b8937ee7d3bb",
+            "roundtrip": true,
+            "grep": true,
+            "determinism_checked": false,
+            "contains_ranked_sum": false,
+            "contains_sort_indices": true
+          },
+          {
+            "mode": "replica-ordered",
+            "bytes": 562206,
+            "encode_seconds": 0.48305781185626984,
+            "decode_seconds": 0.13693196140229702,
+            "encode_samples": [
+              0.48305781185626984
+            ],
+            "decode_samples": [
+              0.13693196140229702
+            ],
+            "compressed_sha256": "5eaf48c4836fa972c40256138e17436faf6e5dd58e6a2d29f5238f22a247cc3d",
+            "roundtrip": true,
+            "grep": true,
+            "determinism_checked": false,
+            "contains_ranked_sum": false,
+            "contains_sort_indices": false
+          },
+          {
+            "mode": "replica-ordered-split",
+            "bytes": 562013,
+            "encode_seconds": 0.48148248344659805,
+            "decode_seconds": 0.14594602398574352,
+            "encode_samples": [
+              0.48148248344659805
+            ],
+            "decode_samples": [
+              0.14594602398574352
+            ],
+            "compressed_sha256": "c94c76b7b69a299bb552915eb58be816b9cd3132a2f69ea394a93c6c08ca7caf",
+            "roundtrip": true,
+            "grep": true,
+            "determinism_checked": false,
+            "contains_ranked_sum": false,
+            "contains_sort_indices": false
+          },
+          {
+            "mode": "replica-physical",
+            "bytes": 571046,
+            "encode_seconds": 0.5190534200519323,
+            "decode_seconds": 0.1369714867323637,
+            "encode_samples": [
+              0.5190534200519323
+            ],
+            "decode_samples": [
+              0.1369714867323637
+            ],
+            "compressed_sha256": "2eb8be2e203e47d84bc6d3c116349f9c87fa9a15e06fe08b31aa92758d347265",
+            "roundtrip": true,
+            "grep": true,
+            "determinism_checked": false,
+            "contains_ranked_sum": false,
+            "contains_sort_indices": false
+          }
+        ]
+      },
+      {
+        "source": "/tmp/zform-ranked-ablation/inputs/tail.log",
+        "raw_bytes": 33554386,
+        "raw_sha256": "34c4fb53a9ebfb71c8032d1efb54160ca1f1d4f24944e9224ee5fb82e7b97817",
+        "variants": [
+          {
+            "mode": "replica-argsort",
+            "bytes": 385855,
+            "encode_seconds": 0.4039159454405308,
+            "decode_seconds": 0.1415588464587927,
+            "encode_samples": [
+              0.4039159454405308
+            ],
+            "decode_samples": [
+              0.1415588464587927
+            ],
+            "compressed_sha256": "7c044f7ea889274c80ce380b7cce3f8ffd6cb97ef9e4bf463d13889f2d1a089f",
+            "roundtrip": true,
+            "grep": true,
+            "determinism_checked": false,
+            "contains_ranked_sum": false,
+            "contains_sort_indices": true
+          },
+          {
+            "mode": "replica-split",
+            "bytes": 385160,
+            "encode_seconds": 0.40051473677158356,
+            "decode_seconds": 0.1408891510218382,
+            "encode_samples": [
+              0.40051473677158356
+            ],
+            "decode_samples": [
+              0.1408891510218382
+            ],
+            "compressed_sha256": "1b9d54156e18818acfdf59a19a2b0f9e8c076545c70e4cfc0cef91234c37589b",
+            "roundtrip": true,
+            "grep": true,
+            "determinism_checked": false,
+            "contains_ranked_sum": false,
+            "contains_sort_indices": true
+          },
+          {
+            "mode": "replica-ordered",
+            "bytes": 385786,
+            "encode_seconds": 0.4015079438686371,
+            "decode_seconds": 0.13972978480160236,
+            "encode_samples": [
+              0.4015079438686371
+            ],
+            "decode_samples": [
+              0.13972978480160236
+            ],
+            "compressed_sha256": "7772ff17abe55d459e3174f5198f9247ab31d56d1123f4b1ce56f93e141ce80e",
+            "roundtrip": true,
+            "grep": true,
+            "determinism_checked": false,
+            "contains_ranked_sum": false,
+            "contains_sort_indices": false
+          },
+          {
+            "mode": "replica-ordered-split",
+            "bytes": 385090,
+            "encode_seconds": 0.39912637509405613,
+            "decode_seconds": 0.1382832508534193,
+            "encode_samples": [
+              0.39912637509405613
+            ],
+            "decode_samples": [
+              0.1382832508534193
+            ],
+            "compressed_sha256": "f90d58eb8fc356ac1b7668669f8386768a5e90e8176803c386abbb527ec00ec5",
+            "roundtrip": true,
+            "grep": true,
+            "determinism_checked": false,
+            "contains_ranked_sum": false,
+            "contains_sort_indices": false
+          },
+          {
+            "mode": "replica-physical",
+            "bytes": 621963,
+            "encode_seconds": 0.4624420963227749,
+            "decode_seconds": 0.1322919838130474,
+            "encode_samples": [
+              0.4624420963227749
+            ],
+            "decode_samples": [
+              0.1322919838130474
+            ],
+            "compressed_sha256": "a157ace9ae4b64a4e366c1e436e9fb758b757a059829773cb5fd607abf857a93",
+            "roundtrip": true,
+            "grep": true,
+            "determinism_checked": false,
+            "contains_ranked_sum": false,
+            "contains_sort_indices": false
+          }
+        ]
+      }
+    ],
+    "zero_seed": [
+      {
+        "source": "/tmp/zform-ranked-ablation/inputs/middle.log",
+        "raw_bytes": 33554316,
+        "raw_sha256": "dbec2df16d5d7d0c2bda2665fdfedad2da8519e28f12b421faa0c2db920d6cb7",
+        "variants": [
+          {
+            "mode": "replica-ordered-zero",
+            "bytes": 562017,
+            "encode_seconds": 0.5370192732661963,
+            "decode_seconds": 0.13563432358205318,
+            "encode_samples": [
+              0.5370192732661963
+            ],
+            "decode_samples": [
+              0.13563432358205318
+            ],
+            "compressed_sha256": "9edec4dbb9e18625d84a5e549f4ae9870ebe33b9e1e07d62608be790aa40a73a",
+            "roundtrip": true,
+            "grep": true,
+            "determinism_checked": false,
+            "contains_ranked_sum": false,
+            "contains_sort_indices": false
+          }
+        ]
+      },
+      {
+        "source": "/tmp/zform-ranked-ablation/inputs/tail.log",
+        "raw_bytes": 33554386,
+        "raw_sha256": "34c4fb53a9ebfb71c8032d1efb54160ca1f1d4f24944e9224ee5fb82e7b97817",
+        "variants": [
+          {
+            "mode": "replica-ordered-zero",
+            "bytes": 385048,
+            "encode_seconds": 0.41413010843098164,
+            "decode_seconds": 0.16040447540581226,
+            "encode_samples": [
+              0.41413010843098164
+            ],
+            "decode_samples": [
+              0.16040447540581226
+            ],
+            "compressed_sha256": "60ce0c028b85a0a93f7ab0f7163d6ecfe28dd011513706d45439231479cf398c",
+            "roundtrip": true,
+            "grep": true,
+            "determinism_checked": false,
+            "contains_ranked_sum": false,
+            "contains_sort_indices": false
+          }
+        ]
+      }
+    ]
+  },
+  "builds": {
+    "initial": {
+      "commit": "fc5e9458fbdf368e4890076ccfbabf3f4b18943f",
+      "overlay_sha256": "5f6f9753ba567df49b02bebacde6280d491ce36e9e79e57fea3807e91638a094",
+      "production_hdfs_sha256": "775a13ce2aa792294e322d3b7c7409d5897bd8f6bc4dc7fcc15c4dc39d6ad4fc",
+      "benchmark_python_sha256": "ece757ff3dc1c943ba7ba7c348d95274692527edff06c9dc3a17789738d79d92",
+      "benchmark_rust_sha256": "cae0ec891dd67991dee7c017ecadd18f2ef3c49340a264ccdb5a644949d0077e"
+    },
+    "with_seed_comparison": {
+      "commit": "fc5e9458fbdf368e4890076ccfbabf3f4b18943f",
+      "overlay_sha256": "6d8399e9efa11320c92856b44f590745e843030d6d3bf3609ce9c4e8bf1bac2f",
+      "production_hdfs_sha256": "775a13ce2aa792294e322d3b7c7409d5897bd8f6bc4dc7fcc15c4dc39d6ad4fc",
+      "benchmark_python_sha256": "7b4779a309548929a35faf0716cfd26ef3c1ca7ad89fe44b84656fac57d7e9bd",
+      "benchmark_rust_sha256": "bbd582c1c12486bab22c2d8b824b44c7ef5db9cca5bce141e6fa8709b36a8a48"
+    }
+  },
+  "validation": {
+    "hdfs_modes_tested": 13,
+    "tests_per_hdfs_process": 12,
+    "payload_tests_passed": 31,
+    "payload_tests_ignored": 1,
+    "test_timeout_seconds": 1,
+    "all_whole_file_roundtrips": true,
+    "all_whole_file_grep_checks": true,
+    "zero_seed_confirm_repeats": 3,
+    "production_sources_changed": false
+  },
+  "interpretation": "Zero-initialized ordered per-key sums retain 83.59% of the deletion savings for 0.593% extra whole-file bytes. They cost only 2502 bytes over the shared-seed ordered sum. Sorting deletion rows physically makes the two block-ID columns about 3.71 MB larger. This is an empirical tradeoff, not a proof of minimum complexity or entropy.",
+  "commands": [
+    "python3 bench/ranked_sum_ablation.py build --work /tmp/ranked-followup",
+    "python3 bench/ranked_sum_ablation.py run --work /tmp/ranked-followup --modes replica-split replica-ordered replica-ordered-split replica-ordered-zero replica-physical --repeats 1 /path/to/HDFS.log",
+    "python3 bench/ranked_sum_ablation.py run --work /tmp/ranked-followup --modes replica-ordered-zero --repeats 3 /path/to/HDFS.log"
+  ]
+}

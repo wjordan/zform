@@ -661,7 +661,12 @@ impl Render<'_> {
             GraphNode::QuoteOrNull { .. } => "QuoteOrNull".into(),
             GraphNode::ParseAsciiInt { .. } => "ParseAsciiInt".into(),
             GraphNode::MatchIndex { .. } => "MatchIndex".into(),
-            GraphNode::KeyedSum { .. } => "KeyedSum".into(),
+            GraphNode::KeyedSum { order, seed, .. } => match (order, seed) {
+                (None, crate::payload::graph::SumSeed::Previous) => "KeyedSum".into(),
+                (None, crate::payload::graph::SumSeed::Zero) => "KeyedSum(zero)".into(),
+                (Some(_), crate::payload::graph::SumSeed::Previous) => "KeyedSum(ordered,previous)".into(),
+                (Some(_), crate::payload::graph::SumSeed::Zero) => "KeyedSum(ordered,zero)".into(),
+            },
             GraphNode::RankedSum { .. } => "RankedSum".into(),
             GraphNode::ExtVariant => "Variant".into(),
             GraphNode::CellIds { .. } => "CellIds".into(),

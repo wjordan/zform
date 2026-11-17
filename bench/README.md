@@ -76,6 +76,141 @@ not complete codecs. Grouping models execute and verify their existing-payload g
 these block-reuse models gave a consistent improvement over the current codec across the three
 windows; no new mutable-state decoder operation was added.
 
+## RankedSum ablation
+
+`ranked_sum_ablation.py` builds a temporary copy of revision `fc5e945` and compares
+deletion-clock representations in complete indexed archives. The runner leaves the working
+tree unchanged; its historical source is pinned so the original experiments stay reproducible. Every mode
+keeps the same writer-side datanode inference for a given record order. `off` disables
+deletion prediction while retaining the other HDFS predictors.
+
+```bash
+python3 bench/ranked_sum_ablation.py build --work /tmp/ranked-ablation
+python3 bench/ranked_sum_ablation.py run --work /tmp/ranked-ablation /path/to/HDFS.log
+```
+
+The build runs the payload tests and HDFS fixtures in every mode, including missing table
+keys, invalid times, sparse rows, negative values and stable sorting ties. Each test process
+has a one-second timeout. The manual benchmark checks exact SHA-256 roundtrips and `grep`
+results, and repeated encodes must produce identical bytes. `--modes`, `--no-mixing`,
+`--level`, `--repeats`, and `--timeout` restrict a run.
+
+On the whole 1,577,982,906-byte HDFS file, at level 6 with HDFS predictors, context mixing,
+one encoding thread, and the query index included:
+
+| Mode | Decoder construction for deletion clocks | Archive bytes | Change from RankedSum |
+|---|---|---:|---:|
+| `ranked` | Current `RankedSum` | 17,599,245 | — |
+| `off` | No deletion prediction | 18,235,313 | +3.61% |
+| `keyed-row` | Explicit node IDs, `KeyedSum`, stored row order | 18,390,759 | +4.50% |
+| `keyed-sorted` | Explicit node IDs, `KeyedSum`, explicit inverse permutation | 18,441,470 | +4.79% |
+| `scan-grouped` | Group by inferred node, `ScanAdd`, explicit inverse permutation | 18,417,705 | +4.65% |
+| `keyed-argsort` | Explicit node IDs, `KeyedSum`, derived permutation | 18,366,984 | +4.36% |
+| `replica-row` | Replica-table lookup, `KeyedSum`, stored row order | 18,343,134 | +4.23% |
+| `replica-argsort` | Replica-table lookup, `KeyedSum`, derived permutation | 17,725,378 | +0.72% |
+
+`replica-argsort` keeps 80.2% of the savings over `off`. Its time-column payload grows
+from 2,831,332 to 2,957,269 bytes. Both predictors are selected in 62 column payloads.
+The other replacements lose more to key or permutation storage, or to worse clock residuals,
+than they save. These are results after ordinary candidate selection; a rejected relation
+falls back to another codec.
+
+Three repeated whole-file runs give median encode/decode times of 18.058/5.524 seconds
+for `ranked` and 18.126/5.563 seconds for `replica-argsort`: differences below 1%, within
+the range of run-to-run decode variation. Encoded bytes were identical across repeats.
+The other whole-file variants were screened once; their timings are not used to rank speed.
+
+The argsort modes introduce one experimental graph node, `SortIndices(values)`, returning
+row indices ordered by signed integer value, with ties in original row order. The replacement
+uses existing operations to look up the selected replica, assign its value ID, gather keys
+and deltas in block-ID order, apply `KeyedSum`, and gather the results back. Sorting the first
+permutation's indices produces its inverse. Candidate ranking and selection without replacement
+remain entirely in the writer.
+
+Only the temporary reader understands `SortIndices` (experimental tag 30). All other modes
+use existing operations. This is an ablation, not a production format change or a decision
+to retain that tag.
+
+Three 32 MiB windows cover the head, middle and tail of the full input. The head selects no
+deletion predictor. On the middle and tail, `replica-argsort` costs 481 and 1,004 more bytes
+than `ranked`; `off` is actually 927 bytes smaller than `ranked` on the tail. Each window
+builds its own file table, so it does not reproduce the whole file's available replica history.
+
+Recorded measurements and validation are in [ranked-sum-results.json](ranked-sum-results.json).
+
+### Further simplification
+
+The follow-up compares simpler state initialization, smaller slot streams, a fused ordered
+sum, and a change to stored row order. Sizes use the same whole input and flags as above:
+
+| Mode | Archive bytes | Extra bytes over RankedSum |
+|---|---:|---:|
+| `replica-argsort` (previous result) | 17,725,378 | 126,133 |
+| `replica-split` | 17,704,190 | 104,945 |
+| `replica-ordered` | 17,722,305 | 123,060 |
+| `replica-ordered-split` | 17,701,119 | 101,874 |
+| `replica-ordered-zero` | 17,703,621 | 104,376 |
+| `replica-physical` | 21,472,105 | 3,872,860 |
+
+`replica-split` codes replica slots per template through the existing `Interleave` operation.
+It removes repeated information already available from record variants; it adds no decoder rule.
+
+`replica-ordered` replaces the sort/gather/sum/inverse/gather composition with one experimental
+`OrderedSum(keys, deltas, order)` node. It accumulates in ascending order, breaks ties by row
+position, and returns results in original row positions. Key 0 passes its delta through.
+`replica-ordered-split` combines that operation with template-separated slot streams.
+
+`replica-ordered-zero` starts every key at zero, removing the dependency on the last sum emitted
+for another key. The writer stores the first value of each key as an absolute delta. It retains
+83.6% of the deletion predictor's savings and costs only 2,502 bytes more than the shared-seed
+version, or 0.014% of that archive. This is the simplest state model tested that keeps most of
+the savings. The prototype carries a seed-mode byte solely to compare the two definitions;
+a production choice of zero-seeded sums would not need that option.
+
+The temporary reader also computes `SortIndices(SortIndices(x))` by a linear permutation
+inversion. The first node already guarantees a permutation, so the second sort is unnecessary.
+This changes neither the graph nor its bytes. An ordered sum needs neither explicit permutation
+node and sorts only rows with a nonzero key.
+
+`replica-physical` sorts deletion rows by block ID within each block before encoding and uses
+the existing keyed sum. It needs no new decoder operation, but the two block-ID columns grow
+by about 3.71 MB relative to `replica-split`. Reordering one column's useful neighbours harms
+the others. This mode also changes the writer's samples and stored layout, so it is a broader
+experiment than the fixed-order graph comparisons.
+
+On the middle and tail windows, `replica-ordered-zero` writes 562,017 and 385,048 bytes,
+respectively: 229 and 197 bytes larger than `RankedSum`. No result establishes a lower bound
+on compression or complexity; the tradeoff measured here favors a plain ordered per-key sum
+and writer-side slot coding over additional domain rules in the reader.
+
+The added modes are available through the same runner. The temporary reader assigns tag 31
+to `OrderedSum`; that experimental tag is not part of the production format. Follow-up measurements are in
+[ranked-sum-simpler-results.json](ranked-sum-simpler-results.json).
+
+### Production KeyedSum extension
+
+The writer now uses existing kind 25 with optional ordering and zero-seed options. It emits
+explicit replica slots, table lookups, `CellIds`, and `KeyedSum`; neither experimental node
+was added. `RankedSum` remains a compatibility decoder. The final graph reuses its alignment
+input and removes the now-unused deletion-selector table.
+
+| Indexed archive | Bytes |
+|---|---:|
+| Original `RankedSum` | 17,599,245 |
+| Deletion prediction disabled | 18,235,313 |
+| Ordered, zero-seeded `KeyedSum` | 17,703,055 |
+
+The simpler production form costs 103,810 bytes (0.590%) over `RankedSum`, retaining 83.7% of
+its deletion-clock savings. Two full encodes produced identical bytes, with median pack/unpack
+times of 18.167/5.476 seconds. Head/middle/tail 32 MiB windows measured 382,990 / 561,990 /
+385,042 bytes. Every archive passed SHA256 roundtrip and indexed `grep` checks.
+
+The new reader also decoded the old full-file `RankedSum` archive exactly. Old readers reject
+new sum options through a graph capability flag. All 21 non-HDFS regression inputs retained
+identical archives to `fc5e945`, with HDFS predictors both disabled and enabled.
+[Production results](keyed-sum-results.json) include hashes and timing samples; the
+[node audit](../DESIGN.md#payload-node-scope) records the remaining node boundaries.
+
 ## hdfs block traces
 
 HDFS.log is sorted by locale collation over the whole line: alphanumerics only, case-folded.

@@ -1,6 +1,6 @@
 //! Writer-side HDFS relationships. Readers execute only ordinary payload operations.
 use super::*;
-use crate::payload::graph::{Ranked, ranked_order};
+use crate::payload::graph::{SumSeed, parse_cell_ascii_i64};
 use memchr::memmem::Finder;
 use std::mem::take;
 use std::sync::LazyLock;
@@ -487,37 +487,24 @@ fn clocks(ctx: &RelationContext<'_, '_>, key: Option<usize>) -> Option<PayloadGr
     let marked: Vec<bool> = (vids.iter().zip(vals))
         .map(|(&v, &t)| deletes[v as usize] > 0 && seconds(t).is_some())
         .collect();
-    let picks = key.and_then(|key| deletions(ctx, key, &marked, &mut deltas));
-    if picks.is_some() {
+    let slots = key.and_then(|key| deletions(ctx, key, &marked, &mut deltas));
+    if slots.is_some() {
         // Steps, not times.
         (0..n_var).filter(|&v| deletes[v] > 0).for_each(|v| recency[stream[v] as usize] = false);
     }
     let mut gb = GraphBuilder::new(vals.len());
-    // Each variant's clock, then its stream, then whether it deletes.
+    // Each variant's clock, then its stream.
     let mut luts = clock.clone();
     luts.extend(&stream);
-    luts.extend(&deletes);
     let lut = gb.add_raw_bytes(&luts);
     let vid = gb.push(GraphNode::ExtVariant);
     let keys = gb.add_prog_i64(lut_prog(0), vec![vid], vec![lut]);
     let sel = gb.add_prog_i64(lut_prog(n_var as i64), vec![vid], vec![lut]);
     let sels: Vec<usize> = vids.iter().map(|&v| stream[v as usize] as usize).collect();
     let deltas = interleave(&mut gb, sel, &sels, &deltas, &recency);
-    let mut t = gb.push(GraphNode::KeyedSum { keys, deltas });
-    if let (Some(picks), Some(key)) = (picks, key) {
-        let sel = gb.add_prog_i64(lut_prog(2 * n_var as i64), vec![vid], vec![lut]);
-        let sels: Vec<usize> = vids.iter().map(|&v| deletes[v as usize] as usize).collect();
-        let picks = interleave(&mut gb, sel, &sels, &picks, &[false; 2]);
-        let at = gb.add_ext_align(key as u32, Some(TABLE_PEER));
-        let (order, cands) = (gb.add_ext_peer(TABLE_PEER), gb.add_ext_peer(TABLE_PEER | 1));
-        t = gb.push(GraphNode::RankedSum {
-            at,
-            picks,
-            deltas: t,
-            order,
-            cands,
-            width: REPLICAS as u8,
-        });
+    let mut t = gb.push(GraphNode::KeyedSum { keys, deltas, order: None, seed: SumSeed::Previous });
+    if let (Some(slots), Some(key)) = (slots, key) {
+        t = deletion_sum(&mut gb, t, key, &slots, sel, &sels, recency.len());
     }
     let b = Builder::new(1);
     // Sums stay within a few days of the base.
@@ -539,10 +526,9 @@ const DELETING: &[u8] = b"Deleting block";
 
 /// A datanode works through the blocks it is told to delete in order of their ids, so one
 /// node's deletions run on a clock of their own once the rows are taken in that order. Rows
-/// do not name the node: it is one of the block's replicas, and the reader ranks first those
-/// that deleted the last block they held. Each of the `marked` rows whose block the table
-/// holds has its time in `deltas` turned into a step on the replica it suits best; the picks
-/// that tell the reader which are returned, `0` for a row left as it was.
+/// do not name the node: infer one of the block's replicas from its clock and recent use.
+/// Selected rows become steps on that replica's independent clock, starting at zero.
+/// Return explicit replica slots, or `-1` for rows left unchanged.
 fn deletions(
     ctx: &RelationContext<'_, '_>,
     key: usize,
@@ -559,11 +545,12 @@ fn deletions(
     let row_of = |i: usize| ids[aligned[i] as usize] as usize;
     let mut rows: Vec<(i64, usize)> = (0..marked.len())
         .filter(|&i| marked[i])
-        .filter_map(|i| Some((ranked_order(blocks.get(row_of(i))?), i)))
+        .filter_map(|i| Some((parse_cell_ascii_i64(blocks.get(row_of(i))?), i)))
         .collect();
     rows.sort_unstable();
-    let mut state = Ranked::default();
-    let (mut picks, mut steps) = (vec![0i64; marked.len()], deltas.to_vec());
+    let mut state = DeletionClocks::default();
+    let (mut slots, mut steps) = (vec![-1i64; marked.len()], deltas.to_vec());
+    let mut emitted = FastSet::default();
     let (mut left, mut all) = (Vec::new(), Vec::new());
     let mut j = 0;
     while j < rows.len() {
@@ -585,19 +572,98 @@ fn deletions(
         for (&p, &(_, i)) in chain.iter().zip(group) {
             let at = left.iter().position(|&k| k == all[p])?;
             let k = left.remove(at);
-            picks[i] = at as i64 + 1;
-            steps[i] = deltas[i] - state.sum(k);
-            state.step(k, steps[i]);
+            slots[i] = (from..from + REPLICAS)
+                .position(|c| ips.get(c).and_then(|v| state.ids.get(v).copied()) == Some(k))? as i64;
+            let step = deltas[i] - state.sum(k);
+            // Inference may compare clocks across nodes; decoding keeps each key independent.
+            steps[i] = if emitted.insert(k) { deltas[i] } else { step };
+            state.step(k, step);
         }
         state.close(&all, &left);
     }
     // A clock pays once its node has rows to step between.
-    let n = picks.iter().filter(|&&p| p > 0).count();
+    let n = slots.iter().filter(|&&p| p >= 0).count();
     if n < 4 * state.keys().max(4) {
         return None;
     }
     deltas.copy_from_slice(&steps);
-    Some(picks)
+    Some(slots)
+}
+
+#[derive(Default)]
+struct DeletionClocks<'a> {
+    ids: FastMap<&'a [u8], u32>,
+    keys: Vec<(Option<i64>, bool)>,
+    last: i64,
+}
+
+impl<'a> DeletionClocks<'a> {
+    /// A group's candidates, in pick order, as `left`.
+    fn open(&mut self, cells: impl Iterator<Item = &'a [u8]>, left: &mut Vec<u32>) {
+        left.clear();
+        for v in cells.filter(|v| !v.is_empty()) {
+            let next = self.keys.len() as u32;
+            let k = *self.ids.entry(v).or_insert(next);
+            if k == next {
+                self.keys.push((None, false));
+            }
+            if !left.contains(&k) {
+                left.push(k);
+            }
+        }
+        // Stable: candidates alike stay in cell order.
+        left.sort_by_key(|&k| !self.keys[k as usize].1);
+    }
+
+    fn keys(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn sum(&self, k: u32) -> i64 {
+        self.keys[k as usize].0.unwrap_or(self.last)
+    }
+
+    fn step(&mut self, k: u32, delta: i64) -> i64 {
+        self.last = self.sum(k).wrapping_add(delta);
+        self.keys[k as usize].0 = Some(self.last);
+        self.last
+    }
+
+    /// Ends a group of candidates `all`, `left` of them untaken.
+    fn close(&mut self, all: &[u32], left: &[u32]) {
+        for &k in all {
+            self.keys[k as usize].1 = !left.contains(&k);
+        }
+    }
+}
+
+/// Explicit replica choices feed ordinary table lookups and an ordered sum.
+fn deletion_sum(
+    gb: &mut GraphBuilder, deltas: u16, key: usize, slots: &[i64],
+    sel: u16, sels: &[usize], streams: usize,
+) -> u16 {
+    let at = gb.add_ext_align(key as u32, Some(TABLE_PEER));
+    let slots = interleave(gb, sel, sels, slots, &vec![false; streams]);
+    let b = Builder::new(2);
+    let present = b.ri(Op::AddI, b.input(1), 1);
+    let index = b.rr(Op::Add, b.ri(Op::MulI, b.input(0), REPLICAS as i64), b.input(1));
+    let index = b.select(present, index, b.konst(0));
+    let index = gb.add_prog_i64(b.finish(&[(index, 8)]), vec![at, slots], vec![]);
+    let ips = gb.add_ext_peer(TABLE_PEER | 1);
+    let ips = gb.add_index_cells(ips, index);
+    let ids = gb.push(GraphNode::CellIds { cells: ips });
+    let b = Builder::new(2);
+    let present = b.ri(Op::AddI, b.input(1), 1);
+    let key = b.select(present, b.ri(Op::AddI, b.input(0), 1), b.konst(0));
+    let keys = gb.add_prog_i64(b.finish(&[(key, 8)]), vec![ids, slots], vec![]);
+    // Unselected rows may name absent table entries; their ordering value is immaterial.
+    let b = Builder::new(2);
+    let safe = b.select(b.input(1), b.input(0), b.konst(0));
+    let at = gb.add_prog_i64(b.finish(&[(safe, 8)]), vec![at, keys], vec![]);
+    let blocks = gb.add_ext_peer(TABLE_PEER);
+    let blocks = gb.add_index_cells(blocks, at);
+    let order = gb.add_parse_ascii_int(blocks);
+    gb.push(GraphNode::KeyedSum { keys, deltas, order: Some(order), seed: SumSeed::Zero })
 }
 
 /// The byte at `offset + x` of the program's buffer.
@@ -878,7 +944,7 @@ fn threads(ctx: &RelationContext<'_, '_>, key: usize) -> Option<PayloadGraph> {
     let (node, code) = (b.input(0), b.input(1));
     let k = b.select(code, b.ri(Op::AddI, node, 1), b.konst(0));
     let keys = gb.add_prog_i64(b.finish(&[(k, 8)]), vec![nodes, codes_node], vec![]);
-    let t = gb.push(GraphNode::KeyedSum { keys, deltas: steps });
+    let t = gb.push(GraphNode::KeyedSum { keys, deltas: steps, order: None, seed: SumSeed::Previous });
     let base = gb.add_prog_cells(prog_fmt_int(false, 0), vec![t], vec![]);
     let root = gb.add_patch(base, &exc_idx, &exc_vals);
     Some(gb.finish(root))
@@ -1436,6 +1502,16 @@ mod tests {
                 cols[3].push(hms(t));
             }
         }
+        for (variant, block, time) in [
+            (2, b"999999".to_vec(), hms(6100)),
+            (1, b"999998".to_vec(), hms(6200)),
+            (1, keys[0].clone(), b"250000".to_vec()),
+        ] {
+            vids.push(variant);
+            cols[1].push(block);
+            cols[2].push(b"081109".to_vec());
+            cols[3].push(time);
+        }
         let cells = |v: &[Vec<u8>]| {
             let lens: Vec<u32> = v.iter().map(|x| x.len() as u32).collect();
             Cells::from_lens(v.concat(), &lens).unwrap()
@@ -1452,7 +1528,10 @@ mod tests {
             variant_ids: &vids,
         };
         let graph = HdfsRelations.try_encode(&ctx, &PackRegistry::default()).unwrap();
-        assert!(graph.nodes.iter().any(|n| matches!(n, GraphNode::RankedSum { .. })));
+        assert!(graph.nodes.iter().any(|n| matches!(n, GraphNode::KeyedSum {
+            order: Some(_), seed: SumSeed::Zero, ..
+        })));
+        assert!(!graph.nodes.iter().any(|n| matches!(n, GraphNode::RankedSum { .. })));
         let dict = Dictionary::new(b"content".to_vec()).with_tables(table());
         let _scope = Scope::enter(Some(Arc::new(dict)));
         let got = decode_with(&plan, &vids, &cols, 3, &graph);

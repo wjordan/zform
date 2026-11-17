@@ -1137,6 +1137,14 @@ impl IntStream {
     }
 }
 
+/// Initial state of a key before its first delta.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SumSeed {
+    Zero,
+    /// Retains the cross-key initialization used by original kind-25 payloads.
+    Previous,
+}
+
 /// One node in a [`PayloadGraph`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GraphNode {
@@ -1232,11 +1240,13 @@ pub enum GraphNode {
         hay: u16,
         codes: u16,
     },
-    /// A running sum per key: `state[keys[i]] += deltas[i]` yields row `i`, a key's state
-    /// starting at the last sum yielded (0 at first); key `0` yields `deltas[i]` alone.
+    /// A wrapping running sum per key. Optional order values determine processing order,
+    /// with ties in input order; outputs retain their input positions. Key 0 passes through.
     KeyedSum {
         keys: u16,
         deltas: u16,
+        order: Option<u16>,
+        seed: SumSeed,
     },
     /// Sums on keys the rows do not name. Rows with a pick are taken in order of the integers
     /// `order[at[i]]`, ties in row order; rows of one order share the first's candidates, the
@@ -1244,6 +1254,7 @@ pub enum GraphNode {
     /// stepped when last a candidate first. Pick `p` steps the `p`-th candidate no earlier row
     /// of the order took: `deltas[i]` added to its sum, which starts at the last sum yielded
     /// (0 at first). A row with pick `0` yields `deltas[i]` alone.
+    /// Legacy decoding only; new writers use ordered `KeyedSum` and explicit keys.
     RankedSum {
         at: u16,
         picks: u16,
@@ -1266,6 +1277,10 @@ pub enum GraphNode {
 }
 
 impl GraphNode {
+    fn extended_sum(&self) -> bool {
+        matches!(self, Self::KeyedSum { order: Some(_), .. } | Self::KeyedSum { seed: SumSeed::Zero, .. })
+    }
+
     #[inline]
     pub fn for_each_dep(&self, mut f: impl FnMut(u16)) {
         match self {
@@ -1278,9 +1293,10 @@ impl GraphNode {
             | Self::ExtAlign { .. }
             | Self::ExtVariant => {}
             Self::ByteChunks { buf, .. } => f(*buf),
-            Self::KeyedSum { keys, deltas } => {
+            Self::KeyedSum { keys, deltas, order, .. } => {
                 f(*keys);
                 f(*deltas);
+                if let Some(order) = order { f(*order); }
             }
             Self::CellIds { cells } => f(*cells),
             Self::RankedSum { at, picks, deltas, order, cands, .. } => {
@@ -1457,9 +1473,11 @@ impl GraphNode {
                 map: map.map(&mut f),
             },
             Self::ParseAsciiInt { cells } => Self::ParseAsciiInt { cells: f(*cells) },
-            Self::KeyedSum { keys, deltas } => Self::KeyedSum {
+            Self::KeyedSum { keys, deltas, order, seed } => Self::KeyedSum {
                 keys: f(*keys),
                 deltas: f(*deltas),
+                order: order.map(&mut f),
+                seed: *seed,
             },
             Self::CellIds { cells } => Self::CellIds { cells: f(*cells) },
             Self::RankedSum { at, picks, deltas, order, cands, width } => Self::RankedSum {
@@ -1684,9 +1702,13 @@ impl PayloadGraph {
             }
         }
 
+        // Old readers did not reject the high node-tag bit on kind 25. A graph capability
+        // bit makes them reject the extended form before interpreting its operands.
+        let extended_sums = self.nodes.iter().any(GraphNode::extended_sum);
         let flags = (u8::from(self.ext_pool))
             | (u8::from(self.ext_dict.is_some()) << 1)
-            | (u8::from(!self.ext_peers.is_empty()) << 2);
+            | (u8::from(!self.ext_peers.is_empty()) << 2)
+            | (u8::from(extended_sums) << 5);
         out.push(flags);
         if let Some(d) = self.ext_dict {
             put_uvarint(&mut out, d as u64);
@@ -1778,7 +1800,7 @@ impl PayloadGraph {
                 nodes,
             });
         }
-        if flags & !0x07 != 0 {
+        if flags & !0x27 != 0 {
             return Err(Error::Format("unknown PayloadGraph ext_flags".into()));
         }
         let ext_pool = (flags & EXT_FLAG_POOL) != 0;
@@ -1813,6 +1835,9 @@ impl PayloadGraph {
         let mut nodes = Vec::with_capacity(n_nodes);
         for idx in 0..n_nodes {
             let node = decode_node(&mut cur, idx, lib, budget)?;
+            if node.extended_sum() && flags & 0x20 == 0 {
+                return Err(Error::Format("KeyedSum options without graph capability".into()));
+            }
             match &node {
                 GraphNode::ExtPool if !ext_pool => {
                     return Err(Error::Format("undeclared ExtPool dependency".into()));
@@ -2925,10 +2950,15 @@ fn encode_node_linked(n: &GraphNode, lib: Option<&Library>, out: &mut Vec<u8>) {
             put_uvarint(out, *hay as u64);
             put_uvarint(out, *codes as u64);
         }
-        GraphNode::KeyedSum { keys, deltas } => {
-            out.push(25);
+        GraphNode::KeyedSum { keys, deltas, order, seed } => {
+            let extended = order.is_some() || *seed == SumSeed::Zero;
+            out.push(25 | if extended { 0x80 } else { 0 });
             put_uvarint(out, *keys as u64);
             put_uvarint(out, *deltas as u64);
+            if extended {
+                out.push(u8::from(*seed == SumSeed::Zero) | (u8::from(order.is_some()) << 1));
+                if let Some(order) = order { put_uvarint(out, *order as u64); }
+            }
         }
         GraphNode::ExtVariant => out.push(26),
         GraphNode::CellIds { cells } => {
@@ -3165,10 +3195,16 @@ fn decode_node(
             hay: check_ref(cur.uvar()?)?,
             codes: check_ref(cur.uvar()?)?,
         }),
-        25 => Ok(GraphNode::KeyedSum {
-            keys: check_ref(cur.uvar()?)?,
-            deltas: check_ref(cur.uvar()?)?,
-        }),
+        25 => {
+            let (keys, deltas) = (check_ref(cur.uvar()?)?, check_ref(cur.uvar()?)?);
+            let options = if flag { cur.u8()? } else { 0 };
+            if options & !3 != 0 || (flag && options == 0) {
+                return Err(Error::Format("invalid KeyedSum options".into()));
+            }
+            let seed = if options & 1 != 0 { SumSeed::Zero } else { SumSeed::Previous };
+            let order = if options & 2 != 0 { Some(check_ref(cur.uvar()?)?) } else { None };
+            Ok(GraphNode::KeyedSum { keys, deltas, order, seed })
+        }
         26 => Ok(GraphNode::ExtVariant),
         27 => Ok(GraphNode::CellIds {
             cells: check_ref(cur.uvar()?)?,
@@ -4087,11 +4123,16 @@ impl CoreDecoder {
                     n_aligned += 1;
                     Val::Ints(v.clone())
                 }
-                GraphNode::KeyedSum { keys, deltas } => Val::Ints(keyed_sum(
-                    head(as_ints(&vals[*keys as usize])?, upto),
-                    head(as_ints(&vals[*deltas as usize])?, upto),
-                    budget,
-                )?),
+                GraphNode::KeyedSum { keys, deltas, order, seed } => {
+                    // A later input row can precede an early requested row in scan order.
+                    let limit = if order.is_some() { usize::MAX } else { upto };
+                    let keys = as_ints(&vals[*keys as usize])?;
+                    let order = order.map(|o| as_ints(&vals[o as usize])).transpose()?;
+                    Val::Ints(keyed_sum(
+                        head(keys, limit), head(as_ints(&vals[*deltas as usize])?, limit),
+                        order, *seed, keys.len(), budget,
+                    )?)
+                }
                 GraphNode::Interleave { sel, streams } => {
                     let sel = head(as_ints(&vals[*sel as usize])?, upto);
                     let streams: Vec<&[i64]> = (streams.iter())
@@ -4114,7 +4155,7 @@ impl CoreDecoder {
                     Val::Ints(out)
                 }
                 GraphNode::RankedSum { at, picks, deltas, order, cands, width } => {
-                    Val::Ints(ranked_sum(
+                    Val::Ints(super::legacy::ranked_sum(
                         as_ints(&vals[*at as usize])?,
                         as_ints(&vals[*picks as usize])?,
                         as_ints(&vals[*deltas as usize])?,
@@ -4160,123 +4201,46 @@ enum Piece<'a> {
 }
 
 /// `KeyedSum` over a dense state per key; keys are bounded by the row count.
-fn keyed_sum(keys: &[i64], deltas: &[i64], budget: &DecodeBudget) -> Result<Vec<i64>> {
-    if keys.len() != deltas.len() {
+fn keyed_sum(
+    keys: &[i64],
+    deltas: &[i64],
+    order: Option<&[i64]>,
+    seed: SumSeed,
+    key_limit: usize,
+    budget: &DecodeBudget,
+) -> Result<Vec<i64>> {
+    if keys.len() != deltas.len() || order.is_some_and(|o| o.len() != keys.len()) {
         return Err(Error::Format("KeyedSum length mismatch".into()));
     }
     let max = keys.iter().copied().max().unwrap_or(0);
-    if keys.iter().any(|&k| k < 0) || max as u64 > keys.len() as u64 {
+    if keys.iter().any(|&k| k < 0) || max as u64 > key_limit as u64 {
         return Err(Error::Format("KeyedSum key out of range".into()));
     }
     budget.check_alloc((max as usize + 1 + keys.len()).saturating_mul(16), "KeyedSum")?;
-    // A key's first sum steps from the last sum yielded, as counters kept by peers run close.
-    let (mut state, mut last) = (vec![None::<i64>; max as usize + 1], 0i64);
-    let mut out = Vec::with_capacity(keys.len());
-    for (&k, &d) in keys.iter().zip(deltas) {
-        if k == 0 {
-            out.push(d);
-            continue;
-        }
-        let s = &mut state[k as usize];
-        last = s.unwrap_or(last).wrapping_add(d);
-        *s = Some(last);
-        out.push(last);
-    }
-    Ok(out)
-}
-
-/// [`GraphNode::RankedSum`]'s keys: each one's sum, and whether it stepped when last a
-/// candidate. The writer walks its rows through the same state.
-#[derive(Default)]
-pub(crate) struct Ranked<'a> {
-    ids: FastMap<&'a [u8], u32>,
-    keys: Vec<(Option<i64>, bool)>,
-    last: i64,
-}
-
-impl<'a> Ranked<'a> {
-    /// A group's candidates, in pick order, as `left`.
-    pub(crate) fn open(&mut self, cells: impl Iterator<Item = &'a [u8]>, left: &mut Vec<u32>) {
-        left.clear();
-        for v in cells.filter(|v| !v.is_empty()) {
-            let next = self.keys.len() as u32;
-            let k = *self.ids.entry(v).or_insert(next);
-            if k == next {
-                self.keys.push((None, false));
-            }
-            if !left.contains(&k) {
-                left.push(k);
-            }
-        }
-        // Stable: candidates alike stay in cell order.
-        left.sort_by_key(|&k| !self.keys[k as usize].1);
-    }
-
-    pub(crate) fn keys(&self) -> usize {
-        self.keys.len()
-    }
-
-    pub(crate) fn sum(&self, k: u32) -> i64 {
-        self.keys[k as usize].0.unwrap_or(self.last)
-    }
-
-    pub(crate) fn step(&mut self, k: u32, delta: i64) -> i64 {
-        self.last = self.sum(k).wrapping_add(delta);
-        self.keys[k as usize].0 = Some(self.last);
-        self.last
-    }
-
-    /// Ends a group of candidates `all`, `left` of them untaken.
-    pub(crate) fn close(&mut self, all: &[u32], left: &[u32]) {
-        for &k in all {
-            self.keys[k as usize].1 = !left.contains(&k);
-        }
-    }
-}
-
-/// The integer a `RankedSum` row is ordered by.
-pub(crate) fn ranked_order(cell: &[u8]) -> i64 {
-    parse_cell_ascii_i64(cell)
-}
-
-fn ranked_sum(
-    at: &[i64],
-    picks: &[i64],
-    deltas: &[i64],
-    order: &Cells,
-    cands: &Cells,
-    width: usize,
-    budget: &DecodeBudget,
-) -> Result<Vec<i64>> {
-    if at.len() != picks.len() || at.len() != deltas.len() {
-        return Err(Error::Format("RankedSum length mismatch".into()));
-    }
-    budget.check_alloc(at.len().saturating_mul(40), "RankedSum")?;
-    let mut rows = Vec::new();
-    for (i, (&a, &p)) in at.iter().zip(picks).enumerate() {
-        if p != 0 {
-            let cell = usize::try_from(a).ok().and_then(|a| order.get(a));
-            let cell = cell.ok_or_else(|| Error::Format("RankedSum row out of range".into()))?;
-            rows.push((ranked_order(cell), i));
-        }
-    }
-    rows.sort_unstable();
+    let indices = order.map(|o| {
+        let mut indices: Vec<usize> = (0..keys.len()).filter(|&i| keys[i] != 0).collect();
+        indices.sort_unstable_by_key(|&i| (o[i], i));
+        indices
+    });
+    let mut state = vec![0i64; max as usize + 1];
+    let mut seen = if seed == SumSeed::Previous { vec![false; state.len()] } else { Vec::new() };
+    let mut last = 0i64;
     let mut out = deltas.to_vec();
-    let mut state = Ranked::default();
-    let (mut left, mut all) = (Vec::new(), Vec::new());
-    let mut j = 0;
-    while j < rows.len() {
-        let end = j + rows[j..].iter().take_while(|r| r.0 == rows[j].0).count();
-        let from = (at[rows[j].1] as usize).saturating_mul(width);
-        state.open((from..from.saturating_add(width)).filter_map(|c| cands.get(c)), &mut left);
-        all.clone_from(&left);
-        for &(_, i) in &rows[j..end] {
-            let p = usize::try_from(picks[i] - 1).ok().filter(|&p| p < left.len());
-            let p = p.ok_or_else(|| Error::Format("RankedSum pick out of range".into()))?;
-            out[i] = state.step(left.remove(p), deltas[i]);
+    let mut step = |i: usize| {
+        let k = keys[i] as usize;
+        if k == 0 { return; }
+        if seed == SumSeed::Previous && !seen[k] {
+            state[k] = last;
+            seen[k] = true;
         }
-        state.close(&all, &left);
-        j = end;
+        state[k] = state[k].wrapping_add(deltas[i]);
+        last = state[k];
+        out[i] = state[k];
+    };
+    if let Some(indices) = indices {
+        indices.into_iter().for_each(step);
+    } else {
+        (0..keys.len()).for_each(&mut step);
     }
     Ok(out)
 }
@@ -4414,7 +4378,7 @@ fn walk_template<'a>(tb: &'a [u8], n_slots: usize, mut f: impl FnMut(Piece<'a>))
 }
 
 #[inline]
-fn parse_cell_ascii_i64(mut s: &[u8]) -> i64 {
+pub(crate) fn parse_cell_ascii_i64(mut s: &[u8]) -> i64 {
     if s.len() >= 2 && s[0] == b'"' && s[s.len() - 1] == b'"' {
         s = &s[1..s.len() - 1];
     }
@@ -4623,8 +4587,9 @@ fn prefix_lens(nodes: &[GraphNode], root: usize, upto: usize) -> Vec<usize> {
                 need(*misses, usize::MAX);
             }
             GraphNode::QuoteOrNull { inner, map: None } => need(*inner, n),
-            GraphNode::KeyedSum { keys, deltas } => {
-                need(*keys, n);
+            GraphNode::KeyedSum { keys, deltas, order: None, .. } => {
+                // Key ids are bounded by the complete stream, even for a short prefix read.
+                need(*keys, usize::MAX);
                 need(*deltas, n);
             }
             GraphNode::Interleave { sel, streams } => {

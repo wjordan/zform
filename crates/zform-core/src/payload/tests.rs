@@ -1,7 +1,7 @@
 //! The engine against the reference evaluator and native generators.
 
 use super::engine::CompiledProgram;
-use super::graph::{CoreDecoder, GraphBuilder, GraphNode, PayloadGraph};
+use super::graph::{CoreDecoder, GraphBuilder, GraphNode, PayloadGraph, SumSeed};
 use super::ir::{ALL_OPS, Builder, Ins, Len, Op, Program, TableBuf, V, Width, eval_reference};
 use super::library::{Harvest, LibEntry, Library, with_code_pricing};
 use super::recur::{CompiledRecurrence, RecurrenceSpec, eval_scalar_u32};
@@ -1509,7 +1509,7 @@ fn keyed(
     let s = gb.add_ints(sel);
     let streams = streams.iter().map(|v| gb.add_ints(v)).collect();
     let d = gb.push(GraphNode::Interleave { sel: s, streams });
-    let root = gb.push(GraphNode::KeyedSum { keys: k, deltas: d });
+    let root = gb.push(GraphNode::KeyedSum { keys: k, deltas: d, order: None, seed: SumSeed::Previous });
     let g = PayloadGraph::decode(&gb.finish(root).encode(), budget)?;
     CoreDecoder::decode_ints(&g, &Default::default(), budget)
 }
@@ -1535,7 +1535,7 @@ fn keyed_sums_run_a_state_per_key_over_interleaved_streams() {
     // References must point back.
     let mut gb = GraphBuilder::new(1);
     let k = gb.add_ints(&[0]);
-    let root = gb.push(GraphNode::KeyedSum { keys: k, deltas: k });
+    let root = gb.push(GraphNode::KeyedSum { keys: k, deltas: k, order: None, seed: SumSeed::Previous });
     let mut wire = gb.finish(root).encode();
     let at = wire.len() - 2;
     assert_eq!(wire[at - 2], 25);
@@ -1562,4 +1562,88 @@ fn variants_and_cell_ids_number_cells() {
     assert_eq!(CoreDecoder::decode_ints(&g, &ext, &budget).unwrap(), [3, 14, 5, 26]);
     // A variant node needs the block's layout.
     assert!(CoreDecoder::decode_ints(&g, &Default::default(), &budget).is_err());
+}
+
+fn sum_graph(keys: &[i64], deltas: &[i64], order: Option<&[i64]>, seed: SumSeed, cells: bool) -> PayloadGraph {
+    let mut gb = GraphBuilder::new(keys.len());
+    let keys = gb.add_ints(keys);
+    let deltas = gb.add_ints(deltas);
+    let order = order.map(|v| gb.add_ints(v));
+    let mut root = gb.push(GraphNode::KeyedSum { keys, deltas, order, seed });
+    if cells {
+        root = gb.add_prog_cells(prog_fmt_int(false, 0), vec![root], vec![]);
+    }
+    PayloadGraph::decode(&gb.finish(root).encode(), &DecodeBudget::default()).unwrap()
+}
+
+#[test]
+fn keyed_sum_order_and_seed_are_independent() {
+    let budget = DecodeBudget::default();
+    let keys = [1, 2, 0, 1, 2, 1];
+    let deltas = [10, 100, 999, 1, 5, -3];
+    let order = [30, -5, i64::MIN, 7, 7, i64::MAX];
+    for (seed, order, want) in [
+        (SumSeed::Zero, None, [10, 100, 999, 11, 105, 8]),
+        (SumSeed::Previous, None, [10, 110, 999, 11, 115, 8]),
+        (SumSeed::Zero, Some(&order[..]), [11, 100, 999, 1, 105, 8]),
+        (SumSeed::Previous, Some(&order[..]), [111, 100, 999, 101, 105, 108]),
+    ] {
+        let g = sum_graph(&keys, &deltas, order, seed, false);
+        assert_eq!(CoreDecoder::decode_ints(&g, &Default::default(), &budget).unwrap(), want);
+    }
+    let g = sum_graph(&[1, 1, 1], &[i64::MAX, 1, -1], Some(&[0, 0, 0]), SumSeed::Zero, false);
+    assert_eq!(CoreDecoder::decode_ints(&g, &Default::default(), &budget).unwrap(), [i64::MAX, i64::MIN, i64::MAX]);
+    // Passthrough rows do not initialize another key, even in the legacy seed mode.
+    let g = sum_graph(&[0, 1], &[99, 2], Some(&[0, 1]), SumSeed::Previous, false);
+    assert_eq!(CoreDecoder::decode_ints(&g, &Default::default(), &budget).unwrap(), [99, 2]);
+}
+
+#[test]
+fn keyed_sum_wire_preserves_legacy_and_checks_extensions() {
+    let budget = DecodeBudget::default();
+    let legacy = [3, 0, 3, 1, 0, 3, 2, 1, 0, 3, 20, 25, 0, 1, 2];
+    let g = PayloadGraph::decode(&legacy, &budget).unwrap();
+    assert_eq!(g.encode(), legacy);
+    assert_eq!(CoreDecoder::decode_ints(&g, &Default::default(), &budget).unwrap(), [10, 20, 30]);
+    let g = sum_graph(&[1, 1, 1], &[10, 10, 10], Some(&[0, 0, 0]), SumSeed::Zero, false);
+    let wire = g.encode();
+    let at = wire.len() - 6;
+    assert_eq!(&wire[at..], &[153, 0, 1, 3, 2, 3]);
+    assert_eq!(wire[1], 0x20);
+    for (pos, val) in [(1, 0), (at + 3, 4), (at + 3, 0), (at + 4, 3)] {
+        let mut bad = wire.clone();
+        bad[pos] = val;
+        assert!(PayloadGraph::decode(&bad, &budget).is_err(), "pos={pos} val={val}");
+    }
+    for end in at + 1..wire.len() {
+        assert!(PayloadGraph::decode(&wire[..end], &budget).is_err());
+    }
+    for (keys, deltas, order) in [
+        (&[1, 1][..], &[1][..], &[0, 0][..]),
+        (&[1, 1][..], &[1, 2][..], &[0][..]),
+        (&[-1, 1][..], &[1, 2][..], &[0, 0][..]),
+        (&[3, 1][..], &[1, 2][..], &[0, 0][..]),
+    ] {
+        let g = sum_graph(keys, deltas, Some(order), SumSeed::Zero, false);
+        assert!(CoreDecoder::decode_ints(&g, &Default::default(), &budget).is_err());
+    }
+    let tight = DecodeBudget { max_single_alloc_bytes: 64, ..budget };
+    let g = sum_graph(&[1; 16], &[1; 16], Some(&[0; 16]), SumSeed::Zero, false);
+    assert!(CoreDecoder::decode_ints(&g, &Default::default(), &tight).is_err());
+}
+
+#[test]
+fn keyed_sum_partial_reads_keep_logical_predecessors_and_full_key_bound() {
+    let budget = DecodeBudget::default();
+    for order in [None, Some(&[2, 0, 1][..])] {
+        for seed in [SumSeed::Zero, SumSeed::Previous] {
+            let g = sum_graph(&[3, 3, 3], &[1, 10, 100], order, seed, true);
+            let ext = Default::default();
+            let whole = CoreDecoder::decode_col(&g, &ext, &budget).unwrap();
+            let first = CoreDecoder::decode_col_reading(&g, &ext, &budget, Some(&[(0, 1)])).unwrap();
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            assert_eq!(first.get(0, &mut a).unwrap(), whole.get(0, &mut b).unwrap());
+            assert_eq!(first.get(0, &mut a).unwrap(), if order.is_some() { &b"111"[..] } else { &b"1"[..] });
+        }
+    }
 }

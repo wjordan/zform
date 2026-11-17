@@ -1,0 +1,267 @@
+{
+  "method": "Indexed level-6 archives; HDFS predictors and context mixing enabled; one encoding thread. Sequential warm-cache runs. SHA256 roundtrip and source-order grep comparison. Prior RankedSum and predictor-off sizes from ranked-sum-simpler-results.json.",
+  "datasets": [
+    {
+      "name": "whole",
+      "raw_bytes": 1577982906,
+      "raw_sha256": "0783096174d7832c618337f9609e06e04abd86ddd7089b3c12b407e63bfebc52",
+      "bytes": 17703055,
+      "sha256": "ec9bbb55de3add1e2800b1da36a5ba636bc76d8d3d4ff3aedb4315b8dc9cd793",
+      "encode_samples": [
+        18.17008987441659,
+        18.163074135780334
+      ],
+      "decode_samples": [
+        5.460919227451086,
+        5.490798149257898
+      ],
+      "encode_seconds": 18.166582005098462,
+      "decode_seconds": 5.475858688354492,
+      "roundtrip": true,
+      "grep": true,
+      "determinism_checked": true,
+      "contains_ranked_sum": false,
+      "contains_ordered_keyed_sum": true
+    },
+    {
+      "name": "head",
+      "raw_bytes": 33554363,
+      "raw_sha256": "f80bfd4351a78f854a27addecfb1fa7717bdf2e7708f7c7d4444d729f6ad628f",
+      "bytes": 382990,
+      "sha256": "5d658eabeae57b77748e60e1c2aab10e0114a431827ae7f11054b91b1d274216",
+      "encode_samples": [
+        0.4269720930606127
+      ],
+      "decode_samples": [
+        0.12948408164083958
+      ],
+      "encode_seconds": 0.4269720930606127,
+      "decode_seconds": 0.12948408164083958,
+      "roundtrip": true,
+      "grep": true,
+      "determinism_checked": false,
+      "contains_ranked_sum": false,
+      "contains_ordered_keyed_sum": false
+    },
+    {
+      "name": "middle",
+      "raw_bytes": 33554316,
+      "raw_sha256": "dbec2df16d5d7d0c2bda2665fdfedad2da8519e28f12b421faa0c2db920d6cb7",
+      "bytes": 561990,
+      "sha256": "7660c1de8dffd03c745a72a3b11ea340004a7cd673eb9b01ac87ca6ae1737531",
+      "encode_samples": [
+        0.474474024027586
+      ],
+      "decode_samples": [
+        0.1315863747149706
+      ],
+      "encode_seconds": 0.474474024027586,
+      "decode_seconds": 0.1315863747149706,
+      "roundtrip": true,
+      "grep": true,
+      "determinism_checked": false,
+      "contains_ranked_sum": false,
+      "contains_ordered_keyed_sum": true
+    },
+    {
+      "name": "tail",
+      "raw_bytes": 33554386,
+      "raw_sha256": "34c4fb53a9ebfb71c8032d1efb54160ca1f1d4f24944e9224ee5fb82e7b97817",
+      "bytes": 385042,
+      "sha256": "f75720a202aca7589dd9cf62a91b2afcb048cba5dae28707a4a0de1577893e87",
+      "encode_samples": [
+        0.3977196831256151
+      ],
+      "decode_samples": [
+        0.1403575111180544
+      ],
+      "encode_seconds": 0.3977196831256151,
+      "decode_seconds": 0.1403575111180544,
+      "roundtrip": true,
+      "grep": true,
+      "determinism_checked": false,
+      "contains_ranked_sum": false,
+      "contains_ordered_keyed_sum": true
+    }
+  ],
+  "generality": [
+    {
+      "name": "OnTime-1987-8MiB.csv",
+      "bytes": 460096,
+      "unchanged_bytes": true,
+      "hdfs_on_identical": true,
+      "roundtrip": true
+    },
+    {
+      "name": "HealthApp-8MiB.log",
+      "bytes": 204040,
+      "unchanged_bytes": true,
+      "hdfs_on_identical": true,
+      "roundtrip": true
+    },
+    {
+      "name": "BGL-tail-8MiB.log",
+      "bytes": 237706,
+      "unchanged_bytes": true,
+      "hdfs_on_identical": true,
+      "roundtrip": true
+    },
+    {
+      "name": "BGL-middle-8MiB.log",
+      "bytes": 151853,
+      "unchanged_bytes": true,
+      "hdfs_on_identical": true,
+      "roundtrip": true
+    },
+    {
+      "name": "BGL-8MiB.log",
+      "bytes": 193543,
+      "unchanged_bytes": true,
+      "hdfs_on_identical": true,
+      "roundtrip": true
+    },
+    {
+      "name": "Zookeeper-8MiB.log",
+      "bytes": 89471,
+      "unchanged_bytes": true,
+      "hdfs_on_identical": true,
+      "roundtrip": true
+    },
+    {
+      "name": "HPC-8MiB.log",
+      "bytes": 217898,
+      "unchanged_bytes": true,
+      "hdfs_on_identical": true,
+      "roundtrip": true
+    },
+    {
+      "name": "nci",
+      "bytes": 694144,
+      "unchanged_bytes": true,
+      "hdfs_on_identical": true,
+      "roundtrip": true
+    },
+    {
+      "name": "sao",
+      "bytes": 3746714,
+      "unchanged_bytes": true,
+      "hdfs_on_identical": true,
+      "roundtrip": true
+    },
+    {
+      "name": "mr",
+      "bytes": 2796201,
+      "unchanged_bytes": true,
+      "hdfs_on_identical": true,
+      "roundtrip": true
+    },
+    {
+      "name": "reymont",
+      "bytes": 1971668,
+      "unchanged_bytes": true,
+      "hdfs_on_identical": true,
+      "roundtrip": true
+    },
+    {
+      "name": "x-ray",
+      "bytes": 4569864,
+      "unchanged_bytes": true,
+      "hdfs_on_identical": true,
+      "roundtrip": true
+    },
+    {
+      "name": "webster",
+      "bytes": 2470824,
+      "unchanged_bytes": true,
+      "hdfs_on_identical": true,
+      "roundtrip": true
+    },
+    {
+      "name": "xml",
+      "bytes": 652637,
+      "unchanged_bytes": true,
+      "hdfs_on_identical": true,
+      "roundtrip": true
+    },
+    {
+      "name": "mozilla",
+      "bytes": 4690753,
+      "unchanged_bytes": true,
+      "hdfs_on_identical": true,
+      "roundtrip": true
+    },
+    {
+      "name": "dickens",
+      "bytes": 3021310,
+      "unchanged_bytes": true,
+      "hdfs_on_identical": true,
+      "roundtrip": true
+    },
+    {
+      "name": "samba",
+      "bytes": 2833651,
+      "unchanged_bytes": true,
+      "hdfs_on_identical": true,
+      "roundtrip": true
+    },
+    {
+      "name": "osdb",
+      "bytes": 2954701,
+      "unchanged_bytes": true,
+      "hdfs_on_identical": true,
+      "roundtrip": true
+    },
+    {
+      "name": "ooffice",
+      "bytes": 3155750,
+      "unchanged_bytes": true,
+      "hdfs_on_identical": true,
+      "roundtrip": true
+    },
+    {
+      "name": "cloudtrail.ndjson",
+      "bytes": 334060,
+      "unchanged_bytes": true,
+      "hdfs_on_identical": true,
+      "roundtrip": true
+    },
+    {
+      "name": "random.bin",
+      "bytes": 1052770,
+      "unchanged_bytes": true,
+      "hdfs_on_identical": true,
+      "roundtrip": true
+    }
+  ],
+  "legacy_ranked_archive_roundtrip": true,
+  "old_reader_rejects_extension": true,
+  "base_revision": "fc5e9458fbdf368e4890076ccfbabf3f4b18943f",
+  "source_state": "Working tree with the ordered KeyedSum extension",
+  "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.42",
+  "source_sha256": {
+    "crates/zform-core/src/payload/graph.rs": "9293ce97c8805916f67a96a6f7d0c392aa0210cfaacdcda6c990dca72038ddb4",
+    "crates/zform-core/src/payload/legacy.rs": "a1ca8ef2b1ad6477622d1953f28d3d37be49bf4c317e57d9093a1b203a175ab7",
+    "crates/zform-core/src/packs/hdfs.rs": "777864c0657583c392370af2be9ed43d9414e58827fb7df6ad84ef727eec53d9",
+    "crates/zform-core/src/inspect.rs": "9a0f3e00a92fef7a85016c74773a419eb697ca567867676633eed5a8da5df349"
+  },
+  "pack_arguments": [
+    "pack",
+    "--threads",
+    "1",
+    "-l",
+    "6",
+    "--hdfs-predictors",
+    "--context-mixing",
+    "INPUT",
+    "-o",
+    "OUTPUT"
+  ],
+  "generality_method": "Same 21 input byte sequences as the previous generality audit; default level, indexed archives, --threads 1; HDFS predictors off and on; exact archive hashes compared with fc5e945 and SHA256 roundtrip.",
+  "references": {
+    "ranked_bytes": 17599245,
+    "deletion_prediction_off_bytes": 18235313
+  },
+  "extra_bytes_over_ranked": 103810,
+  "change_percent_over_ranked": 0.5898548488869837,
+  "deletion_savings_retained_percent": 83.67941792386978
+}

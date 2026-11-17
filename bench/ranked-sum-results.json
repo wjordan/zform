@@ -1,0 +1,778 @@
+{
+  "commit": "fc5e9458fbdf368e4890076ccfbabf3f4b18943f",
+  "platform": "Linux-6.17.0-40-generic-x86_64-with-glibc2.42",
+  "method": "Complete indexed archives; level 6; HDFS predictors and context mixing; one encoding thread; original CRLF input. All variants preserve the same inferred datanode assignments. Exact SHA256 roundtrips and normalized-line-ending grep checks. Initial screening one run each; final ranked/replica-argsort confirmation three sequential repeats with deterministic archives. Screening timings are exploratory and may overlap compilation; use confirmation medians for speed comparisons.",
+  "commands": [
+    "python3 bench/ranked_sum_ablation.py build --work /tmp/ranked-ablation",
+    "python3 bench/ranked_sum_ablation.py run --work /tmp/ranked-ablation --repeats 1 /path/to/HDFS.log",
+    "python3 bench/ranked_sum_ablation.py run --work /tmp/ranked-ablation --modes ranked replica-argsort --repeats 3 /path/to/HDFS.log"
+  ],
+  "whole_file": {
+    "raw_bytes": 1577982906,
+    "raw_sha256": "0783096174d7832c618337f9609e06e04abd86ddd7089b3c12b407e63bfebc52"
+  },
+  "variants": [
+    {
+      "mode": "ranked",
+      "bytes": 17599245,
+      "encode_seconds": 18.05795812793076,
+      "decode_seconds": 5.524064298719168,
+      "encode_samples": [
+        18.05938713811338,
+        17.982176842167974,
+        18.05795812793076
+      ],
+      "decode_samples": [
+        5.584722252562642,
+        5.513667983934283,
+        5.524064298719168
+      ],
+      "compressed_sha256": "acc3e4895ddba772ecfca104ad684989f65814a4a2e6417881276a8b450f452f",
+      "roundtrip": true,
+      "grep": true,
+      "determinism_checked": true,
+      "contains_ranked_sum": true,
+      "contains_sort_indices": false,
+      "timing_repeats": 3,
+      "change_percent": 0.0,
+      "clock_payload_bytes": 2831332,
+      "ranked_payloads": 62,
+      "sort_indices_payloads": 0
+    },
+    {
+      "mode": "off",
+      "bytes": 18235313,
+      "encode_seconds": 17.478665832430124,
+      "decode_seconds": 5.208942351862788,
+      "encode_samples": [
+        17.478665832430124
+      ],
+      "decode_samples": [
+        5.208942351862788
+      ],
+      "compressed_sha256": "52712cfeec8eaebf9c93f5de1033971ccd8f157db4a2b9c7c7395350236141e8",
+      "roundtrip": true,
+      "grep": true,
+      "contains_ranked_sum": false,
+      "timing_repeats": 1,
+      "determinism_checked": false,
+      "change_percent": 3.6141777672848985,
+      "clock_payload_bytes": 3467392,
+      "ranked_payloads": 0,
+      "sort_indices_payloads": 0
+    },
+    {
+      "mode": "keyed-row",
+      "bytes": 18390759,
+      "encode_seconds": 17.836395198479295,
+      "decode_seconds": 5.216690024361014,
+      "encode_samples": [
+        17.836395198479295
+      ],
+      "decode_samples": [
+        5.216690024361014
+      ],
+      "compressed_sha256": "93e05ef2cd516ffac60f758e16a2fb81c1fa950deba165f3b9b16a3f83911beb",
+      "roundtrip": true,
+      "grep": true,
+      "contains_ranked_sum": false,
+      "timing_repeats": 1,
+      "determinism_checked": false,
+      "change_percent": 4.497431565956389,
+      "clock_payload_bytes": 3622832,
+      "ranked_payloads": 0,
+      "sort_indices_payloads": 0
+    },
+    {
+      "mode": "keyed-sorted",
+      "bytes": 18441470,
+      "encode_seconds": 18.502800719812512,
+      "decode_seconds": 5.377191755920649,
+      "encode_samples": [
+        18.502800719812512
+      ],
+      "decode_samples": [
+        5.377191755920649
+      ],
+      "compressed_sha256": "658889afe85d3fe0a3195cb0f6468c919de8bc3c724b06054d95ac2dff39a9c4",
+      "roundtrip": true,
+      "grep": true,
+      "contains_ranked_sum": false,
+      "timing_repeats": 1,
+      "determinism_checked": false,
+      "change_percent": 4.785574608456211,
+      "clock_payload_bytes": 3673514,
+      "ranked_payloads": 0,
+      "sort_indices_payloads": 0
+    },
+    {
+      "mode": "scan-grouped",
+      "bytes": 18417705,
+      "encode_seconds": 19.835949297994375,
+      "decode_seconds": 5.213722767308354,
+      "encode_samples": [
+        19.835949297994375
+      ],
+      "decode_samples": [
+        5.213722767308354
+      ],
+      "compressed_sha256": "e0cd35553fba2dd77cdbcd3a4dba890921eb53d0e60677bf8c689172d70b99dd",
+      "roundtrip": true,
+      "grep": true,
+      "contains_ranked_sum": false,
+      "timing_repeats": 1,
+      "determinism_checked": false,
+      "change_percent": 4.650540406704939,
+      "clock_payload_bytes": 3649763,
+      "ranked_payloads": 0,
+      "sort_indices_payloads": 0
+    },
+    {
+      "mode": "keyed-argsort",
+      "bytes": 18366984,
+      "encode_seconds": 19.214247539639473,
+      "decode_seconds": 5.379088254645467,
+      "encode_samples": [
+        19.214247539639473
+      ],
+      "decode_samples": [
+        5.379088254645467
+      ],
+      "compressed_sha256": "97ad33d62eed32a3ab8a3bb034fce327a5a65ec07570c7a337ebe62dabd8870b",
+      "roundtrip": true,
+      "grep": true,
+      "determinism_checked": false,
+      "contains_ranked_sum": false,
+      "contains_sort_indices": true,
+      "timing_repeats": 1,
+      "change_percent": 4.362340543585819,
+      "clock_payload_bytes": 3598959,
+      "ranked_payloads": 0,
+      "sort_indices_payloads": 26
+    },
+    {
+      "mode": "replica-row",
+      "bytes": 18343134,
+      "encode_seconds": 18.05959822796285,
+      "decode_seconds": 5.251396419480443,
+      "encode_samples": [
+        18.05959822796285
+      ],
+      "decode_samples": [
+        5.251396419480443
+      ],
+      "compressed_sha256": "a860731157c579ca079c87a3fb09dc83c6e42691307919f79e8c7825998595ac",
+      "roundtrip": true,
+      "grep": true,
+      "determinism_checked": false,
+      "contains_ranked_sum": false,
+      "contains_sort_indices": false,
+      "timing_repeats": 1,
+      "change_percent": 4.226823366570565,
+      "clock_payload_bytes": 3575100,
+      "ranked_payloads": 0,
+      "sort_indices_payloads": 0
+    },
+    {
+      "mode": "replica-argsort",
+      "bytes": 17725378,
+      "encode_seconds": 18.125546848401427,
+      "decode_seconds": 5.563419748097658,
+      "encode_samples": [
+        18.13226724229753,
+        18.125546848401427,
+        18.113131986930966
+      ],
+      "decode_samples": [
+        5.563419748097658,
+        5.62019188888371,
+        5.547661904245615
+      ],
+      "compressed_sha256": "28e5c05daa1ded84c6ce34377e06aa8c05b6a147300eb8cfbef7db6d466f8f99",
+      "roundtrip": true,
+      "grep": true,
+      "determinism_checked": true,
+      "contains_ranked_sum": false,
+      "contains_sort_indices": true,
+      "timing_repeats": 3,
+      "change_percent": 0.7166955173361078,
+      "clock_payload_bytes": 2957269,
+      "ranked_payloads": 0,
+      "sort_indices_payloads": 62
+    }
+  ],
+  "confirmation_build": {
+    "commit": "fc5e9458fbdf368e4890076ccfbabf3f4b18943f",
+    "overlay_sha256": "d268bd1df858478fdbb24a1580d1175e662027615d0a835c427868bd75d43353",
+    "production_hdfs_sha256": "775a13ce2aa792294e322d3b7c7409d5897bd8f6bc4dc7fcc15c4dc39d6ad4fc",
+    "benchmark_python_sha256": "80ae50e350350f2b10b82429c1a078d380c0a7486f75772b08e204d867e360b9",
+    "benchmark_rust_sha256": "a319fbee3d37833146b2c1fedf89d3bd0b5fd23808269174aea0ebe3deef2b38"
+  },
+  "validation": {
+    "hdfs_test_processes": 8,
+    "tests_per_hdfs_process": 10,
+    "payload_tests_passed": 31,
+    "payload_tests_ignored": 1,
+    "test_process_timeout_seconds": 1,
+    "all_whole_file_roundtrips": true,
+    "all_whole_file_grep_checks": true,
+    "production_baseline_byte_identical_on": [
+      "middle.log",
+      "tail.log"
+    ],
+    "production_reader_roundtrips": [
+      [
+        "middle.log",
+        "ranked"
+      ],
+      [
+        "middle.log",
+        "off"
+      ],
+      [
+        "middle.log",
+        "keyed-row"
+      ],
+      [
+        "middle.log",
+        "keyed-sorted"
+      ],
+      [
+        "middle.log",
+        "scan-grouped"
+      ],
+      [
+        "middle.log",
+        "replica-row"
+      ],
+      [
+        "tail.log",
+        "ranked"
+      ],
+      [
+        "tail.log",
+        "off"
+      ],
+      [
+        "tail.log",
+        "keyed-row"
+      ],
+      [
+        "tail.log",
+        "keyed-sorted"
+      ],
+      [
+        "tail.log",
+        "scan-grouped"
+      ],
+      [
+        "tail.log",
+        "replica-row"
+      ]
+    ]
+  },
+  "conclusion": "Replica-table slot lookup + stable integer SortIndices + KeyedSum retains 80.17% of the deletion predictor savings for 0.717% more archive bytes; encode/decode medians differ by less than 1%. No production change. SortIndices is experimental tag 30 in the temporary reader only.",
+  "windows": [
+    {
+      "source": "/tmp/zform-ranked-ablation/inputs/head.log",
+      "raw_bytes": 33554363,
+      "raw_sha256": "f80bfd4351a78f854a27addecfb1fa7717bdf2e7708f7c7d4444d729f6ad628f",
+      "variants": [
+        {
+          "mode": "ranked",
+          "bytes": 382996,
+          "encode_seconds": 0.45226918533444405,
+          "decode_seconds": 0.13586724270135164,
+          "encode_samples": [
+            0.47561226412653923,
+            0.42892610654234886
+          ],
+          "decode_samples": [
+            0.14113714918494225,
+            0.13059733621776104
+          ],
+          "compressed_sha256": "3ea57f85cdaaa04fde646834edd739a8421dc36f22fe02431122eca9cf9298a8",
+          "roundtrip": true,
+          "grep": true,
+          "determinism_checked": true,
+          "contains_ranked_sum": false,
+          "contains_sort_indices": false
+        },
+        {
+          "mode": "off",
+          "bytes": 382996,
+          "encode_seconds": 0.42831108160316944,
+          "decode_seconds": 0.1299831811338663,
+          "encode_samples": [
+            0.4292076528072357,
+            0.42741451039910316
+          ],
+          "decode_samples": [
+            0.12930065765976906,
+            0.13066570460796356
+          ],
+          "compressed_sha256": "3ea57f85cdaaa04fde646834edd739a8421dc36f22fe02431122eca9cf9298a8",
+          "roundtrip": true,
+          "grep": true,
+          "determinism_checked": true,
+          "contains_ranked_sum": false,
+          "contains_sort_indices": false
+        },
+        {
+          "mode": "keyed-row",
+          "bytes": 382996,
+          "encode_seconds": 0.4188456032425165,
+          "decode_seconds": 0.1283158753067255,
+          "encode_samples": [
+            0.41634243726730347,
+            0.42134876921772957
+          ],
+          "decode_samples": [
+            0.12619182467460632,
+            0.13043992593884468
+          ],
+          "compressed_sha256": "3ea57f85cdaaa04fde646834edd739a8421dc36f22fe02431122eca9cf9298a8",
+          "roundtrip": true,
+          "grep": true,
+          "determinism_checked": true,
+          "contains_ranked_sum": false,
+          "contains_sort_indices": false
+        },
+        {
+          "mode": "keyed-sorted",
+          "bytes": 382996,
+          "encode_seconds": 0.4238635487854481,
+          "decode_seconds": 0.1350597944110632,
+          "encode_samples": [
+            0.42303600907325745,
+            0.4246910884976387
+          ],
+          "decode_samples": [
+            0.14035532996058464,
+            0.12976425886154175
+          ],
+          "compressed_sha256": "3ea57f85cdaaa04fde646834edd739a8421dc36f22fe02431122eca9cf9298a8",
+          "roundtrip": true,
+          "grep": true,
+          "determinism_checked": true,
+          "contains_ranked_sum": false,
+          "contains_sort_indices": false
+        },
+        {
+          "mode": "scan-grouped",
+          "bytes": 382996,
+          "encode_seconds": 0.42631970532238483,
+          "decode_seconds": 0.13255543913692236,
+          "encode_samples": [
+            0.42650424130260944,
+            0.4261351693421602
+          ],
+          "decode_samples": [
+            0.12713117897510529,
+            0.13797969929873943
+          ],
+          "compressed_sha256": "3ea57f85cdaaa04fde646834edd739a8421dc36f22fe02431122eca9cf9298a8",
+          "roundtrip": true,
+          "grep": true,
+          "determinism_checked": true,
+          "contains_ranked_sum": false,
+          "contains_sort_indices": false
+        },
+        {
+          "mode": "keyed-argsort",
+          "bytes": 382996,
+          "encode_seconds": 0.42772042751312256,
+          "decode_seconds": 0.14328099321573973,
+          "encode_samples": [
+            0.42877029068768024,
+            0.4266705643385649
+          ],
+          "decode_samples": [
+            0.12851340882480145,
+            0.158048577606678
+          ],
+          "compressed_sha256": "3ea57f85cdaaa04fde646834edd739a8421dc36f22fe02431122eca9cf9298a8",
+          "roundtrip": true,
+          "grep": true,
+          "determinism_checked": true,
+          "contains_ranked_sum": false,
+          "contains_sort_indices": false
+        },
+        {
+          "mode": "replica-row",
+          "bytes": 382996,
+          "encode_seconds": 0.4225088460370898,
+          "decode_seconds": 0.12885254435241222,
+          "encode_samples": [
+            0.4229574203491211,
+            0.42206027172505856
+          ],
+          "decode_samples": [
+            0.12681891582906246,
+            0.13088617287576199
+          ],
+          "compressed_sha256": "3ea57f85cdaaa04fde646834edd739a8421dc36f22fe02431122eca9cf9298a8",
+          "roundtrip": true,
+          "grep": true,
+          "determinism_checked": true,
+          "contains_ranked_sum": false,
+          "contains_sort_indices": false
+        },
+        {
+          "mode": "replica-argsort",
+          "bytes": 382996,
+          "encode_seconds": 0.42315699718892574,
+          "decode_seconds": 0.13002311252057552,
+          "encode_samples": [
+            0.4237853493541479,
+            0.4225286450237036
+          ],
+          "decode_samples": [
+            0.1293513160198927,
+            0.13069490902125835
+          ],
+          "compressed_sha256": "3ea57f85cdaaa04fde646834edd739a8421dc36f22fe02431122eca9cf9298a8",
+          "roundtrip": true,
+          "grep": true,
+          "determinism_checked": true,
+          "contains_ranked_sum": false,
+          "contains_sort_indices": false
+        }
+      ]
+    },
+    {
+      "source": "/tmp/zform-ranked-ablation/inputs/middle.log",
+      "raw_bytes": 33554316,
+      "raw_sha256": "dbec2df16d5d7d0c2bda2665fdfedad2da8519e28f12b421faa0c2db920d6cb7",
+      "variants": [
+        {
+          "mode": "ranked",
+          "bytes": 561788,
+          "encode_seconds": 0.48579496517777443,
+          "decode_seconds": 0.13417375460267067,
+          "encode_samples": [
+            0.48491072840988636,
+            0.4866792019456625
+          ],
+          "decode_samples": [
+            0.13523538783192635,
+            0.133112121373415
+          ],
+          "compressed_sha256": "fd92b3bda96baa59bd60f6f49a6c99f177938ce20f2330fc124ccd6d12c4f119",
+          "roundtrip": true,
+          "grep": true,
+          "determinism_checked": true,
+          "contains_ranked_sum": true,
+          "contains_sort_indices": false
+        },
+        {
+          "mode": "off",
+          "bytes": 562096,
+          "encode_seconds": 0.4709667209535837,
+          "decode_seconds": 0.1320935506373644,
+          "encode_samples": [
+            0.4708370082080364,
+            0.471096433699131
+          ],
+          "decode_samples": [
+            0.13254521042108536,
+            0.13164189085364342
+          ],
+          "compressed_sha256": "fc246e6c09544a6212ccbd120d769e068e31ec6162c6cbfc9e5bc9094a1db8a4",
+          "roundtrip": true,
+          "grep": true,
+          "determinism_checked": true,
+          "contains_ranked_sum": false,
+          "contains_sort_indices": false
+        },
+        {
+          "mode": "keyed-row",
+          "bytes": 566894,
+          "encode_seconds": 0.48313966020941734,
+          "decode_seconds": 0.13354896567761898,
+          "encode_samples": [
+            0.4803775753825903,
+            0.4859017450362444
+          ],
+          "decode_samples": [
+            0.13502686470746994,
+            0.13207106664776802
+          ],
+          "compressed_sha256": "cb291a70d4e555e1d23b4b558a7eea144b99b48b31f6a71357b20904cdd437f4",
+          "roundtrip": true,
+          "grep": true,
+          "determinism_checked": true,
+          "contains_ranked_sum": false,
+          "contains_sort_indices": false
+        },
+        {
+          "mode": "keyed-sorted",
+          "bytes": 569619,
+          "encode_seconds": 0.515189528465271,
+          "decode_seconds": 0.13240691274404526,
+          "encode_samples": [
+            0.5037373285740614,
+            0.5266417283564806
+          ],
+          "decode_samples": [
+            0.1322849839925766,
+            0.13252884149551392
+          ],
+          "compressed_sha256": "51049f1002a4b6622f170e3e306c770506d617fbc89601179fbd17627b21fbd3",
+          "roundtrip": true,
+          "grep": true,
+          "determinism_checked": true,
+          "contains_ranked_sum": false,
+          "contains_sort_indices": false
+        },
+        {
+          "mode": "scan-grouped",
+          "bytes": 569619,
+          "encode_seconds": 0.49816744588315487,
+          "decode_seconds": 0.13299001660197973,
+          "encode_samples": [
+            0.5066716521978378,
+            0.4896632395684719
+          ],
+          "decode_samples": [
+            0.13207202032208443,
+            0.13390801288187504
+          ],
+          "compressed_sha256": "51049f1002a4b6622f170e3e306c770506d617fbc89601179fbd17627b21fbd3",
+          "roundtrip": true,
+          "grep": true,
+          "determinism_checked": true,
+          "contains_ranked_sum": false,
+          "contains_sort_indices": false
+        },
+        {
+          "mode": "keyed-argsort",
+          "bytes": 566656,
+          "encode_seconds": 0.47909060772508383,
+          "decode_seconds": 0.13751278724521399,
+          "encode_samples": [
+            0.47843970358371735,
+            0.4797415118664503
+          ],
+          "decode_samples": [
+            0.13791074976325035,
+            0.13711482472717762
+          ],
+          "compressed_sha256": "33a795287c30582b1cb23d30dea268c4b1fd1f212b8dbb2e4276ff6cf1565a23",
+          "roundtrip": true,
+          "grep": true,
+          "determinism_checked": true,
+          "contains_ranked_sum": false,
+          "contains_sort_indices": true
+        },
+        {
+          "mode": "replica-row",
+          "bytes": 562514,
+          "encode_seconds": 0.4813177362084389,
+          "decode_seconds": 0.13559537939727306,
+          "encode_samples": [
+            0.48066853545606136,
+            0.4819669369608164
+          ],
+          "decode_samples": [
+            0.13496502675116062,
+            0.1362257320433855
+          ],
+          "compressed_sha256": "eaf45866fc0c6a32a2637126f8e9e962ed2939093bbf3feb6399305d9055e285",
+          "roundtrip": true,
+          "grep": true,
+          "determinism_checked": true,
+          "contains_ranked_sum": false,
+          "contains_sort_indices": false
+        },
+        {
+          "mode": "replica-argsort",
+          "bytes": 562269,
+          "encode_seconds": 0.48361527640372515,
+          "decode_seconds": 0.13859503623098135,
+          "encode_samples": [
+            0.484344769269228,
+            0.4828857835382223
+          ],
+          "decode_samples": [
+            0.1377825252711773,
+            0.1394075471907854
+          ],
+          "compressed_sha256": "2abdddf64ca04827d514cc5fb2d5ca5ced1eadab6e61d6bccd6e5dd02b545fba",
+          "roundtrip": true,
+          "grep": true,
+          "determinism_checked": true,
+          "contains_ranked_sum": false,
+          "contains_sort_indices": true
+        }
+      ]
+    },
+    {
+      "source": "/tmp/zform-ranked-ablation/inputs/tail.log",
+      "raw_bytes": 33554386,
+      "raw_sha256": "34c4fb53a9ebfb71c8032d1efb54160ca1f1d4f24944e9224ee5fb82e7b97817",
+      "variants": [
+        {
+          "mode": "ranked",
+          "bytes": 384851,
+          "encode_seconds": 0.4044761164113879,
+          "decode_seconds": 0.13230830803513527,
+          "encode_samples": [
+            0.4029645211994648,
+            0.40598771162331104
+          ],
+          "decode_samples": [
+            0.13112554885447025,
+            0.13349106721580029
+          ],
+          "compressed_sha256": "99145b1f1eac61b676d17e9700db24010b59058ce771f422bf0c7ab376dab31d",
+          "roundtrip": true,
+          "grep": true,
+          "determinism_checked": true,
+          "contains_ranked_sum": true,
+          "contains_sort_indices": false
+        },
+        {
+          "mode": "off",
+          "bytes": 383924,
+          "encode_seconds": 0.3844362534582615,
+          "decode_seconds": 0.1253394354134798,
+          "encode_samples": [
+            0.3830750286579132,
+            0.38579747825860977
+          ],
+          "decode_samples": [
+            0.12471480295062065,
+            0.12596406787633896
+          ],
+          "compressed_sha256": "a10152c3f7e9fd715921c2138707cbde1096a0908e0c917153e44fd8a16de2af",
+          "roundtrip": true,
+          "grep": true,
+          "determinism_checked": true,
+          "contains_ranked_sum": false,
+          "contains_sort_indices": false
+        },
+        {
+          "mode": "keyed-row",
+          "bytes": 388277,
+          "encode_seconds": 0.3998867254704237,
+          "decode_seconds": 0.12896810472011566,
+          "encode_samples": [
+            0.40184956043958664,
+            0.39792389050126076
+          ],
+          "decode_samples": [
+            0.12845430709421635,
+            0.12948190234601498
+          ],
+          "compressed_sha256": "6ddc82ff96e2bb4a6810c28714e8e76a53b206d1210d0e9ad255f16a36ca3146",
+          "roundtrip": true,
+          "grep": true,
+          "determinism_checked": true,
+          "contains_ranked_sum": false,
+          "contains_sort_indices": false
+        },
+        {
+          "mode": "keyed-sorted",
+          "bytes": 390270,
+          "encode_seconds": 0.40724767558276653,
+          "decode_seconds": 0.1293543754145503,
+          "encode_samples": [
+            0.41126389242708683,
+            0.40323145873844624
+          ],
+          "decode_samples": [
+            0.1283603012561798,
+            0.1303484495729208
+          ],
+          "compressed_sha256": "396c46c5707a5520fc2cc63f6f2bfd94a0421c04d46acfc90c2c980f4e920fe6",
+          "roundtrip": true,
+          "grep": true,
+          "determinism_checked": true,
+          "contains_ranked_sum": false,
+          "contains_sort_indices": false
+        },
+        {
+          "mode": "scan-grouped",
+          "bytes": 389398,
+          "encode_seconds": 0.40532909892499447,
+          "decode_seconds": 0.129135487601161,
+          "encode_samples": [
+            0.40582449175417423,
+            0.4048337060958147
+          ],
+          "decode_samples": [
+            0.13032880425453186,
+            0.12794217094779015
+          ],
+          "compressed_sha256": "c13a7142117811178e5c6a85b7bb0906ced25cc979ad4d1df468a3b7be369565",
+          "roundtrip": true,
+          "grep": true,
+          "determinism_checked": true,
+          "contains_ranked_sum": false,
+          "contains_sort_indices": false
+        },
+        {
+          "mode": "keyed-argsort",
+          "bytes": 388131,
+          "encode_seconds": 0.4012290621176362,
+          "decode_seconds": 0.14034230448305607,
+          "encode_samples": [
+            0.39980251155793667,
+            0.40265561267733574
+          ],
+          "decode_samples": [
+            0.1431735623627901,
+            0.13751104660332203
+          ],
+          "compressed_sha256": "9a8caff035c0b9551d86263de5055eea9177de5690c48bdf07e12488e967825b",
+          "roundtrip": true,
+          "grep": true,
+          "determinism_checked": true,
+          "contains_ranked_sum": false,
+          "contains_sort_indices": true
+        },
+        {
+          "mode": "replica-row",
+          "bytes": 386012,
+          "encode_seconds": 0.40213348995894194,
+          "decode_seconds": 0.1343318596482277,
+          "encode_samples": [
+            0.3995867446064949,
+            0.40468023531138897
+          ],
+          "decode_samples": [
+            0.1289211753755808,
+            0.1397425439208746
+          ],
+          "compressed_sha256": "62d1dbf3efcc665faf7db896e894296df68c9c80a98d037ec85345a00c068e97",
+          "roundtrip": true,
+          "grep": true,
+          "determinism_checked": true,
+          "contains_ranked_sum": false,
+          "contains_sort_indices": false
+        },
+        {
+          "mode": "replica-argsort",
+          "bytes": 385855,
+          "encode_seconds": 0.41680466290563345,
+          "decode_seconds": 0.14938027691096067,
+          "encode_samples": [
+            0.4010698664933443,
+            0.4325394593179226
+          ],
+          "decode_samples": [
+            0.14118790440261364,
+            0.1575726494193077
+          ],
+          "compressed_sha256": "7c044f7ea889274c80ce380b7cce3f8ffd6cb97ef9e4bf463d13889f2d1a089f",
+          "roundtrip": true,
+          "grep": true,
+          "determinism_checked": true,
+          "contains_ranked_sum": false,
+          "contains_sort_indices": true
+        }
+      ]
+    }
+  ]
+}
