@@ -25,6 +25,7 @@ pub use zform_core::{
     PackOptions, PackRegistry, PayloadGraph, Predicate, Profile, RelationContext, RelationPack,
     ResolvedFraming, Result, StreamEncoder, TrainOptions, build_dictionary, build_tables,
     eval_raw_record, first_run, inspect_stream, logical, pack_stream, raw_field_values,
+    unpack_stream_threads,
 };
 
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -285,6 +286,9 @@ mod tests {
         let mut restored = Vec::new();
         unpack(&comp[..], &mut restored).expect("unpack");
         assert_eq!(raw, &restored[..], "byte-exact roundtrip failed");
+        let mut par = Vec::new();
+        unpack_stream_threads(&comp[..], &mut par, &DecodeBudget::default(), 3).expect("unpack");
+        assert!(par == restored, "threads change the unpacked bytes");
         comp
     }
 
@@ -1530,6 +1534,9 @@ mod tests {
         let mut restored = Vec::new();
         unpack(&cat[..], &mut restored).unwrap();
         assert!(restored == raw.repeat(3).into_bytes());
+        let mut par = Vec::new();
+        unpack_stream_threads(&cat[..], &mut par, &DecodeBudget::default(), 4).unwrap();
+        assert!(par == restored);
     }
 
     #[test]

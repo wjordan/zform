@@ -1986,6 +1986,18 @@ pub fn decode_frame_payload<W: Write>(
     budget: &DecodeBudget,
     mut out: W,
 ) -> Result<()> {
+    let frame = decode_frame(hdr, payload, expected_xxh64, prev_plan, budget)?;
+    Ok(out.write_all(&frame)?)
+}
+
+/// [`decode_frame_payload`]'s bytes.
+fn decode_frame(
+    hdr: &ParsedFrameHeader,
+    payload: &[u8],
+    expected_xxh64: Option<u64>,
+    prev_plan: &mut Option<ModelPlan>,
+    budget: &DecodeBudget,
+) -> Result<Vec<u8>> {
     if (hdr.flags & FLAG_PASSTHROUGH) != 0 {
         let raw = decompress_leaf(&mut Cursor::new(payload), budget)?;
         if raw.len() != hdr.raw_len {
@@ -1997,8 +2009,7 @@ pub fn decode_frame_payload<W: Write>(
         {
             return Err(Error::ChecksumMismatch("ZFM1 passthrough frame XXH64"));
         }
-        out.write_all(&raw)?;
-        return Ok(());
+        return Ok(raw);
     }
 
     let bdir = parse_frame_blocks(hdr, payload, prev_plan, budget)?;
@@ -2039,8 +2050,7 @@ pub fn decode_frame_payload<W: Write>(
     {
         return Err(Error::ChecksumMismatch("ZFM1 frame content XXH64"));
     }
-    out.write_all(&frame_out)?;
-    Ok(())
+    Ok(frame_out)
 }
 
 // ============================================================================
@@ -2062,18 +2072,27 @@ pub fn pack_stream<R: Read, W: Write>(reader: R, mut writer: W, opts: &PackOptio
     // Frames encode `threads` at a time and are written in order. A reuse frame waits for its
     // sync frame's library and seeds, as `encode_framed` hands them on, so the bytes match.
     std::thread::scope(|s| {
-        let (tx, rx) = mpsc::channel();
-        let mut fl = Inflight {
-            queue: VecDeque::new(),
-            written: 0,
-            running: 0,
-            rx,
-            dict: opts.dictionary.as_deref(),
+        let mut fl = Inflight::new();
+        let dict = opts.dictionary.as_deref();
+        // Writes the finished frames at the front once the dictionary frame can go first.
+        let flush = |fl: &mut Inflight<_>, enc: &mut StreamEncoder, out: &mut W| -> Result<()> {
+            while dict.is_none_or(Dictionary::has_id)
+                && let Some((task, frame)) = fl.pop()
+            {
+                enc.start(&mut *out)?;
+                enc.emit(&task, frame, &mut *out)?;
+            }
+            Ok(())
+        };
+        // Waits for a frame to finish or, with none running, for the dictionary.
+        let wait_one = |fl: &mut Inflight<_>| match fl.running {
+            0 => drop(dict.map(Dictionary::id)),
+            _ => fl.poll(true),
         };
         let mut plan: Option<Arc<ModelPlan>> = None;
         let mut group: Option<Arc<Link>> = None;
         // Tables may still be encoding their wire, which only the dictionary frame needs.
-        if let Some(d) = fl.dict {
+        if let Some(d) = dict {
             s.spawn(|| d.id());
         }
         for_each_chunk(reader, opts, Some(&orders), |fc| {
@@ -2091,84 +2110,97 @@ pub fn pack_stream<R: Read, W: Write>(reader: R, mut writer: W, opts: &PackOptio
                 group = Some(Arc::clone(&next));
                 (None, Some(next))
             };
-            let (c, t, plan, tx) = (OwnedChunk::new(fc), task.clone(), plan.clone(), tx.clone());
-            let seq = fl.written + fl.queue.len();
-            s.spawn(move || {
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let (mut plan, mut seeds) = (plan, Seeds::default());
-                    if let Some(l) = wait {
-                        let (p, sd) = l.get();
-                        (plan, seeds) = (Some(p), sd);
-                    }
-                    let mut frame = encode_task(opts, &t, &c.view(), plan.as_deref(), &mut seeds);
-                    if let Some(l) = publish {
-                        let p = frame.plan.take().map(Arc::new).or(plan);
-                        l.set(p.expect("a structural frame has a model"), seeds);
-                    }
-                    frame
-                }));
-                let _ = tx.send((seq, r));
-            });
             // A small frame may fall back to passthrough, which changes the next frame's kind.
             let small = !task.passthrough && fc.raw.len() <= SMALL_FRAME;
-            fl.queue.push_back((task, None));
-            fl.running += 1;
+            let (c, plan) = (OwnedChunk::new(fc), plan.clone());
+            fl.spawn(s, move || {
+                let (mut plan, mut seeds) = (plan, Seeds::default());
+                if let Some(l) = wait {
+                    let (p, sd) = l.get();
+                    (plan, seeds) = (Some(p), sd);
+                }
+                let mut frame = encode_task(opts, &task, &c.view(), plan.as_deref(), &mut seeds);
+                if let Some(l) = publish {
+                    let p = frame.plan.take().map(Arc::new).or(plan);
+                    l.set(p.expect("a structural frame has a model"), seeds);
+                }
+                (task, frame)
+            });
             // Reuse frames wait on their sync frame, so more frames run than threads.
             let depth = opts.threads + opts.sync_interval_frames;
             loop {
-                while let Ok(m) = fl.rx.try_recv() {
-                    fl.land(m);
-                }
-                fl.flush(&mut enc, &mut writer)?;
+                fl.poll(false);
+                flush(&mut fl, &mut enc, &mut writer)?;
                 if fl.queue.is_empty() || fl.running < depth && !small {
                     return Ok(());
                 }
-                fl.wait();
+                wait_one(&mut fl);
             }
         })?;
         while !fl.queue.is_empty() {
-            fl.wait();
-            fl.flush(&mut enc, &mut writer)?;
+            wait_one(&mut fl);
+            flush(&mut fl, &mut enc, &mut writer)?;
         }
         enc.finish(&mut writer)
     })
 }
 
-/// Frames being encoded, in stream order from `written`, each with its encoding once done.
-struct Inflight<'d> {
-    queue: VecDeque<(FrameTask, Option<EncodedFrame>)>,
+/// Jobs in stream order from `written`, each with its result once done.
+struct Inflight<T> {
+    queue: VecDeque<Option<T>>,
     written: usize,
     running: usize,
-    rx: mpsc::Receiver<(usize, std::thread::Result<EncodedFrame>)>,
-    dict: Option<&'d Dictionary>,
+    tx: mpsc::Sender<(usize, std::thread::Result<T>)>,
+    rx: mpsc::Receiver<(usize, std::thread::Result<T>)>,
 }
 
-impl Inflight<'_> {
-    fn land(&mut self, (seq, frame): (usize, std::thread::Result<EncodedFrame>)) {
-        let frame = frame.unwrap_or_else(|p| std::panic::resume_unwind(p));
-        self.queue[seq - self.written].1 = Some(frame);
-        self.running -= 1;
-    }
-
-    /// Waits for a frame to finish or, with none running, for the dictionary.
-    fn wait(&mut self) {
-        match self.running {
-            0 => drop(self.dict.map(Dictionary::id)),
-            _ => self.land(self.rx.recv().expect("a running frame sends")),
+impl<T: Send> Inflight<T> {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self {
+            queue: VecDeque::new(),
+            written: 0,
+            running: 0,
+            tx,
+            rx,
         }
     }
 
-    /// Writes the finished frames at the front once the dictionary frame can go first.
-    fn flush<W: Write>(&mut self, enc: &mut StreamEncoder, mut out: W) -> Result<()> {
-        while self.dict.is_none_or(Dictionary::has_id)
-            && self.queue.front().is_some_and(|j| j.1.is_some())
-        {
-            let (task, frame) = self.queue.pop_front().unwrap();
-            enc.start(&mut out)?;
-            enc.emit(&task, frame.unwrap(), &mut out)?;
-            self.written += 1;
+    /// Queues `f`, run on a thread of `s`.
+    fn spawn<'s>(&mut self, s: &'s std::thread::Scope<'s, '_>, f: impl FnOnce() -> T + Send + 's)
+    where
+        T: 's,
+    {
+        let (seq, tx) = (self.written + self.queue.len(), self.tx.clone());
+        s.spawn(move || {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            let _ = tx.send((seq, r));
+        });
+        self.queue.push_back(None);
+        self.running += 1;
+    }
+
+    /// Queues a job that is already done.
+    fn push(&mut self, done: T) {
+        self.queue.push_back(Some(done));
+    }
+
+    /// Takes in the jobs that have finished, after waiting for one with `block`.
+    fn poll(&mut self, block: bool) {
+        let first = block.then(|| self.rx.recv().expect("a running job sends"));
+        let done = std::iter::from_fn(|| self.rx.try_recv().ok());
+        for (seq, r) in first.into_iter().chain(done) {
+            let r = r.unwrap_or_else(|p| std::panic::resume_unwind(p));
+            self.queue[seq - self.written] = Some(r);
+            self.running -= 1;
         }
-        Ok(())
+    }
+
+    /// The front job's result, once it is done.
+    fn pop(&mut self) -> Option<T> {
+        self.queue.front()?.as_ref()?;
+        self.written += 1;
+        self.queue.pop_front().flatten()
     }
 }
 
@@ -2366,53 +2398,140 @@ fn chunks<R: Read>(
     Ok(())
 }
 
-pub fn unpack_stream<R: Read, W: Write>(
+pub fn unpack_stream<R: Read, W: Write>(reader: R, writer: W, budget: &DecodeBudget) -> Result<()> {
+    unpack_stream_threads(reader, writer, budget, 1)
+}
+
+/// A frame as the unpacker takes it from the stream.
+enum Frame {
+    /// An index region: a stream concatenated after it starts with its own model and dictionary.
+    Index,
+    Dictionary(Dictionary),
+    Order(Vec<u8>),
+    Data(ParsedFrameHeader, Vec<u8>, Option<u64>),
+}
+
+fn read_frame<R: Read>(reader: &mut R, budget: &DecodeBudget) -> Result<Option<Frame>> {
+    let hdr = match read_next_frame_header(reader, budget)? {
+        NextFrameKind::Eof => return Ok(None),
+        NextFrameKind::Index { skip_bytes } => {
+            std::io::copy(&mut reader.take(skip_bytes as u64), &mut std::io::sink())?;
+            return Ok(Some(Frame::Index));
+        }
+        NextFrameKind::Data(hdr) => hdr,
+    };
+    let mut payload = budget.alloc_vec(hdr.payload_len, "frame payload")?;
+    reader.read_exact(&mut payload)?;
+    let exp_xxh = if (hdr.flags & FLAG_HAS_CHECKSUM) != 0 {
+        let mut cb = [0u8; 8];
+        reader.read_exact(&mut cb)?;
+        Some(u64::from_le_bytes(cb))
+    } else {
+        None
+    };
+    if (hdr.flags & FLAG_DICTIONARY) != 0 {
+        let id = exp_xxh.ok_or_else(|| Error::Format("dictionary frame has no id".into()))?;
+        let dict = Dictionary::read(&payload, id, budget)?;
+        return Ok(Some(Frame::Dictionary(dict)));
+    }
+    if (hdr.flags & FLAG_ORDER) != 0 {
+        if budget.verify_checksums && exp_xxh != Some(xxh64(&payload, ORDER_SEED)) {
+            return Err(Error::ChecksumMismatch("ZFM1 order frame XXH64"));
+        }
+        return Ok(Some(Frame::Order(payload)));
+    }
+    Ok(Some(Frame::Data(hdr, payload, exp_xxh)))
+}
+
+/// Unpacks with data frames decoded `threads` at a time, written in stream order. The output,
+/// and the first error in stream order, match `threads == 1`.
+pub fn unpack_stream_threads<R: Read, W: Write>(
     mut reader: R,
     writer: W,
     budget: &DecodeBudget,
+    threads: usize,
 ) -> Result<()> {
-    let mut prev_plan: Option<ModelPlan> = None;
-    let mut dict = Scope::enter(None);
     let mut writer = Restore::new(writer);
-    loop {
-        match read_next_frame_header(&mut reader, budget)? {
-            NextFrameKind::Eof => return writer.finish(),
-            NextFrameKind::Index { skip_bytes } => {
-                std::io::copy(
-                    &mut (&mut reader).take(skip_bytes as u64),
-                    &mut std::io::sink(),
-                )?;
-                // A stream concatenated after this one starts with its own model and dictionary.
-                prev_plan = None;
-                dict.set(None);
-            }
-            NextFrameKind::Data(hdr) => {
-                let mut payload = budget.alloc_vec(hdr.payload_len, "frame payload")?;
-                reader.read_exact(&mut payload)?;
-                let exp_xxh = if (hdr.flags & FLAG_HAS_CHECKSUM) != 0 {
-                    let mut cb = [0u8; 8];
-                    reader.read_exact(&mut cb)?;
-                    Some(u64::from_le_bytes(cb))
-                } else {
-                    None
-                };
-                if (hdr.flags & FLAG_DICTIONARY) != 0 {
-                    let id = exp_xxh
-                        .ok_or_else(|| Error::Format("dictionary frame has no id".into()))?;
-                    dict.set(Some(Arc::new(Dictionary::read(&payload, id, budget)?)));
-                    continue;
+    if threads <= 1 {
+        let mut prev_plan: Option<ModelPlan> = None;
+        let mut dict = Scope::enter(None);
+        while let Some(frame) = read_frame(&mut reader, budget)? {
+            match frame {
+                Frame::Index => {
+                    prev_plan = None;
+                    dict.set(None);
                 }
-                if (hdr.flags & FLAG_ORDER) != 0 {
-                    if budget.verify_checksums && exp_xxh != Some(xxh64(&payload, ORDER_SEED)) {
-                        return Err(Error::ChecksumMismatch("ZFM1 order frame XXH64"));
-                    }
-                    writer.order(&payload, budget)?;
-                    continue;
+                Frame::Dictionary(d) => dict.set(Some(Arc::new(d))),
+                Frame::Order(p) => writer.order(&p, budget)?,
+                Frame::Data(hdr, payload, exp) => {
+                    decode_frame_payload(&hdr, &payload, exp, &mut prev_plan, budget, &mut writer)?
                 }
-                decode_frame_payload(&hdr, &payload, exp_xxh, &mut prev_plan, budget, &mut writer)?;
             }
         }
+        return writer.finish();
     }
+    enum Piece {
+        Bytes(Vec<u8>),
+        Order(Vec<u8>),
+    }
+    std::thread::scope(|s| {
+        let mut fl = Inflight::<Result<Piece>>::new();
+        let mut plan: Option<Arc<ModelPlan>> = None;
+        let mut dict: Option<Arc<Dictionary>> = None;
+        // Writes the finished frames at the front until fewer than `most` are in flight.
+        let mut settle = |fl: &mut Inflight<_>, most: usize| -> Result<()> {
+            loop {
+                fl.poll(false);
+                while let Some(piece) = fl.pop() {
+                    match piece? {
+                        Piece::Bytes(b) => writer.write_all(&b)?,
+                        Piece::Order(p) => writer.order(&p, budget)?,
+                    }
+                }
+                if fl.queue.len() < most {
+                    return Ok(());
+                }
+                fl.poll(true);
+            }
+        };
+        loop {
+            // An error here comes after the frames already queued, which may fail first.
+            let frame = read_frame(&mut reader, budget).and_then(|f| {
+                if let Some(Frame::Data(hdr, payload, _)) = &f
+                    && hdr.flags & (FLAG_PASSTHROUGH | FLAG_REUSE_PREV_MODEL) == 0
+                {
+                    // The plan is a small part of a sync frame; reading it here keeps the
+                    // reuse frames after it from waiting on that frame's decode.
+                    let mut p = None;
+                    load_sync_frame_plan(hdr, payload, &mut p, budget)?;
+                    plan = p.map(Arc::new);
+                }
+                Ok(f)
+            });
+            match frame {
+                Ok(None) => break,
+                Err(e) => {
+                    fl.push(Err(e));
+                    break;
+                }
+                Ok(Some(Frame::Index)) => (plan, dict) = (None, None),
+                Ok(Some(Frame::Dictionary(d))) => dict = Some(Arc::new(d)),
+                Ok(Some(Frame::Order(p))) => fl.push(Ok(Piece::Order(p))),
+                Ok(Some(Frame::Data(hdr, payload, exp))) => {
+                    let (plan, dict) = (plan.clone(), dict.clone());
+                    fl.spawn(s, move || {
+                        let _dict = Scope::enter(dict);
+                        let mut plan = plan.as_deref().cloned();
+                        decode_frame(&hdr, &payload, exp, &mut plan, budget).map(Piece::Bytes)
+                    });
+                }
+            }
+            // At most `threads` frames are decoding, or decoded and waiting to be written.
+            settle(&mut fl, threads)?;
+        }
+        settle(&mut fl, 1)?;
+        writer.finish()
+    })
 }
 
 pub use crate::inspect::inspect_stream;
@@ -2522,5 +2641,80 @@ mod nested_tests {
                 assert_eq!(back.get(i).unwrap(), want);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod unpack_threads_tests {
+    use super::*;
+
+    /// A passthrough frame, one record longer than a frame, then log lines in sync and reuse frames.
+    fn stream() -> &'static (Vec<u8>, Vec<u8>) {
+        static STREAM: std::sync::OnceLock<(Vec<u8>, Vec<u8>)> = std::sync::OnceLock::new();
+        STREAM.get_or_init(build)
+    }
+
+    fn build() -> (Vec<u8>, Vec<u8>) {
+        let mut state = 9u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut raw: Vec<u8> = (0..70_000).map(|_| next() as u8 | 0x80).collect();
+        for i in 0..3000u64 {
+            let r = next();
+            let (day, host, blk, n) = (i / 100 + 1, r % 9, r >> 40, r % 5000);
+            let line = format!("2024-05-{day:02} host{host} INFO blk_{blk} sent {n} bytes\n");
+            raw.extend(line.bytes());
+        }
+        let opts = PackOptions {
+            chunk_bytes: 64 << 10,
+            sync_interval_frames: 3,
+            threads: 1,
+            ..PackOptions::default()
+        };
+        let mut packed = Vec::new();
+        pack_stream(&raw[..], &mut packed, &opts).unwrap();
+        (raw, packed)
+    }
+
+    fn unpack(packed: &[u8], threads: usize) -> (Vec<u8>, Result<()>) {
+        let mut out = Vec::new();
+        let r = unpack_stream_threads(packed, &mut out, &DecodeBudget::default(), threads);
+        (out, r)
+    }
+
+    #[test]
+    fn threads_unpack_the_serial_bytes() {
+        let (raw, packed) = stream();
+        let rep = inspect_stream(&packed[..], &DecodeBudget::default()).unwrap();
+        assert!(
+            rep.frames > rep.sync_frames && rep.passthrough_frames > 0,
+            "{rep:?}"
+        );
+        let cat = [&packed[..], &packed].concat();
+        for threads in [2, 5] {
+            assert!(unpack(&cat, threads) == (raw.repeat(2), Ok(())));
+        }
+    }
+
+    #[test]
+    fn threads_fail_as_the_serial_reader_does() {
+        let (_, packed) = stream();
+        // Damage in each frame, and cuts through each, keep the serial error and output.
+        let (step, mut errors) = (packed.len() / 13, 0);
+        for at in (step / 2..packed.len()).step_by(step) {
+            let mut bad = packed.clone();
+            bad[at] ^= 0x20;
+            for s in [&bad[..], &packed[..at]] {
+                let serial = unpack(s, 1);
+                errors += serial.1.is_err() as usize;
+                assert!(unpack(s, 3) == serial, "{at}");
+            }
+        }
+        // The index region is skipped unread, so damage there goes unseen.
+        assert!(errors > 20, "{errors}");
     }
 }

@@ -639,7 +639,7 @@ mod tests {
 
     #[test]
     fn a_packed_stream_unpacks_in_its_original_order() {
-        use crate::container::{PackOptions, pack_stream, unpack_stream};
+        use crate::container::{PackOptions, pack_stream, unpack_stream, unpack_stream_threads};
         let input = events(8000);
         let pack = |order_by: &[&str], threads| {
             let opts = PackOptions {
@@ -661,6 +661,10 @@ mod tests {
         let mut back = Vec::new();
         unpack_stream(&packed.repeat(2)[..], &mut back, &DecodeBudget::default()).unwrap();
         assert_eq!(back, input.repeat(2));
+        let mut par = Vec::new();
+        unpack_stream_threads(&packed.repeat(2)[..], &mut par, &DecodeBudget::default(), 3)
+            .unwrap();
+        assert!(par == back);
     }
 
     #[test]

@@ -9,8 +9,7 @@ use zform::inspect::inspect_breakdown;
 use zform::{
     Archive, DecodeBudget, Dictionary, EntropyBackend, FramingSpec, PackOptions, Predicate,
     Profile, Stats, TrainOptions, build_dictionary, build_tables, first_run, inspect_stream,
-    logical, pack,
-    train, train_seekable, unpack_with_budget,
+    logical, pack, train, train_seekable, unpack_stream_threads,
 };
 
 fn usage() -> &'static str {
@@ -40,7 +39,8 @@ OPTIONS:
   --chunk-bytes <BYTES>     Streaming frame raw chunk size (default: 16777216 = 16 MiB)
   --block-bytes <BYTES>     Raw bytes per block, the unit a query reads (default: 8388608 = 8 MiB)
   --block-rows <N>          Max records per block (default: 65536)
-  --threads <N>             Frames encoded at once (default: the CPU count); the output is the same
+  --threads <N>             Frames encoded, or unpacked, at once (default: the CPU count); the
+                            output is the same
   --dict-bytes <BYTES>      File dictionary budget, for a file input of over one block whose text
                             values recur across blocks (default: 0 = none; with --best, 1/32 of
                             the file, 8 to 32 MiB). Levels 1-4 use at most 16 MiB
@@ -414,6 +414,7 @@ fn file_profile(path: &str, opts: &mut PackOptions, max_bytes: usize) -> Result<
 
 fn cmd_unpack(args: &[String], test_only: bool) -> Result<(), String> {
     let mut budget = DecodeBudget::default();
+    let mut threads = PackOptions::default().threads;
     let mut input: Option<&str> = None;
     let mut output: Option<&str> = None;
     let mut i = 0usize;
@@ -425,6 +426,14 @@ fn cmd_unpack(args: &[String], test_only: bool) -> Result<(), String> {
                 output = Some(args.get(i).ok_or("missing value for -o")?);
             }
             "--no-verify" => budget.verify_checksums = false,
+            "--threads" => {
+                i += 1;
+                threads = args
+                    .get(i)
+                    .ok_or("missing value for --threads")?
+                    .parse()
+                    .map_err(|_| "invalid --threads")?;
+            }
             "-f" | "--force" | "-q" | "--quiet" | "-k" | "--keep" | "-c" | "--stdout" => {}
             _ if a.starts_with('-') && a != "-" => return Err(format!("unknown flag '{a}'")),
             _ => {
@@ -440,10 +449,10 @@ fn cmd_unpack(args: &[String], test_only: bool) -> Result<(), String> {
     check_not_same_file(input, output)?;
     let rdr = open_input(input)?;
     if test_only {
-        unpack_with_budget(rdr, io::sink(), &budget).map_err(|e| e.to_string())
+        unpack_stream_threads(rdr, io::sink(), &budget, threads).map_err(|e| e.to_string())
     } else {
         let mut wtr = open_output(output)?;
-        unpack_with_budget(rdr, &mut wtr, &budget).map_err(|e| e.to_string())?;
+        unpack_stream_threads(rdr, &mut wtr, &budget, threads).map_err(|e| e.to_string())?;
         wtr.flush().map_err(|e| e.to_string())
     }
 }
