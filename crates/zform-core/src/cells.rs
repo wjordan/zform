@@ -51,13 +51,8 @@ impl Cells {
         if total != buf.len() || total > u32::MAX as usize {
             return Err(Error::Format("fixed-width buffer length mismatch".into()));
         }
-        let mut ends = Vec::with_capacity(rows);
-        let w = width as u32;
-        let mut pos = 0u32;
-        for _ in 0..rows {
-            pos += w;
-            ends.push(pos);
-        }
+        // Each end is at most `total`, which fits in u32.
+        let ends = (1..=rows).map(|i| (i * width) as u32).collect();
         Ok(Self { buf, ends })
     }
 
