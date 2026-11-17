@@ -667,7 +667,6 @@ impl Render<'_> {
                 (Some(_), crate::payload::graph::SumSeed::Previous) => "KeyedSum(ordered,previous)".into(),
                 (Some(_), crate::payload::graph::SumSeed::Zero) => "KeyedSum(ordered,zero)".into(),
             },
-            GraphNode::RankedSum { .. } => "RankedSum".into(),
             GraphNode::ExtVariant => "Variant".into(),
             GraphNode::CellIds { .. } => "CellIds".into(),
             GraphNode::Interleave { .. } => "Interleave".into(),
@@ -706,9 +705,6 @@ fn lib_name(shared: bool, bytes: &[u8]) -> String {
 
 fn int_kind(s: &IntStream) -> String {
     match s {
-        IntStream::ContextMix {
-            bits, table_bits, ..
-        } => format!("ContextMix/{bits}b/t{table_bits}"),
         IntStream::NibbleMix {
             bits, table_bits, ..
         } => format!("NibbleMix/{bits}b/t{table_bits}"),

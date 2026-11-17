@@ -85,8 +85,7 @@ not change; a selective read still fetches only its declared parts.
 This generalizes the experiment's prediction of dictionary IDs, flags, and small residuals.
 Writers emit kind `10`, which codes a value a nibble at a time: two 16-symbol models, one on
 the nibble prefix and one hashed from the preceding pair, are mixed and range-coded. That is
-about two coding steps per value instead of kind `9`'s one per bit. It costs a third of kind
-`9`'s instructions in both directions, and its streams come out slightly smaller. The transport
+about two coding steps per value where a bitwise coder takes one per bit. The transport
 has no log-format names, hardware topology, field parser, or state shared between payloads.
 Each stream uses at most 1.5 MiB of model tables and resets at its boundary.
 
@@ -97,9 +96,7 @@ skip the trial. Timestamps, numeric reconstruction, and byte formatting remain o
 programs. The latency-oriented `add_ints_fast` path does not run this search.
 
 Context mixing trades decode speed for density, so it is opt-in even with `--best`.
-Readers implement two bounded integer transports: kind `10`, and kind `9` for older files.
-Lane programs gain no mutable hash tables or arbitrary loops. Older readers cannot decode a
-payload that selects either kind.
+Lane programs gain no mutable hash tables or arbitrary loops.
 Cross-field contexts could be a later extension with explicit graph dependencies, but the
 current transport uses only its own preceding values.
 
@@ -133,8 +130,7 @@ after block.
 A datanode deletes its blocks in id order and its deletion rows do not name it. The writer
 infers the replica from its clock and recent use, then stores its explicit position in the
 block's replica table. Ordinary table lookups and `CellIds` produce keys; ordered, zero-seeded
-`KeyedSum` reconstructs the clocks. The reader does no candidate ranking. `RankedSum` remains
-only for decoding older archives, in `payload/legacy.rs`.
+`KeyedSum` reconstructs the clocks. The reader does no candidate ranking.
 
 A keyed relation that loses a sample by under a half is tried again on the block, where its
 keys' first steps weigh less. On a 256 MB HDFS slice the write clocks and counters cut threads
@@ -153,7 +149,7 @@ the existing block-ID encoding, so they remain benchmark experiments rather than
 
 ## payload node scope
 
-The graph has 25 active node kinds plus legacy `RankedSum`; the lane program still has 35
+The graph has 25 node kinds; the lane program still has 35
 operations. Ordered `KeyedSum` adds options to an existing node, not another opcode or a
 second sorting/permutation language. The full node sweep found these boundaries worth keeping:
 
@@ -171,10 +167,8 @@ second sorting/permutation language. The full node sweep found these boundaries 
 | `ExtAlign`, `ExtVariant` | Record alignment and variant metadata supplied by the host; no HDFS template or field names. |
 | `MatchIndex`, `CellIds` | Keyed occurrence lookup versus value interning. `IndexCells` is a positional lookup, so it does not replace either. |
 | `Interleave`, `KeyedSum` | Stable multiplexing of integer streams and per-key accumulation, composable with explicit keys and ordering values. |
-| `RankedSum` | Compatibility only. Candidate ranking, elimination, ordering and clock state made it the over-specialized node; new graphs express the relationship using the simpler nodes above. |
 
-Integer transports are a separate layer. The older bitwise `ContextMix` remains a reader
-compatibility form; writers choose `NibbleMix`. The other transports encode constant,
+Integer transports are a separate layer. Beside `NibbleMix`, they encode constant,
 run-length, bit-packed, sparse, Rice, varint, or byte-plane distributions without corpus
 semantics. Similar names alone are not evidence that two representations are redundant.
 

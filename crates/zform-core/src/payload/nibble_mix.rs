@@ -1,6 +1,6 @@
 //! Kind 10: bounded integer lanes coded a nibble at a time from a mixture of two adaptive
-//! 16-symbol models, with a multi-symbol range coder. One coding step per nibble instead of
-//! kind 9's one per bit. Its predictions are the wire contract: a change needs a new kind.
+//! 16-symbol models, with a multi-symbol range coder: one coding step per nibble. Its
+//! predictions are the wire contract.
 use crate::wire::{DecodeBudget, Error, Result};
 
 /// The models' cumulative total. The coder adds one per symbol below `s`, so every symbol

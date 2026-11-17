@@ -218,14 +218,13 @@ fn main() -> zform::Result<()> {
 rows: uvarint | flags: u8 | [dict_id: uvarint] | [n_src: uvarint | src: [uvarint; n_src]] | n_nodes: uvarint | nodes | root: uvarint
 ```
 
-A graph with no rows is exactly one byte, `0`, with no flags or nodes. Nonempty general graphs have 1–4,096 nodes. Their dependency and capability flags combine as follows:
+A graph with no rows is exactly one byte, `0`, with no flags or nodes. Nonempty general graphs have 1–4,096 nodes. Their dependency flags combine as follows:
 
 | Flag | Following header fields | Meaning |
 |---:|---|---|
 | `0x01` | None | The block's prose pool |
 | `0x02` | `dict_id: uvarint` | One shared dictionary of cells in the block |
 | `0x04` | `n_src: uvarint`, then `src: [uvarint; n_src]` | 1–64 peer column ids in the block |
-| `0x20` | None | Extended `KeyedSum` operands are permitted |
 
 A `src` entry with bit 31 set names column `src & 0x7fffffff` of the file's tables, which it must have. `ExtPeer.slot` indexes the header's `src` list; it is not a column id. `ExtDict.dict_id` must match the header's dictionary id. These declarations let a reader fetch dependencies without evaluating nodes. The model's library supplies code references separately. A missing external input returns `Error::NotLoaded`; an undeclared input is a format error.
 
@@ -275,20 +274,14 @@ Unless typed otherwise, operands are `uvarint`. `ref` names an earlier node; `re
 | `26` | `ExtVariant` | None | Integers: for each cell of this column, its record's variant id |
 | `27` | `CellIds` | `cells: ref` | Integers: each cell's value id, the rank of its value's first occurrence |
 | `28` | `Interleave` | `sel: ref`, `streams: refs` | Integers: row `i` is the next unread value of `streams[sel[i]]`; every stream is read to its end |
-| `29` | `RankedSum` (legacy) | `at: ref`, `picks: ref`, `deltas: ref`, `order: ref`, `cands: ref`, `width: u8` | Integers: a row with pick `0` yields `deltas[i]`. The others are taken in order of the integer in cell `at[i]` of `order` (parsed as by `ParseAsciiInt`), ties in row order. Rows of one order share the candidates of its first row: the distinct nonempty cells among `cands[width * at[i]..][..width]`, those that were picked in the last order they were candidates of first, each group in cell order. Pick `p` takes the `p`-th candidate that no earlier row of the order took and yields its sum plus `deltas[i]`, wrapping; a candidate's sum starts at the last sum yielded (0 at first) |
 
-`KeyedSum` without `has_options` retains its original operands and behavior: process input
-rows in order, initializing a new key from the last nonzero-key sum (initially zero).
+Without `has_options`, `KeyedSum` processes input rows in order and initializes a new key
+from the last nonzero-key sum (initially zero).
 With `has_options`, `options` must be nonzero and contain only bits `0x01` and `0x02`.
-Bit `0x01` initializes each key independently at zero; otherwise the original seed policy
-applies. Bit `0x02` adds an integer `order` reference: process rows by signed order value,
+Bit `0x01` initializes each key independently at zero. Bit `0x02` adds an integer `order` reference: process rows by signed order value,
 break ties by input position, and put each result back at its input position. Keys, deltas,
 and ordering values must have equal lengths. Key zero passes through without changing
 any state. Ordered scans require all input rows even for a prefix read.
-
-An extended `KeyedSum` requires graph flag `0x20`. Earlier readers reject this flag before
-reading node operands; they cannot read the extended form. Current readers still accept
-original `KeyedSum` and `RankedSum` payloads. Built-in writers no longer emit `RankedSum`.
 
 `MtfFixed` keeps the last 64 items, most recent first. Code `0` consumes the next `width` fallback bytes and inserts that item. Code `k > 0` selects rank `k - 1` and moves it to the front. `MtfInts` uses the same code convention with integer misses.
 
@@ -315,7 +308,6 @@ An `IntStream` starts with `kind: u8`, then `length: uvarint`, followed by the o
 | `6` | ZigZag byte head and exceptions | `head: leaf_blob`, `tail: IntStream` |
 | `7` | Shifted constant | `shift: u8`, `coefficient: ivarint` |
 | `8` | Centered Rice | `bytes: blob` |
-| `9` | Context mixture | `min: ivarint`, `bits: u8`, `table_bits: u8`, `bytes: blob` |
 | `10` | Nibble context mixture | `min: ivarint`, `bits: u8`, `table_bits: u8`, `escape: u8`, `bytes: blob` |
 
 - **Constant:** repeat `value`. A shifted constant repeats `coefficient << shift`; the shift is 1–63 and must preserve the signed coefficient without overflow.
@@ -325,29 +317,14 @@ An `IntStream` starts with `kind: u8`, then `length: uvarint`, followed by the o
 - **Byte planes:** `width` is 1, 2, 4, or 8. The expanded leaf holds `length * width` bytes: all low bytes of unsigned offsets from `min`, then all second bytes, and so on. Interleave and add `min` with 64-bit wrapping arithmetic.
 - **Byte head and exceptions:** the expanded head holds one byte per lane. Bytes 0–254 represent offsets from `min` (kind `5`) or ZigZag codes (kind `6`). Byte 255 consumes the next tail value and adds 255 to obtain the offset or ZigZag code. Each exception consumes exactly one tail value. Kind `5` tails must be nonnegative; kind `6` tails carry unsigned bit patterns in signed lanes. A tail is never itself kind `5` or `6`.
 - **Centered Rice:** `bytes` contains `center: ivarint`, `k: u8`, then a least-significant-bit-first bitstream. ZigZag-encode each signed difference from `center`. Write `code >> k` zero bits, one bit, then the low `k` bits. `k` is 0–63. Decoders reject arithmetic overflow, truncation, trailing bytes, and nonzero padding.
-- **Context mixture:** kind `9` fixes the integer-only model and range coder in
-  [`payload/context_mix.rs`](crates/zform-core/src/payload/context_mix.rs).
-  `length` is nonzero, `bits` is 1–16, and `table_bits` is 8–14. Each value is an unsigned
-  `bits`-wide offset from `min`, coded most-significant bit first. Add `min` with wrapping
-  arithmetic to reconstruct signed lanes. `bytes` is the arithmetic stream itself, without
-  another entropy-leaf wrapper. It ends with four range-flush bytes.
+- **Nibble context mixture:** `length` is nonzero, `bits` is 1–16, and `table_bits` is 8–14.
+  Each value is an unsigned `bits`-wide offset from `min`; add `min` with wrapping arithmetic
+  to reconstruct signed lanes. `bytes` is the arithmetic stream itself, without another
+  entropy-leaf wrapper. No state carries into another integer stream. Decoder limits cover
+  parameters, compressed bytes, output allocation, and model memory. Predictions are part of
+  the wire: changing the model changes the format.
 
-Kind `9` starts three tables of `2^table_bits` counters at probability 32768 and count zero.
-The contexts are the partial bit prefix (starting at 1), the preceding value plus prefix,
-and the preceding pair plus prefix. Previous values start at zero. Table indexing uses the
-fixed hashes and bit layouts in the reference implementation. A counter's probability uses
-16 fractional bits; its update rate is `floor(65536 / (count + 2))`, with count capped at 63.
-Probability updates use signed arithmetic shifts and clamp to 1–65535.
-
-Each bit depth has three mixture weights, initially `[21845, 21845, 21846]`, summing to 65536.
-Predict with the weighted probability sum shifted right 16, clamped to 1–65535. After the bit,
-update weights from their likelihoods and blend 31/32 of that posterior with 1/32 uniform weight.
-Assign rounding remainder to the third weight. Then update the model counters. No state
-carries into another integer stream. Decoder limits cover parameters, compressed bytes, output
-allocation, and model memory; truncated or trailing arithmetic bytes are errors. Predictions
-are part of this wire kind: a different model requires a different kind, not an encoder tweak.
-
-Kind `10` has the same parameters and bounds, and its reference implementation is
+Kind `10`'s reference implementation is
 [`payload/nibble_mix.rs`](crates/zform-core/src/payload/nibble_mix.rs). It codes each offset
 most-significant nibble first with a 15-bit multi-symbol range coder. When `escape` is 1 (only for
 `bits` above 4), a first symbol codes offsets 0–14 directly, and symbol 15 is followed by the

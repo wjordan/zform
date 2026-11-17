@@ -274,13 +274,6 @@ pub enum IntStream {
         len: u32,
         bytes: Vec<u8>,
     },
-    ContextMix {
-        len: u32,
-        min: i64,
-        bits: u8,
-        table_bits: u8,
-        bytes: Vec<u8>,
-    },
     NibbleMix {
         len: u32,
         min: i64,
@@ -326,7 +319,6 @@ impl IntStream {
             }
             Self::Const { .. }
             | Self::Rice { .. }
-            | Self::ContextMix { .. }
             | Self::NibbleMix { .. } => {}
         }
         Ok(())
@@ -659,7 +651,6 @@ impl IntStream {
             Self::Const { len, .. }
             | Self::Rle { len, .. }
             | Self::Rice { len, .. }
-            | Self::ContextMix { len, .. }
             | Self::NibbleMix { len, .. }
             | Self::ForBitpack { len, .. }
             | Self::ZigZagVarint { len, .. }
@@ -675,20 +666,6 @@ impl IntStream {
 
     pub fn encode(&self, out: &mut Vec<u8>) {
         match self {
-            Self::ContextMix {
-                len,
-                min,
-                bits,
-                table_bits,
-                bytes,
-            } => {
-                out.push(9);
-                put_uvarint(out, *len as u64);
-                put_ivarint(out, *min);
-                out.extend_from_slice(&[*bits, *table_bits]);
-                put_uvarint(out, bytes.len() as u64);
-                out.extend_from_slice(bytes);
-            }
             Self::NibbleMix {
                 len,
                 min,
@@ -833,21 +810,6 @@ impl IntStream {
                     bytes: bytes.to_vec(),
                 })
             }
-            9 => {
-                let min = cur.ivar()?;
-                let bits = cur.u8()?;
-                let table_bits = cur.u8()?;
-                let bytes = cur.bytes()?;
-                super::context_mix::validate(len as usize, bits, table_bits, bytes.len(), budget)?;
-                budget.check_alloc(bytes.len(), "context mixing bytes")?;
-                Ok(Self::ContextMix {
-                    len,
-                    min,
-                    bits,
-                    table_bits,
-                    bytes: bytes.to_vec(),
-                })
-            }
             8 => Ok(Self::Rice {
                 len,
                 bytes: cur.bytes()?.to_vec(),
@@ -934,13 +896,6 @@ impl IntStream {
         match self {
             Self::Const { val, len } => Ok(vec![*val; *len as usize]),
             Self::Rice { len, bytes } => super::rice::decode(bytes, *len as usize, budget),
-            Self::ContextMix {
-                len,
-                min,
-                bits,
-                table_bits,
-                bytes,
-            } => super::context_mix::decode(bytes, *len as usize, *min, *bits, *table_bits, budget),
             Self::NibbleMix {
                 len,
                 min,
@@ -1222,21 +1177,6 @@ pub enum GraphNode {
         order: Option<u16>,
         seed: SumSeed,
     },
-    /// Sums on keys the rows do not name. Rows with a pick are taken in order of the integers
-    /// `order[at[i]]`, ties in row order; rows of one order share the first's candidates, the
-    /// distinct nonempty cells among the `width` of `cands` from `width * at[i]`, those that
-    /// stepped when last a candidate first. Pick `p` steps the `p`-th candidate no earlier row
-    /// of the order took: `deltas[i]` added to its sum, which starts at the last sum yielded
-    /// (0 at first). A row with pick `0` yields `deltas[i]` alone.
-    /// Legacy decoding only; new writers use ordered `KeyedSum` and explicit keys.
-    RankedSum {
-        at: u16,
-        picks: u16,
-        deltas: u16,
-        order: u16,
-        cands: u16,
-        width: u8,
-    },
     /// For each cell of this column, the variant id of its record.
     ExtVariant,
     /// Each cell's value id: the rank of its value's first occurrence.
@@ -1251,10 +1191,6 @@ pub enum GraphNode {
 }
 
 impl GraphNode {
-    fn extended_sum(&self) -> bool {
-        matches!(self, Self::KeyedSum { order: Some(_), .. } | Self::KeyedSum { seed: SumSeed::Zero, .. })
-    }
-
     #[inline]
     pub fn for_each_dep(&self, mut f: impl FnMut(u16)) {
         match self {
@@ -1273,9 +1209,6 @@ impl GraphNode {
                 if let Some(order) = order { f(*order); }
             }
             Self::CellIds { cells } => f(*cells),
-            Self::RankedSum { at, picks, deltas, order, cands, .. } => {
-                [*at, *picks, *deltas, *order, *cands].into_iter().for_each(f);
-            }
             Self::Interleave { sel, streams } => {
                 f(*sel);
                 for &x in streams {
@@ -1454,14 +1387,6 @@ impl GraphNode {
                 seed: *seed,
             },
             Self::CellIds { cells } => Self::CellIds { cells: f(*cells) },
-            Self::RankedSum { at, picks, deltas, order, cands, width } => Self::RankedSum {
-                at: f(*at),
-                picks: f(*picks),
-                deltas: f(*deltas),
-                order: f(*order),
-                cands: f(*cands),
-                width: *width,
-            },
             Self::Interleave { sel, streams } => Self::Interleave {
                 sel: f(*sel),
                 streams: streams.iter().map(|&x| f(x)).collect(),
@@ -1514,7 +1439,6 @@ impl PayloadGraph {
                 || matches!(
                     stream,
                     IntStream::Const { .. }
-                        | IntStream::ContextMix { .. }
                         | IntStream::NibbleMix { .. }
                 )
             {
@@ -1676,13 +1600,9 @@ impl PayloadGraph {
             }
         }
 
-        // Old readers did not reject the high node-tag bit on kind 25. A graph capability
-        // bit makes them reject the extended form before interpreting its operands.
-        let extended_sums = self.nodes.iter().any(GraphNode::extended_sum);
         let flags = (u8::from(self.ext_pool))
             | (u8::from(self.ext_dict.is_some()) << 1)
-            | (u8::from(!self.ext_peers.is_empty()) << 2)
-            | (u8::from(extended_sums) << 5);
+            | (u8::from(!self.ext_peers.is_empty()) << 2);
         out.push(flags);
         if let Some(d) = self.ext_dict {
             put_uvarint(&mut out, d as u64);
@@ -1774,7 +1694,7 @@ impl PayloadGraph {
                 nodes,
             });
         }
-        if flags & !0x27 != 0 {
+        if flags & !0x07 != 0 {
             return Err(Error::Format("unknown PayloadGraph ext_flags".into()));
         }
         let ext_pool = (flags & EXT_FLAG_POOL) != 0;
@@ -1809,9 +1729,6 @@ impl PayloadGraph {
         let mut nodes = Vec::with_capacity(n_nodes);
         for idx in 0..n_nodes {
             let node = decode_node(&mut cur, idx, lib, budget)?;
-            if node.extended_sum() && flags & 0x20 == 0 {
-                return Err(Error::Format("KeyedSum options without graph capability".into()));
-            }
             match &node {
                 GraphNode::ExtPool if !ext_pool => {
                     return Err(Error::Format("undeclared ExtPool dependency".into()));
@@ -2944,13 +2861,6 @@ fn encode_node_linked(n: &GraphNode, lib: Option<&Library>, out: &mut Vec<u8>) {
             put_uvarint(out, *sel as u64);
             put_u16_list(out, streams);
         }
-        GraphNode::RankedSum { at, picks, deltas, order, cands, width } => {
-            out.push(29);
-            for r in [at, picks, deltas, order, cands] {
-                put_uvarint(out, *r as u64);
-            }
-            out.push(*width);
-        }
     }
 }
 
@@ -3190,12 +3100,6 @@ fn decode_node(
                 return Err(Error::Format("Interleave without streams".into()));
             }
             Ok(GraphNode::Interleave { sel, streams })
-        }
-        29 => {
-            let mut r = || check_ref(cur.uvar()?);
-            let (at, picks, deltas, order, cands) = (r()?, r()?, r()?, r()?, r()?);
-            let width = cur.u8()?;
-            Ok(GraphNode::RankedSum { at, picks, deltas, order, cands, width })
         }
         21 => {
             if flag {
@@ -4127,17 +4031,6 @@ impl CoreDecoder {
                         return Err(Error::Format("Interleave trailing values".into()));
                     }
                     Val::Ints(out)
-                }
-                GraphNode::RankedSum { at, picks, deltas, order, cands, width } => {
-                    Val::Ints(super::legacy::ranked_sum(
-                        as_ints(&vals[*at as usize])?,
-                        as_ints(&vals[*picks as usize])?,
-                        as_ints(&vals[*deltas as usize])?,
-                        as_cells(&vals[*order as usize])?,
-                        as_cells(&vals[*cands as usize])?,
-                        *width as usize,
-                        budget,
-                    )?)
                 }
                 GraphNode::CellIds { cells } => {
                     let c = as_cells(&vals[*cells as usize])?;

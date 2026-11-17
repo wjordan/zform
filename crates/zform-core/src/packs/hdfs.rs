@@ -1531,7 +1531,6 @@ mod tests {
         assert!(graph.nodes.iter().any(|n| matches!(n, GraphNode::KeyedSum {
             order: Some(_), seed: SumSeed::Zero, ..
         })));
-        assert!(!graph.nodes.iter().any(|n| matches!(n, GraphNode::RankedSum { .. })));
         let dict = Dictionary::new(b"content".to_vec()).with_tables(table());
         let _scope = Scope::enter(Some(Arc::new(dict)));
         let got = decode_with(&plan, &vids, &cols, 3, &graph);
