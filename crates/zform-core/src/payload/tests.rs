@@ -410,6 +410,125 @@ fn bench_recurrences() {
     }
 }
 
+/// Engine throughput per opcode and for the programs the packs write: `cargo test --release
+/// bench_programs -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn bench_programs() {
+    const ROWS: usize = 1 << 16;
+    let best = |f: &mut dyn FnMut()| {
+        let ns = (0..25).map(|_| {
+            let t = std::time::Instant::now();
+            f();
+            t.elapsed().as_nanos()
+        });
+        ns.min().unwrap() as f64 / ROWS as f64
+    };
+    let mut rng = 7u64;
+    let wide: Vec<i64> = (0..ROWS).map(|_| splitmix64(&mut rng) as i64).collect();
+    let small: Vec<i64> = wide.iter().map(|x| x & 0xffff).collect();
+    let narrow = |c: &[i64]| -> Vec<u32> { c.iter().map(|&x| x as u32).collect() };
+    let (wide32, small32) = (narrow(&wide), narrow(&small));
+    let table: Vec<u8> = (0..1 << 16).map(|i| i as u8).collect();
+    let bufs = [TableBuf::from_bytes(&table)];
+    // One instruction between two cheap ones, less the two alone.
+    let single = |width: Width, op: Op| {
+        let b = Builder::with_width(width, 2);
+        let (x, y) = (b.input(0), b.ri(Op::AndI, b.input(1), 31));
+        let v = match op {
+            _ if op.arity() == 2 => b.rr(op, x, y),
+            Op::Select => b.select(y, x, y),
+            Op::Const => b.konst(5),
+            Op::NibbleLut => b.nibble_lut(x, b.add_lut16(*b"0123456789abcdef")),
+            Op::ByteLut32 => {
+                b.byte_lut32(x, b.add_lut32(b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"))
+            }
+            Op::Gather => b.gather(b.add_buf(), 2, b.ri(Op::AndI, x, 0xfff8), 0),
+            Op::ShlI | Op::ShrI | Op::SarI => b.ri(op, x, 7),
+            _ if op.has_imm() => b.ri(op, x, 0x4039_0000_0000_0003),
+            _ => b.r(op, x),
+        };
+        let out = b.rr(Op::Xor, v, y);
+        b.finish(&[(out, width.bits() as u8 / 8)])
+    };
+    let mut o64 = vec![0i64; ROWS];
+    let mut o32 = vec![0u32; ROWS];
+    let mut time = |p: &Program| match p.width {
+        Width::W64 => {
+            let cp = CompiledProgram::compile(p);
+            best(&mut || cp.eval_i64(&[&wide, &small], &bufs[..p.n_bufs as usize], &mut o64))
+        }
+        Width::W32 => {
+            let cp = CompiledProgram::compile(p);
+            let bufs = &bufs[..p.n_bufs as usize];
+            best(&mut || cp.eval_u32(&[&wide32, &small32], bufs, &mut o32))
+        }
+    };
+    let base = |w| {
+        let b = Builder::with_width(w, 2);
+        let y = b.ri(Op::AndI, b.input(1), 31);
+        let out = b.rr(Op::Xor, b.input(0), y);
+        b.finish(&[(out, w.bits() as u8 / 8)])
+    };
+    let (b64, b32) = (time(&base(Width::W64)), time(&base(Width::W32)));
+    println!("ns/row per opcode (frame of two ops: w64 {b64:.3}, w32 {b32:.3})");
+    for op in ALL_OPS {
+        let w64 = time(&single(Width::W64, op)) - b64;
+        let wide_only = Program::decode(&single(Width::W32, op).encode()).is_err();
+        let w32 = match wide_only {
+            true => f64::NAN,
+            false => time(&single(Width::W32, op)) - b32,
+        };
+        println!("  {op:<12?} w64 {w64:6.3}  w32 {w32:6.3}");
+    }
+
+    // Columns as the packs code them, decoded whole; `ZBENCH=<name>` runs the one for a profile.
+    let col = |f: &dyn Fn(usize) -> String| (0..ROWS).map(f).collect::<Vec<_>>();
+    let cols: Vec<(&str, Vec<String>)> = vec![
+        ("int <1e4", col(&|i| (i * 7919 % 10_000).to_string())),
+        ("int <1e8", col(&|i| (i * 7_919_333 % 100_000_000).to_string())),
+        ("int 19 digits", col(&|i| wide[i].to_string())),
+        ("iso time", col(&|i| {
+            format!("2026-11-{:02}T{:02}:24:{:02}Z", 1 + i % 28, i * 7 % 24, i * 13 % 60)
+        })),
+        ("uuid", col(&|i| {
+            format!("{:08x}-0000-4000-8000-{:012x}", wide[i] as u32, wide[i] as u64 >> 16)
+        })),
+        ("ip:port", col(&|i| {
+            format!("10.250.{}.{}:{}", i % 7, i * 37 % 256, 50_000 + i * 31 % 9_000)
+        })),
+        ("hex16", col(&|i| format!("{:016x}", wide[i]))),
+    ];
+    let reg = PackRegistry::default();
+    let only = std::env::var("ZBENCH").ok();
+    for (name, col) in &cols {
+        if only.as_ref().is_some_and(|o| !name.contains(o.as_str())) {
+            continue;
+        }
+        let rows: Vec<&[u8]> = col.iter().map(String::as_bytes).collect();
+        let bytes: usize = rows.iter().map(|r| r.len()).sum();
+        let graph = reg.encode_best_graph(&rows);
+        let ops = graph.nodes.iter().filter_map(|n| match n {
+            GraphNode::ProgramCells { prog, .. } | GraphNode::ProgramI64 { prog, .. } => {
+                Some(prog.ops.len())
+            }
+            _ => None,
+        });
+        let ops: Vec<usize> = ops.collect();
+        let wire = graph.encode();
+        // Repeated, so that the allocator's first use of a size is not what is timed.
+        let reps = if only.is_some() { 400 } else { 8 };
+        let ns = best(&mut || {
+            for _ in 0..reps {
+                let col = CoreDecoder::decode_bytes(&wire, &DecodeBudget::default()).unwrap();
+                assert_eq!(col.len(), ROWS);
+            }
+        }) / reps as f64;
+        let gbs = bytes as f64 / ROWS as f64 / ns;
+        println!("{name:<14} {ns:6.2} ns/row  {gbs:5.2} GB/s  program ops {ops:?}");
+    }
+}
+
 #[test]
 fn random_recurrences_match_the_scalar_evaluator() {
     let mut rng = 0x5eed_0f_7ec0_u64;

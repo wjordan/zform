@@ -1,6 +1,6 @@
 //! Vector-at-a-time executor for [`Program`]: rows run in chunks, each SSA value lives in one
 //! chunk-sized slot, and each instruction is one plain loop over the chunk that the compiler is
-//! left to vectorize. Slots are reused once their value's last reader has run.
+//! left to vectorize, but for byte tables. Slots are reused once their value's last reader has run.
 //!
 //! A [`Plan`] (which slot holds which value) depends only on a program's operands, so one plan
 //! serves a library entry under any constant overrides: constants are read from the program as
@@ -250,8 +250,59 @@ fn bin<T: Lane>(s: &mut Slots<T>, st: &Step, f: impl Fn(T, T) -> T) {
     }
 }
 
+/// `d = a` with every byte mapped through `table` by its low bits under `mask` (15 or 31).
 #[inline(always)]
-fn exec<T: Lane>(st: &Step, p: &Program, s: &mut Slots<T>, bufs: &[TableBuf<'_>], scan: &mut T) {
+fn lut<T: Lane, const V3: bool>(s: &mut Slots<T>, st: &Step, table: &[u8; 32], mask: u8) {
+    #[cfg(target_arch = "x86_64")]
+    if V3 {
+        let (d, read) = s.split(st.d);
+        if st.a != st.d {
+            d.copy_from_slice(read(st.a));
+        }
+        // SAFETY: lanes are plain bytes, and a `V3` build of the loops runs only with AVX2.
+        unsafe {
+            let bytes = std::slice::from_raw_parts_mut(d.as_mut_ptr().cast(), size_of_val(d));
+            lut_avx2(bytes, table, mask);
+        }
+        return;
+    }
+    un(s, st, |a| a.map_bytes(|b| table[(b & mask) as usize]))
+}
+
+/// The table as two shuffles, which the compiler does not make of indexed loads.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+fn lut_avx2(bytes: &mut [u8], table: &[u8; 32], mask: u8) {
+    use std::arch::x86_64::*;
+    // SAFETY: each load and store is of 16 or 32 bytes inside its slice.
+    unsafe {
+        let lo = _mm256_broadcastsi128_si256(_mm_loadu_si128(table.as_ptr().cast()));
+        let hi = _mm256_broadcastsi128_si256(_mm_loadu_si128(table[16..].as_ptr().cast()));
+        let mut blocks = bytes.chunks_exact_mut(32);
+        for b in &mut blocks {
+            let x = _mm256_loadu_si256(b.as_ptr().cast());
+            let i = _mm256_and_si256(x, _mm256_set1_epi8(15));
+            let (y, upper) = (_mm256_shuffle_epi8(lo, i), _mm256_shuffle_epi8(hi, i));
+            // An index's bit 4 picks the upper half; the blend reads each byte's top bit.
+            let pick = _mm256_slli_epi16(_mm256_and_si256(x, _mm256_set1_epi8(mask as i8)), 3);
+            let y = _mm256_blendv_epi8(y, upper, pick);
+            _mm256_storeu_si256(b.as_mut_ptr().cast(), y);
+        }
+        for b in blocks.into_remainder() {
+            *b = table[(*b & mask) as usize];
+        }
+    }
+}
+
+#[inline(always)]
+fn exec<T: Lane, const V3: bool>(
+    st: &Step,
+    p: &Program,
+    s: &mut Slots<T>,
+    bufs: &[TableBuf<'_>],
+    scan: &mut T,
+) {
     let Ins { op, aux, imm, .. } = p.ops[st.i as usize];
     let i = T::from_u64(imm as u64);
     let (fi, sh) = (f64::from_bits(imm as u64), imm as u32);
@@ -300,15 +351,13 @@ fn exec<T: Lane>(st: &Step, p: &Program, s: &mut Slots<T>, bufs: &[TableBuf<'_>]
         Op::Bswap => un(s, st, T::swap),
         Op::U64ToF64 => un(s, st, |a| tf(a.u64() as f64)),
         Op::I64ToF64 => un(s, st, |a| tf(a.u64() as i64 as f64)),
-        Op::NibbleLut => {
-            let l = &p.luts[aux as usize];
-            un(s, st, |a| a.map_bytes(|b| l[(b & 15) as usize]))
-        }
-        Op::ByteLut32 => {
+        Op::NibbleLut | Op::ByteLut32 => {
             let mut t = [0u8; 32];
             t[..16].copy_from_slice(&p.luts[aux as usize]);
-            t[16..].copy_from_slice(&p.luts[aux as usize + 1]);
-            un(s, st, |a| a.map_bytes(|b| t[(b & 31) as usize]))
+            if op == Op::ByteLut32 {
+                t[16..].copy_from_slice(&p.luts[aux as usize + 1]);
+            }
+            lut::<T, V3>(s, st, &t, if op == Op::ByteLut32 { 31 } else { 15 })
         }
         Op::Gather => {
             let buf = &bufs[(aux & 63) as usize];
@@ -332,10 +381,17 @@ fn exec<T: Lane>(st: &Step, p: &Program, s: &mut Slots<T>, bufs: &[TableBuf<'_>]
     }
 }
 
+/// Runs a chunk's steps; a `V3` build of these loops may use AVX2.
 #[inline(always)]
-fn steps<T: Lane>(steps: &[Step], p: &Program, s: &mut Slots<T>, b: &[TableBuf<'_>], sc: &mut [T]) {
+fn steps<T: Lane, const V3: bool>(
+    steps: &[Step],
+    p: &Program,
+    s: &mut Slots<T>,
+    b: &[TableBuf<'_>],
+    sc: &mut [T],
+) {
     for (st, scan) in steps.iter().zip(sc) {
-        exec(st, p, s, b, scan);
+        exec::<T, V3>(st, p, s, b, scan);
     }
 }
 
@@ -348,10 +404,11 @@ fn steps_v3<T: Lane>(
     b: &[TableBuf<'_>],
     sc: &mut [T],
 ) {
-    self::steps(steps, p, s, b, sc)
+    self::steps::<T, true>(steps, p, s, b, sc)
 }
 
-/// Runs one chunk, through the AVX2 build of the loops where the CPU has it.
+/// Runs one chunk, through the AVX2 build of the loops where the CPU has it. A 512-bit build
+/// ran fewer instructions in the same time on a core that splits them in two.
 fn chunk_steps<T: Lane>(
     st: &[Step],
     p: &Program,
@@ -375,7 +432,7 @@ fn chunk_steps<T: Lane>(
             return unsafe { steps_v3(st, p, s, b, sc) };
         }
     }
-    steps(st, p, s, b, sc)
+    steps::<T, false>(st, p, s, b, sc)
 }
 
 /// A program's slots and scan states across the chunks of one run.
@@ -575,20 +632,43 @@ impl<'p> CompiledProgram<'p> {
                 *d = T::from_u64(x as u64);
             }
         };
-        let sinks: Vec<(usize, u32, usize)> = (self.plan.sinks.iter().zip(&self.p.sinks))
-            .map(|(&(v, l), &(_, len))| match len {
-                Len::Fixed(w) => (v as usize, NONE, w as usize),
-                Len::Lane(_) => (v as usize, l, 0),
-            })
-            .collect();
+        let sinks = &self.plan.sinks;
+        let nc = CHUNK.min(rows.max(1));
+        // The bytes each sink gives a row of the chunk; a fixed width stays as filled here.
+        let fixed = |&(_, len): &(u32, Len)| match len {
+            Len::Fixed(w) => w,
+            Len::Lane(_) => 0,
+        };
+        let mut lens: Vec<u8> =
+            (self.p.sinks.iter().flat_map(|sink| std::iter::repeat_n(fixed(sink), nc))).collect();
+        let whole = sinks.len() == 1 && lens[0] as usize == T::BYTES && ends.is_none();
         self.run::<T>(rows, bufs, load, |row, nc, s| {
-            for r in 0..nc.min(rows - row) {
-                for &(v, len, w) in &sinks {
-                    let x = s[v * nc + r];
-                    let w = match len {
-                        NONE => w,
-                        l => (s[l as usize * nc + r].u64() as usize).min(T::BYTES),
-                    };
+            let n = nc.min(rows - row);
+            let col = |slot: u32| &s[slot as usize * nc..][..n];
+            if whole {
+                // One whole lane a row: the slot's bytes are the cells.
+                let to = out[pos..pos + n * T::BYTES].chunks_exact_mut(T::BYTES);
+                for (o, x) in to.zip(col(sinks[0].0)) {
+                    o.copy_from_slice(&x.u64().to_le_bytes()[..T::BYTES]);
+                }
+                pos += n * T::BYTES;
+                return;
+            }
+            // Lengths are clamped a chunk at a time: they vary by row, and a branch on one in
+            // the loop below mispredicts.
+            for (&(_, l), lens) in sinks.iter().zip(lens.chunks_exact_mut(nc)) {
+                if l != NONE {
+                    for (w, x) in lens.iter_mut().zip(col(l)) {
+                        *w = x.u64().min(T::BYTES as u64) as u8;
+                    }
+                }
+            }
+            let cols: Vec<(&[T], &[u8])> = (sinks.iter().zip(lens.chunks_exact(nc)))
+                .map(|(&(v, _), w)| (col(v), &w[..n]))
+                .collect();
+            for r in 0..n {
+                for &(x, w) in &cols {
+                    let (x, w) = (x[r], w[r] as usize);
                     // Store a whole lane where it fits and advance by the sink's width.
                     if pos + T::BYTES <= out.len() {
                         out[pos..pos + T::BYTES]

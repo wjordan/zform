@@ -96,7 +96,7 @@ programs. The latency-oriented `add_ints_fast` path does not run this search.
 
 Context mixing trades decode speed for density, so it is opt-in even with `--best`.
 Readers implement two bounded integer transports: kind `10`, and kind `9` for older files.
-The lane VM gains no mutable hash tables or arbitrary loops. Older readers cannot decode a
+Lane programs gain no mutable hash tables or arbitrary loops. Older readers cannot decode a
 payload that selects either kind.
 Cross-field contexts could be a later extension with explicit graph dependencies, but the
 current transport uses only its own preceding values.
