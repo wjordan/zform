@@ -1921,6 +1921,47 @@ impl<'a> BlockRows<'a> {
             .reconstruct_next(vid, self.plan, &mut self.ctx, out, budget)
     }
 
+    /// Appends every row back to back when all are of the model's fixed-stride binary variant
+    /// and every cell has its field's width, column by column: a cell is then a fixed-size copy
+    /// to a place known up front. Returns `false`, having written nothing, otherwise.
+    pub fn emit_fixed(&mut self, out: &mut Vec<u8>, budget: &DecodeBudget) -> Result<bool> {
+        let Some((vi, stride, fields)) = &self.plan.routes.binary else {
+            return Ok(false);
+        };
+        let n = self.len();
+        let distinct = fields.iter().all(|f| fields.iter().filter(|g| g.2 == f.2).count() == 1);
+        if self.next != 0 || !distinct || self.variant_ids.iter().any(|v| v != vi) {
+            return Ok(false);
+        }
+        match n.checked_mul(*stride) {
+            Some(total) if total <= budget.max_block_decoded_bytes && *stride > 0 => {
+                out.resize(out.len() + total, 0)
+            }
+            _ => return Ok(false),
+        }
+        let base = out.len() - n * stride;
+        for &(off, w, cid) in fields {
+            let col = block_col(cid as usize, self.plan, &mut self.ctx, budget)?;
+            let rows = &mut out[base..];
+            let at = (*stride, off);
+            let filled = col.len() >= n
+                && match w {
+                    1 => fill::<1>(rows, at, col),
+                    2 => fill::<2>(rows, at, col),
+                    4 => fill::<4>(rows, at, col),
+                    8 => fill::<8>(rows, at, col),
+                    _ => false,
+                };
+            if !filled {
+                out.truncate(base);
+                return Ok(false);
+            }
+        }
+        fields.iter().for_each(|f| self.recon.advance(f.2, n));
+        self.next = n;
+        Ok(true)
+    }
+
     /// Calls `f(row, record)` for each of `rows`, ascending, from the cursor on. Columns are
     /// built only as far as these rows read them, which takes the cursors around each row first.
     pub fn emit_rows(
@@ -1974,6 +2015,44 @@ impl<'a> BlockRows<'a> {
         self.next = row;
         self.recon.skip_rows(vids, self.plan, &mut self.ctx, budget)
     }
+}
+
+/// Copies cell `r` of `col` to `rows[r * stride + off..]` for each row, if every cell is `W`
+/// bytes: one load and store each.
+fn fill<const W: usize>(rows: &mut [u8], (stride, off): (usize, usize), col: &Col) -> bool {
+    let copy = |row: &mut [u8], cell: &[u8]| row[off..off + W].copy_from_slice(&cell[..W]);
+    // Cells all of width `W` need no span looked up each.
+    let even = |ends: &[u32], n: usize| {
+        ends.len() >= n && (ends[..n].iter().enumerate()).all(|(i, &e)| e as usize == (i + 1) * W)
+    };
+    let rows = rows.chunks_exact_mut(stride);
+    let n = rows.len();
+    match col {
+        Col::Dict { dict, ords } if ords.len() >= n && even(dict.ends(), dict.len()) => {
+            let cells = dict.bytes();
+            return rows.zip(ords).all(|(row, &o)| {
+                let at = o as usize * W;
+                at < cells.len() && {
+                    copy(row, &cells[at..]);
+                    true
+                }
+            });
+        }
+        _ => match col.laid() {
+            Some((bytes, ends)) if bytes.len() >= n * W && even(ends, n) => {
+                rows.zip(bytes.chunks_exact(W)).for_each(|(row, cell)| copy(row, cell));
+                return true;
+            }
+            _ => {}
+        },
+    }
+    rows.enumerate().all(|(r, row)| match col.span(r) {
+        Some(Ok((buf, s, e))) if e - s == W => {
+            copy(row, &buf[s..e]);
+            true
+        }
+        _ => false,
+    })
 }
 
 pub(crate) fn decode_single_block_records(
@@ -2038,26 +2117,34 @@ fn decode_frame(
         .map_err(|_| Error::BudgetExceeded("frame output reserve"))?;
 
     frame_out.extend_from_slice(&bdir.prefix);
-    let mut emitted_recs = 0usize;
-    let mut put = |out: &mut Vec<u8>, body: &mut dyn FnMut(&mut Vec<u8>) -> Result<()>| {
-        if emitted_recs > 0 {
+    let mut emitted = 0usize;
+    let put = |out: &mut Vec<u8>,
+               emitted: &mut usize,
+               body: &mut dyn FnMut(&mut Vec<u8>) -> Result<()>| {
+        if *emitted > 0 {
             out.extend_from_slice(&bdir.sep);
         }
-        emitted_recs += 1;
-        frame_record(out, hdr.framing, emitted_recs == hdr.record_count, body)
+        *emitted += 1;
+        frame_record(out, hdr.framing, *emitted == hdr.record_count, body)
     };
+    // Records with nothing around or between them can be written all at once.
+    let bare = matches!(hdr.framing, ResolvedFraming::FixedStride { .. }) && bdir.sep.is_empty();
     for (nrows, bslice) in &bdir.blocks {
         if (hdr.flags & FLAG_SORTED_ROWS) != 0 {
             let recs = decode_single_block_records(bslice, *nrows, plan, budget)?;
             for i in sort_records(&recs) {
                 let rec = recs.get(i as usize).unwrap();
-                put(&mut frame_out, &mut |o| Ok(o.extend_from_slice(rec)))?;
+                put(&mut frame_out, &mut emitted, &mut |o| Ok(o.extend_from_slice(rec)))?;
             }
         } else {
             // Rows go straight into the frame, each byte copied once.
             let mut rows = BlockRows::open(bslice, *nrows, plan, budget)?;
-            for _ in 0..*nrows {
-                put(&mut frame_out, &mut |o| rows.emit(o, budget))?;
+            if bare && rows.emit_fixed(&mut frame_out, budget)? {
+                emitted += *nrows;
+            } else {
+                for _ in 0..*nrows {
+                    put(&mut frame_out, &mut emitted, &mut |o| rows.emit(o, budget))?;
+                }
             }
         }
         if frame_out.len() > hdr.raw_len {
@@ -2601,10 +2688,22 @@ mod nested_tests {
             lp.extend_from_slice(&(r.len() as u32).to_le_bytes());
             lp.extend_from_slice(r.as_bytes());
         }
+        // Fixed-stride records of 8-, 4-, 2- and 1-byte fields, after a header.
+        let mut bin = b"HEADER-9".to_vec();
+        for i in 0..3000u64 {
+            bin.extend((i * 1_000_003).to_le_bytes());
+            bin.extend(((i % 17) as u32).to_le_bytes());
+            bin.extend(((i * 7) as u16).to_le_bytes());
+            bin.push(b'a' + (i % 3) as u8);
+        }
+        let fixed = |header_bytes| FramingSpec::FixedStride { stride: 15, header_bytes };
         let cases = [
             (lines.as_bytes(), FramingSpec::Crlf),
             (&lines.as_bytes()[..lines.len() - 2], FramingSpec::Crlf),
             (&lp[..], FramingSpec::LengthU32Le),
+            (&bin[8..], fixed(0)),
+            (&bin[..], fixed(8)),
+            (&bin[8..bin.len() - 6], fixed(0)),
         ];
         for (raw, framing) in cases {
             let opts = PackOptions {

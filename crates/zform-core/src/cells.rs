@@ -255,7 +255,7 @@ impl Col {
     /// The cell's bytes when they exist as one stored slice: the buffer holding them, and their
     /// range in it.
     #[inline(always)]
-    fn span(&self, i: usize) -> Option<Result<(&[u8], usize, usize)>> {
+    pub(crate) fn span(&self, i: usize) -> Option<Result<(&[u8], usize, usize)>> {
         let laid = |buf, ends: &[u32], base: usize, i: usize| match ends.get(i) {
             Some(&e) => {
                 let s = if i == 0 { 0 } else { ends[i - 1] as usize };

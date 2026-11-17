@@ -250,7 +250,7 @@ pub struct Routes {
     cri: Option<u32>,
     syslog: Option<u32>,
     /// Variant, record length, and `(offset, width, column)` of each field.
-    binary: Option<(u32, usize, Vec<(usize, usize, u16)>)>,
+    pub(crate) binary: Option<(u32, usize, Vec<(usize, usize, u16)>)>,
     logfmt: Option<LogfmtRoute>,
     csv: Option<CsvRoute>,
 }
@@ -1444,6 +1444,11 @@ impl BlockReconstructor {
             json_rec,
             cell_shapes: Vec::new(),
         }
+    }
+
+    /// Moves column `cid`'s cursor past `n` cells read elsewhere.
+    pub(crate) fn advance(&mut self, cid: u16, n: usize) {
+        self.col_pos[cid as usize] += n;
     }
 
     pub fn json_streams(&self) -> &[Vec<u32>] {
