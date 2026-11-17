@@ -417,21 +417,26 @@ impl Encoder {
             let h = hash(self.prev, self.prev2);
             let y = if plan.escape && x >= 15 { x - 15 } else { x };
             let mut shift = plan.bits;
-            value(plan, |parent, wprev, last, d, width| {
-                let s = if plan.escape && d == 0 {
-                    x.min(15) as usize
-                } else {
-                    shift -= width;
-                    (y >> shift & ((1 << width) - 1)) as usize
-                };
-                let ids = self.model.ids(parent, wprev, last, h);
-                let (a, b) = self.model.nodes(ids);
-                let w = self.model.weights[d & 7];
-                let (lo, hi) = (cum(a, b, w, s), cum(a, b, w, s + 1));
-                self.put(lo, hi);
-                self.model.learn::<O>(ids, d, s);
-                s
-            });
+            // Inlined for the same reason as the decoder's step.
+            value(
+                plan,
+                #[inline(always)]
+                |parent, wprev, last, d, width| {
+                    let s = if plan.escape && d == 0 {
+                        x.min(15) as usize
+                    } else {
+                        shift -= width;
+                        (y >> shift & ((1 << width) - 1)) as usize
+                    };
+                    let ids = self.model.ids(parent, wprev, last, h);
+                    let (a, b) = self.model.nodes(ids);
+                    let w = self.model.weights[d & 7];
+                    let (lo, hi) = (cum(a, b, w, s), cum(a, b, w, s + 1));
+                    self.put(lo, hi);
+                    self.model.learn::<O>(ids, d, s);
+                    s
+                },
+            );
             (self.prev2, self.prev) = (self.prev, x);
             if !self.fits(limit) {
                 return false;
@@ -553,26 +558,32 @@ fn decode_with<O: Ops>(
             return Err(Error::Format("truncated nibble stream".into()));
         }
         let h = hash(prev, prev2);
-        let x = value(plan, |parent, wprev, last, d, _| {
-            let ids = model.ids(parent, wprev, last, h);
-            let (a, b) = model.nodes(ids);
-            let r = range >> TOT_BITS;
-            // Normalization keeps range at least 2^24, so r is nonzero.
-            let q = (code / r).min(32767);
-            let (s, lo, hi) = O::find(a, b, model.weights[d & 7], q);
-            code -= r * lo;
-            range = if s == 15 {
-                range - r * lo
-            } else {
-                r * (hi - lo)
-            };
-            let shift = range.leading_zeros() & 24;
-            code = ((code as u64) << shift | (word(at) as u64) >> (32 - shift)) as u32;
-            range <<= shift;
-            at += (shift / 8) as usize;
-            model.learn::<O>(ids, d, s);
-            s
-        });
+        // Inlined so the step compiles with the caller's SIMD features; an outlined
+        // closure calls `O::find` and `O::update` through memory.
+        let x = value(
+            plan,
+            #[inline(always)]
+            |parent, wprev, last, d, _| {
+                let ids = model.ids(parent, wprev, last, h);
+                let (a, b) = model.nodes(ids);
+                let r = range >> TOT_BITS;
+                // Normalization keeps range at least 2^24, so r is nonzero.
+                let q = (code / r).min(32767);
+                let (s, lo, hi) = O::find(a, b, model.weights[d & 7], q);
+                code -= r * lo;
+                range = if s == 15 {
+                    range - r * lo
+                } else {
+                    r * (hi - lo)
+                };
+                let shift = range.leading_zeros() & 24;
+                code = ((code as u64) << shift | (word(at) as u64) >> (32 - shift)) as u32;
+                range <<= shift;
+                at += (shift / 8) as usize;
+                model.learn::<O>(ids, d, s);
+                s
+            },
+        );
         // Only an escaped value can pass the width, and only in a corrupt stream.
         if x >> bits != 0 {
             return Err(Error::Format("nibble value out of range".into()));
