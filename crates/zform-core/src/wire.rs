@@ -119,8 +119,34 @@ pub fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
     out.extend_from_slice(b);
 }
 
+/// Inlines the one-byte case, which most integer streams and lengths hit.
 #[inline]
 pub fn get_uvarint(buf: &[u8], pos: &mut usize) -> Result<u64> {
+    if let Some(&b) = buf.get(*pos)
+        && b < 0x80
+    {
+        *pos += 1;
+        return Ok(b as u64);
+    }
+    get_uvarint_long(buf, pos)
+}
+
+fn get_uvarint_long(buf: &[u8], pos: &mut usize) -> Result<u64> {
+    // A varint that ends within the next eight bytes decodes without a loop over its
+    // bytes, whose varying count mispredicts; it is too short to overflow.
+    if let Some(w) = buf.get(*pos..*pos + 8) {
+        let w = u64::from_le_bytes(w.try_into().unwrap());
+        let stops = !w & 0x8080_8080_8080_8080;
+        if stops != 0 {
+            let len = stops.trailing_zeros() / 8 + 1;
+            *pos += len as usize;
+            let v = w & (u64::MAX >> (64 - 8 * len)) & 0x7f7f_7f7f_7f7f_7f7f;
+            // Close the gaps between 7-bit groups: pairs, then quads, then the halves.
+            let v = (v & 0x007f_007f_007f_007f) | (v >> 1 & 0x3f80_3f80_3f80_3f80);
+            let v = (v & 0x0000_3fff_0000_3fff) | (v >> 2 & 0x0fff_c000_0fff_c000);
+            return Ok((v & 0x0fff_ffff) | (v >> 4 & 0x00ff_ffff_f000_0000));
+        }
+    }
     let mut x = 0u64;
     let mut shift = 0u32;
     for _ in 0..10 {
@@ -671,6 +697,34 @@ pub fn sha256_hex(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn varints_decode_alike_near_the_end_and_with_overlong_bytes() {
+        let mut state = 9u64;
+        for i in 0..2000u32 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let v = state >> (i % 64);
+            let mut buf = Vec::new();
+            put_uvarint(&mut buf, v);
+            if i % 3 == 0 && buf.len() < 10 {
+                // An overlong form: a continuation byte and a zero group.
+                *buf.last_mut().unwrap() |= 0x80;
+                buf.push(0);
+            }
+            let len = buf.len();
+            buf.extend(std::iter::repeat_n(0xff, i as usize % 9));
+            let mut pos = 0;
+            assert_eq!(get_uvarint(&buf, &mut pos).unwrap(), v);
+            assert_eq!(pos, len);
+            assert!(get_uvarint(&buf[..len - 1], &mut 0).is_err());
+        }
+        assert!(get_uvarint(&[0xff; 9], &mut 0).is_err());
+        let overflow = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 2];
+        assert!(get_uvarint(&overflow, &mut 0).is_err());
+        assert!(get_uvarint(&[0x80; 11], &mut 0).is_err());
+    }
 
     #[test]
     fn leaf_matches_repetitions_beyond_the_default_window() {
