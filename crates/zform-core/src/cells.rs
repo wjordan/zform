@@ -208,6 +208,24 @@ pub enum Col {
     },
 }
 
+/// Appends `buf[s..e]` to `out`. Most cells are short, and a fixed 32-byte copy costs less than a
+/// memmove call; bytes past `e` land in `out`'s spare capacity and do not count.
+#[inline(always)]
+pub(crate) fn put(out: &mut Vec<u8>, buf: &[u8], s: usize, e: usize) {
+    let src = &buf[s..e];
+    if src.len() <= 32 && buf.len() - s >= 32 {
+        out.reserve(32);
+        // SAFETY: `buf` holds 32 bytes from `s`, and `out` has room for 32 past its length.
+        unsafe {
+            let len = out.len();
+            std::ptr::copy_nonoverlapping(src.as_ptr(), out.as_mut_ptr().add(len), 32);
+            out.set_len(len + src.len());
+        }
+    } else {
+        out.extend_from_slice(src);
+    }
+}
+
 pub(crate) fn underflow() -> Error {
     Error::Format("column occurrence underflow".into())
 }
@@ -234,35 +252,42 @@ impl Col {
         self.len() == 0
     }
 
-    /// The cell's bytes when they exist as one stored slice.
+    /// The cell's bytes when they exist as one stored slice: the buffer holding them, and their
+    /// range in it.
     #[inline(always)]
-    fn slice(&self, i: usize) -> Option<Result<&[u8]>> {
-        Some(match self {
-            Col::Flat(c) => c.get(i).ok_or_else(underflow),
-            Col::Const { val, n } => {
-                if i < *n {
-                    Ok(val.as_slice())
-                } else {
-                    Err(underflow())
-                }
+    fn span(&self, i: usize) -> Option<Result<(&[u8], usize, usize)>> {
+        let laid = |buf, ends: &[u32], base: usize, i: usize| match ends.get(i) {
+            Some(&e) => {
+                let s = if i == 0 { 0 } else { ends[i - 1] as usize };
+                Ok((buf, base + s, base + e as usize))
             }
-            Col::Dict { dict, ords } => ords
-                .get(i)
-                .and_then(|&o| dict.get(o as usize))
-                .ok_or_else(underflow),
-            Col::Pool { pool, base, ends } => match ends.get(i) {
-                Some(&e) => {
-                    let s = if i == 0 { 0 } else { ends[i - 1] as usize };
-                    Ok(&pool.bytes()[base + s..base + e as usize])
-                }
+            None => Err(underflow()),
+        };
+        Some(match self {
+            Col::Flat(c) => laid(&c.buf[..], &c.ends, 0, i),
+            Col::Const { val, n } => match i < *n {
+                true => Ok((val.as_slice(), 0, val.len())),
+                false => Err(underflow()),
+            },
+            Col::Dict { dict, ords } => match ords.get(i) {
+                Some(&o) => laid(&dict.buf[..], &dict.ends, 0, o as usize),
                 None => Err(underflow()),
             },
+            Col::Pool { pool, base, ends } => laid(pool.bytes(), ends, *base, i),
             Col::Paged { pool, spans } => match spans.get(i) {
-                Some(&(s, e)) => pool.bytes.get(s as usize..e as usize).ok_or(Error::NotLoaded),
+                Some(&(s, e)) if s <= e && e as usize <= pool.bytes.len() => {
+                    Ok((&pool.bytes[..], s as usize, e as usize))
+                }
+                Some(_) => Err(Error::NotLoaded),
                 None => Err(underflow()),
             },
             Col::Quoted { .. } => return None,
         })
+    }
+
+    #[inline(always)]
+    fn slice(&self, i: usize) -> Option<Result<&[u8]>> {
+        Some(self.span(i)?.map(|(buf, s, e)| &buf[s..e]))
     }
 
     /// The cells' bytes laid back to back with each cell's end, when the column holds them so.
@@ -275,12 +300,20 @@ impl Col {
     }
 
     /// Appends cell `i` to `out`.
-    #[inline]
+    #[inline(always)]
     pub fn write(&self, i: usize, out: &mut Vec<u8>) -> Result<()> {
-        if let Some(s) = self.slice(i) {
-            out.extend_from_slice(s?);
-            return Ok(());
+        match self.span(i) {
+            Some(span) => {
+                let (buf, s, e) = span?;
+                put(out, buf, s, e);
+                Ok(())
+            }
+            None => self.write_quoted(i, out),
         }
+    }
+
+    #[inline(never)]
+    fn write_quoted(&self, i: usize, out: &mut Vec<u8>) -> Result<()> {
         match self {
             Col::Quoted { inner, map } => {
                 let j = if map.is_empty() {
@@ -324,5 +357,28 @@ impl Col {
             out.seal();
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_cells_copy_exactly_near_buffer_ends() {
+        // Lengths across the 32-byte chunk, so cells end before, at and past the buffer's last
+        // 32 bytes, written into vectors with no spare room.
+        let lens: Vec<u32> = (0..=40).chain((0..=40).rev()).collect();
+        let total: usize = lens.iter().map(|&l| l as usize).sum();
+        let buf: Vec<u8> = (0..total).map(|i| (i * 7 + 1) as u8).collect();
+        let col = Col::Flat(Cells::from_lens(buf.clone(), &lens).unwrap());
+        let mut all = Vec::new();
+        for i in 0..col.len() {
+            let mut one = Vec::new();
+            col.write(i, &mut one).unwrap();
+            assert_eq!(one, col.slice(i).unwrap().unwrap());
+            col.write(i, &mut all).unwrap();
+        }
+        assert_eq!(all, buf);
     }
 }
