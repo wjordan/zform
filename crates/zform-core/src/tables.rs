@@ -19,7 +19,7 @@ pub struct Tables {
     encode: Mutex<Option<Encode>>,
     graphs: Vec<PayloadGraph>,
     budget: DecodeBudget,
-    cols: Vec<OnceLock<Arc<Cells>>>,
+    cols: Vec<OnceLock<Result<Arc<Cells>>>>,
     /// By column: each distinct value's id, the rank of its first occurrence.
     ids: Vec<OnceLock<Ids>>,
 }
@@ -47,7 +47,10 @@ impl Tables {
             encode: Mutex::new(Some(Box::new(encode))),
             graphs: Vec::new(),
             budget: DecodeBudget::default(),
-            cols: cols.into_iter().map(Arc::new).map(OnceLock::from).collect(),
+            cols: cols
+                .into_iter()
+                .map(|c| OnceLock::from(Ok(Arc::new(c))))
+                .collect(),
             ids: (0..n).map(|_| OnceLock::new()).collect(),
         }
     }
@@ -103,21 +106,22 @@ impl Tables {
 
     /// Column `c`'s cells, which must be in range.
     pub fn col(&self, c: usize) -> Result<&Arc<Cells>> {
-        if let Some(cells) = self.cols[c].get() {
-            return Ok(cells);
-        }
-        let graph = &self.graphs[c];
-        let peers = graph
-            .ext_peers
-            .iter()
-            .map(|&p| self.col(p as usize).cloned())
-            .collect::<Result<Vec<_>>>()?;
-        let ext = ExtInputs {
-            peers: &peers,
-            ..ExtInputs::empty()
-        };
-        let cells = Arc::new(CoreDecoder::decode_cells(graph, &ext, &self.budget)?);
-        Ok(self.cols[c].get_or_init(|| cells))
+        // Frames decoding at once ask together: one decodes, and the others wait for it.
+        let cells = self.cols[c].get_or_init(|| {
+            let graph = &self.graphs[c];
+            let peers = graph
+                .ext_peers
+                .iter()
+                .map(|&p| self.col(p as usize).cloned())
+                .collect::<Result<Vec<_>>>()?;
+            let ext = ExtInputs {
+                peers: &peers,
+                ..ExtInputs::empty()
+            };
+            let cells = CoreDecoder::decode_cells(graph, &ext, &self.budget)?;
+            Ok(Arc::new(cells))
+        });
+        cells.as_ref().map_err(Clone::clone)
     }
 
     pub fn wire(&self) -> &[u8] {
@@ -137,11 +141,8 @@ impl Tables {
 
     /// Column `c`'s value ids: the rank of each value's first occurrence.
     fn ids(&self, c: usize) -> Result<&Ids> {
-        if let Some(ids) = self.ids[c].get() {
-            return Ok(ids);
-        }
-        let ids = Ids::new(self.col(c)?);
-        Ok(self.ids[c].get_or_init(|| ids))
+        let col = self.col(c)?;
+        Ok(self.ids[c].get_or_init(|| Ids::new(col)))
     }
 
     /// Ids of `cells`, values of a block column, joint with table column `c`'s: a value the
