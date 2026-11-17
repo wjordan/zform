@@ -1236,6 +1236,36 @@ fn sparse_integer_transport_preserves_wide_exceptions_and_validates_framing() {
 }
 
 #[test]
+fn byte_head_exceptions_consume_the_tail_exactly() {
+    use super::graph::{IntStream, pack_leaf};
+    let budget = DecodeBudget::default();
+    let unpack = |head: &[u8], tail: &[i64]| {
+        IntStream::ForTail255 {
+            len: head.len() as u32,
+            min: -3,
+            head_leaf: pack_leaf(head),
+            tail: Box::new(IntStream::encode_fast(tail)),
+        }
+        .unpack(&budget)
+    };
+    let head: Vec<u8> = (0..19).map(|i| if i % 7 < 2 { 255 } else { i }).collect();
+    let tail = [0, 1000, 5, 7, 9, i64::MAX - 300];
+    let mut exceptions = tail.iter();
+    let want: Vec<i64> = head
+        .iter()
+        .map(|&b| match b {
+            255 => 252 + exceptions.next().unwrap(),
+            _ => b as i64 - 3,
+        })
+        .collect();
+    assert_eq!(unpack(&head, &tail).unwrap(), want);
+    assert!(unpack(&head, &tail[1..]).is_err());
+    assert!(unpack(&[255, 255], &[1]).is_err());
+    assert!(unpack(&[255], &[1, 2]).is_err());
+    assert!(unpack(&[255], &[-1]).is_err());
+}
+
+#[test]
 fn encoder_dictionary_hashes_distribute_padded_identifier_suffixes() {
     use std::hash::{Hash, Hasher};
     for width in [16, 32] {

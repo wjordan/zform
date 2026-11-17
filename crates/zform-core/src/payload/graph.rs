@@ -1111,24 +1111,31 @@ impl IntStream {
                     return Err(Error::Format("ForTail255 head length mismatch".into()));
                 }
                 let over = tail.unpack(budget)?;
-                let mut oi = 0usize;
-                let base = *min as u64;
-                let mut out = Vec::with_capacity(n);
-                for &b0 in &h_raw {
-                    if b0 < 0xff {
-                        out.push(base.wrapping_add(b0 as u64) as i64);
-                    } else {
-                        if oi >= over.len() || over[oi] < 0 {
-                            return Err(Error::Format(
-                                "ForTail255 tail underflow or negative".into(),
-                            ));
+                let mut out: Vec<i64> = h_raw.iter().map(|&b| min.wrapping_add(b as i64)).collect();
+                // Exceptions are rare: find them a word at a time and add their tail values.
+                let mut tail = over.iter();
+                let chunks = h_raw.chunks_exact(8);
+                let mut rest = [0u8; 8];
+                rest[..chunks.remainder().len()].copy_from_slice(chunks.remainder());
+                let words = chunks.map(|c| u64::from_le_bytes(c.try_into().unwrap()));
+                for (k, x) in words.chain([u64::from_le_bytes(rest)]).enumerate() {
+                    // The high bit of each 0xff byte: only 0x7f carries into bit 7.
+                    let mut m = x & ((x & 0x7f7f_7f7f_7f7f_7f7f) + 0x0101_0101_0101_0101);
+                    m &= 0x8080_8080_8080_8080;
+                    while m != 0 {
+                        let i = 8 * k + m.trailing_zeros() as usize / 8;
+                        match tail.next() {
+                            Some(&t) if t >= 0 => out[i] = out[i].wrapping_add(t),
+                            _ => {
+                                return Err(Error::Format(
+                                    "ForTail255 tail underflow or negative".into(),
+                                ));
+                            }
                         }
-                        let u = 0xffu64.wrapping_add(over[oi] as u64);
-                        oi += 1;
-                        out.push(base.wrapping_add(u) as i64);
+                        m &= m - 1;
                     }
                 }
-                if oi != over.len() {
+                if tail.next().is_some() {
                     return Err(Error::Format("ForTail255 trailing tail items".into()));
                 }
                 Ok(out)
