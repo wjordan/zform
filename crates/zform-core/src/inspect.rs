@@ -709,6 +709,7 @@ fn int_kind(s: &IntStream) -> String {
             bits, table_bits, ..
         } => format!("NibbleMix/{bits}b/t{table_bits}"),
         IntStream::Const { .. } => "Const".into(),
+        IntStream::Radix { .. } => "Radix".into(),
         IntStream::Rice { .. } => "Rice".into(),
         IntStream::Rle { leaf, .. } => format!("Rle/{}", backend(leaf)),
         IntStream::ForBitpack { leaf, .. } => format!("ForBitpack/{}", backend(leaf)),

@@ -9,7 +9,7 @@ pub fn encode_i64(values: &[i64]) -> Vec<u8> {
     zform_core::payload::graph::with_encode_opts(crate::EntropyBackend::Zstd, 1, || {
         let mut graph = GraphBuilder::new(values.len());
         let root = graph.add_ints_fast(values);
-        graph.finish(root).fuse_numeric_programs().encode()
+        graph.finish(root).fuse_numeric_programs().encode_numeric()
     })
 }
 
@@ -55,9 +55,21 @@ impl FloatEncoder {
         if values.is_empty() || self.bits.iter().all(|v| *v == self.bits[0]) {
             return encode_i64(&self.bits);
         }
-        let runs = 1 + self.bits.windows(2).filter(|w| w[0] != w[1]).count();
-        if runs * 16 < values.len() {
-            return encode_i64(&self.bits);
+        self.integers.clear();
+        if values.iter().all(|&v| {
+            let i = v as i64;
+            if (i as f64).to_bits() != v.to_bits() {
+                return false;
+            }
+            self.integers.push(i);
+            true
+        }) {
+            let mut graph = GraphBuilder::new(values.len());
+            let ints = graph.add_ints_fast(&self.integers);
+            let b = Builder::new(1);
+            let value = b.r(Op::I64ToF64, b.input(0));
+            let root = graph.add_prog_i64(b.finish(&[(value, 8)]), vec![ints], vec![]);
+            return graph.finish(root).fuse_numeric_programs().encode_numeric();
         }
         let fits = |e: u8, mode: Scale| {
             let scale = 10f64.powi(e as i32);
@@ -142,7 +154,7 @@ impl FloatEncoder {
             output = b.rr(Op::Xor, output, b.input(1));
         }
         let root = graph.add_prog_i64(b.finish(&[(output, 8)]), inputs, vec![]);
-        let candidate = graph.finish(root).fuse_numeric_programs().encode();
+        let candidate = graph.finish(root).fuse_numeric_programs().encode_numeric();
         if candidate.len() < values.len() * 2 {
             return candidate;
         }
@@ -164,7 +176,7 @@ impl FloatEncoder {
             }
             let mut graph = GraphBuilder::new(n);
             let root = graph.add_planes(&bytes, 8);
-            graph.finish(root).fuse_numeric_programs().encode()
+            graph.finish(root).fuse_numeric_programs().encode_numeric()
         })
     }
 }
@@ -331,7 +343,7 @@ pub fn encode_f64_with_base(values: &[f64], base: &[f64]) -> Result<Vec<u8>> {
     let delta = b.r(Op::I64ToF64, b.input(0));
     let value = b.rr(Op::F64Add, b.input(1), delta);
     let root = graph.add_prog_i64(b.finish(&[(value, 8)]), vec![input, prior], vec![]);
-    Ok(graph.finish(root).fuse_numeric_programs().encode())
+    Ok(graph.finish(root).fuse_numeric_programs().encode_numeric())
 }
 
 pub fn decode_f64_with_base(

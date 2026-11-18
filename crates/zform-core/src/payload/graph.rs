@@ -270,6 +270,12 @@ pub enum IntStream {
         len: u32,
         leaf: Vec<u8>,
     },
+    Radix {
+        len: u32,
+        min: i64,
+        radix: u32,
+        bytes: Vec<u8>,
+    },
     Rice {
         len: u32,
         bytes: Vec<u8>,
@@ -318,6 +324,7 @@ impl IntStream {
                 tail.relevel(backend, level)?;
             }
             Self::Const { .. }
+            | Self::Radix { .. }
             | Self::Rice { .. }
             | Self::NibbleMix { .. } => {}
         }
@@ -567,7 +574,7 @@ impl IntStream {
     }
 
     /// Linear-time selection for latency-sensitive native numeric columns. Uses the same
-    /// generic streams as exhaustive selection, with one entropy-compression attempt.
+    /// generic streams as exhaustive selection, with bounded trials for short streams.
     pub fn encode_fast(vals: &[i64]) -> Self {
         let len = vals.len() as u32;
         if vals.is_empty() {
@@ -636,12 +643,48 @@ impl IntStream {
             }
         };
         if vals.len() <= 1024 {
+            let mut candidate = candidate;
             let mut framed = Vec::new();
             candidate.encode(&mut framed);
-            // The Rice stream needs its kind, count and byte-length prefix too.
-            if let Some(bytes) = super::rice::encode(vals, framed.len().saturating_sub(6)) {
+            // Varints preserve byte-aligned repeated differences, including rare jumps.
+            // Their compressed form can win even when the uncompressed integers need many bytes.
+            if varbytes < vals.len() * 5
+                && (varbytes + 5 < framed.len()
+                    || vals.len() <= 128 && varbytes <= 2 * framed.len())
+            {
+                let mut varints = Vec::with_capacity(varbytes);
+                for &v in vals {
+                    put_ivarint(&mut varints, v);
+                }
+                let leaf = pack_leaf(&varints);
+                if leaf.len() + 4 < framed.len() {
+                    candidate = Self::ZigZagVarint { len, leaf };
+                    framed.clear();
+                    candidate.encode(&mut framed);
+                }
+            }
+            let radix = u32::try_from(i128::from(max) - i128::from(min) + 1)
+                .ok()
+                .and_then(super::radix::Layout::new);
+            let cost = radix.as_ref().map_or(usize::MAX, |layout| {
+                let mut header = Vec::new();
+                put_ivarint(&mut header, min);
+                put_uvarint(&mut header, u64::from(layout.radix));
+                layout.size(vals.len()) + header.len() + 4
+            });
+            if let Some(bytes) = super::rice::encode(vals, framed.len().min(cost).saturating_sub(6))
+            {
                 return Self::Rice { len, bytes };
             }
+            if let Some(layout) = radix.filter(|_| cost < framed.len()) {
+                return Self::Radix {
+                    len,
+                    min,
+                    radix: layout.radix,
+                    bytes: layout.pack(vals, min),
+                };
+            }
+            return candidate;
         }
         candidate
     }
@@ -650,6 +693,7 @@ impl IntStream {
         match *self {
             Self::Const { len, .. }
             | Self::Rle { len, .. }
+            | Self::Radix { len, .. }
             | Self::Rice { len, .. }
             | Self::NibbleMix { len, .. }
             | Self::ForBitpack { len, .. }
@@ -699,6 +743,18 @@ impl IntStream {
                     put_uvarint(out, *len as u64);
                     put_ivarint(out, *val);
                 }
+            }
+            Self::Radix {
+                len,
+                min,
+                radix,
+                bytes,
+            } => {
+                out.push(11);
+                put_uvarint(out, *len as u64);
+                put_ivarint(out, *min);
+                put_uvarint(out, u64::from(*radix));
+                out.extend_from_slice(bytes);
             }
             Self::Rice { len, bytes } => {
                 out.push(8);
@@ -810,6 +866,21 @@ impl IntStream {
                     bytes: bytes.to_vec(),
                 })
             }
+            11 => {
+                let min = cur.ivar()?;
+                let radix = u32::try_from(cur.uvar()?)
+                    .map_err(|_| Error::Format("radix too large".into()))?;
+                let layout = super::radix::Layout::new(radix)
+                    .ok_or_else(|| Error::Format("invalid radix".into()))?;
+                let size = layout.size(len as usize);
+                budget.check_alloc(size, "radix bytes")?;
+                Ok(Self::Radix {
+                    len,
+                    min,
+                    radix,
+                    bytes: cur.slice(size)?.to_vec(),
+                })
+            }
             8 => Ok(Self::Rice {
                 len,
                 bytes: cur.bytes()?.to_vec(),
@@ -895,6 +966,14 @@ impl IntStream {
         budget.check_alloc(n.saturating_mul(8), "IntStream")?;
         match self {
             Self::Const { val, len } => Ok(vec![*val; *len as usize]),
+            Self::Radix {
+                len,
+                min,
+                radix,
+                bytes,
+            } => super::radix::Layout::new(*radix)
+                .ok_or_else(|| Error::Format("invalid radix".into()))?
+                .unpack(bytes, *len as usize, *min),
             Self::Rice { len, bytes } => super::rice::decode(bytes, *len as usize, budget),
             Self::NibbleMix {
                 len,
@@ -1472,6 +1551,104 @@ impl PayloadGraph {
         self.encode_linked(None)
     }
 
+    /// A single integer input followed by a short unary program. The enclosing
+    /// frame already delimits the integer bytes and supplies their lane count.
+    pub fn encode_numeric(&self) -> Vec<u8> {
+        let (stream, prog) = match self.nodes.as_slice() {
+            [GraphNode::IntStream(s)] if self.root == 0 => (s, None),
+            [
+                GraphNode::IntStream(s),
+                GraphNode::ProgramI64 { prog, inputs, bufs },
+            ] if self.root == 1
+                && inputs == &[0]
+                && bufs.is_empty()
+                && prog.is_linear_lane()
+                && (1..=7).contains(&prog.ops.len()) =>
+            {
+                (s, Some(prog))
+            }
+            _ => return self.encode(),
+        };
+        if self.rows == 0
+            || stream.len() != self.rows as usize
+            || self.ext_pool
+            || self.ext_dict.is_some()
+            || !self.ext_peers.is_empty()
+        {
+            return self.encode();
+        }
+        let mut out = Vec::new();
+        put_uvarint(&mut out, self.rows as u64);
+        let tag = out.len();
+        out.push(0x80 | (prog.map_or(0, |p| p.ops.len() as u8) << 4));
+        if let Some(prog) = prog {
+            prog.encode_linear_ops(&mut out);
+        }
+        fn raw_bytes(leaf: &[u8]) -> Option<&[u8]> {
+            let mut input = Cursor::new(leaf);
+            if input.u8().ok()? != EntropyBackend::Raw as u8 {
+                return None;
+            }
+            let len = input.uvar().ok()?;
+            let bytes = input.bytes().ok()?;
+            (len == bytes.len() as u64 && input.remaining() == 0).then_some(bytes)
+        }
+        let kind = match stream {
+            IntStream::Rice { bytes, .. } => {
+                out.extend_from_slice(bytes);
+                8
+            }
+            IntStream::Radix {
+                min, radix, bytes, ..
+            } => {
+                put_ivarint(&mut out, *min);
+                put_uvarint(&mut out, u64::from(*radix));
+                out.extend_from_slice(bytes);
+                11
+            }
+            IntStream::Const { val, .. } => {
+                let shift = val.trailing_zeros().min(63);
+                if shift >= 14 {
+                    out.push(shift as u8);
+                    put_ivarint(&mut out, *val >> shift);
+                    7
+                } else {
+                    put_ivarint(&mut out, *val);
+                    0
+                }
+            }
+            IntStream::ZigZagVarint { leaf, .. } => {
+                if let Some(bytes) = raw_bytes(leaf) {
+                    out.extend_from_slice(bytes);
+                    4
+                } else {
+                    out.extend_from_slice(leaf);
+                    5
+                }
+            }
+            IntStream::Rle { leaf, .. } => {
+                out.extend_from_slice(leaf);
+                1
+            }
+            IntStream::ForBitpack {
+                min, bits, leaf, ..
+            } => {
+                put_ivarint(&mut out, *min);
+                out.push(*bits);
+                if let Some(bytes) = raw_bytes(leaf) {
+                    out.extend_from_slice(bytes);
+                    3
+                } else {
+                    out.extend_from_slice(leaf);
+                    2
+                }
+            }
+            _ => return self.encode(),
+        };
+        out[tag] |= kind;
+        out
+    }
+
     /// Fuses consecutive numeric programs and removes unreachable intermediates. This
     /// keeps a predictor and its output conversion in one compiled row loop.
     pub fn fuse_numeric_programs(mut self) -> Self {
@@ -1666,16 +1843,12 @@ impl PayloadGraph {
         {
             return Err(Error::BudgetExceeded("PayloadGraph row count"));
         }
-        let rows = rows_u64 as u32;
+        let rows = u32::try_from(rows_u64).map_err(|_| Error::BudgetExceeded("graph rows"))?;
         let flags = cur.u8()?;
-        if matches!(flags, 8 | 16) {
-            let stream = IntStream::decode_wire(&mut cur, budget, 0)?;
-            if stream.len() != rows as usize {
-                return Err(Error::Format("numeric graph row count mismatch".into()));
-            }
+        if flags & 0x80 != 0 || matches!(flags, 8 | 16) {
+            let (stream, prog, _) = read_numeric(&mut cur, rows, flags, budget)?;
             let mut nodes = vec![GraphNode::IntStream(stream)];
-            if flags == 16 {
-                let prog = decode_lane_program(cur.slice(cur.remaining())?)?;
+            if let Some(prog) = prog {
                 nodes.push(GraphNode::ProgramI64 {
                     prog: prog.into(),
                     inputs: vec![0],
@@ -1780,12 +1953,12 @@ pub(crate) fn decode_linked_sizes(
     let mut cur = Cursor::new(b);
     cur.uvar()?;
     let flags = cur.u8()?;
-    if matches!(flags, 8 | 16) {
-        let at = cur.pos;
-        IntStream::decode_wire(&mut cur, budget, 0)?;
-        sizes.push(cur.pos - at);
-        if flags == 16 {
-            sizes.push(cur.remaining());
+    if flags & 0x80 != 0 || matches!(flags, 8 | 16) {
+        let size = cur.remaining();
+        let (_, prog, code) = read_numeric(&mut cur, graph.rows, flags, budget)?;
+        sizes.push(size - code);
+        if prog.is_some() {
+            sizes.push(code);
         }
         return Ok((graph, sizes));
     }
@@ -2281,8 +2454,8 @@ impl GraphBuilder {
                 ((64 - (((v << 1) ^ (v >> 63)) as u64).leading_zeros()).max(1) as usize).div_ceil(7)
             })
             .sum::<usize>();
-        if (span(vals).saturating_sub(span(&deltas)) as usize) * vals.len() > 256
-            || delta_bytes * 8 + 256 < span(vals) as usize * vals.len()
+        if (span(vals).saturating_sub(span(&deltas)) as usize) * vals.len() > 40
+            || delta_bytes * 8 + 40 < span(vals) as usize * vals.len()
         {
             let input = self.push(GraphNode::IntStream(IntStream::encode_fast(&deltas)));
             let b = Builder::new(1);
@@ -3158,19 +3331,10 @@ impl CoreDecoder {
         compact.uvar()?;
         if rows > 0 && rows <= budget.max_records_per_block as u64 {
             let flags = compact.u8()?;
-            if matches!(flags, 8 | 16) {
-                let stream = IntStream::decode_wire(&mut compact, budget, 0)?;
-                if stream.len() as u64 != rows {
-                    return Err(Error::Format("numeric graph row count mismatch".into()));
-                }
-                let prog = if flags == 16 {
-                    Some(decode_lane_program(compact.slice(compact.remaining())?)?)
-                } else {
-                    None
-                };
-                if compact.remaining() != 0 {
-                    return Err(Error::Format("trailing numeric graph bytes".into()));
-                }
+            if flags & 0x80 != 0 || matches!(flags, 8 | 16) {
+                let rows =
+                    u32::try_from(rows).map_err(|_| Error::BudgetExceeded("numeric rows"))?;
+                let (stream, prog, _) = read_numeric(&mut compact, rows, flags, budget)?;
                 let values = stream.unpack(budget)?;
                 if let Some(prog) = prog {
                     budget.check_alloc(values.len().saturating_mul(8), "numeric lane output")?;
@@ -4622,6 +4786,121 @@ fn bitunpack_u64(mut bytes: Vec<u8>, bits: u8, len: usize, min: i64) -> Vec<i64>
             (min as u64).wrapping_add((w >> (i * b % 8)) as u64 & mask) as i64
         })
         .collect()
+}
+
+fn read_numeric(
+    cur: &mut Cursor<'_>,
+    rows: u32,
+    flags: u8,
+    budget: &DecodeBudget,
+) -> Result<(IntStream, Option<Program>, usize)> {
+    budget.check_alloc((rows as usize).saturating_mul(8), "numeric lanes")?;
+    if flags & 0x80 == 0 {
+        let stream = IntStream::decode_wire(cur, budget, 0)?;
+        if stream.len() != rows as usize {
+            return Err(Error::Format("numeric graph row count mismatch".into()));
+        }
+        let code = cur.remaining();
+        let prog = if flags == 16 {
+            Some(decode_lane_program(cur.slice(code)?)?)
+        } else {
+            None
+        };
+        if cur.remaining() != 0 {
+            return Err(Error::Format("trailing numeric graph bytes".into()));
+        }
+        return Ok((stream, prog, code));
+    }
+    let ops = (flags >> 4) & 7;
+    let mut rest = &cur.buf[cur.pos..];
+    let prog = if ops > 0 {
+        Some(Program::decode_linear_ops(&mut rest, u32::from(ops))?)
+    } else {
+        None
+    };
+    let code = cur.remaining() - rest.len();
+    cur.slice(code)?;
+    let len = rows;
+    budget.check_alloc(cur.remaining(), "numeric transport bytes")?;
+    let stream = match flags & 15 {
+        0 => IntStream::Const {
+            len,
+            val: cur.ivar()?,
+        },
+        7 => {
+            let shift = cur.u8()?;
+            if shift >= 64 {
+                return Err(Error::Format("invalid constant shift".into()));
+            }
+            let c = cur.ivar()?;
+            let val = c.wrapping_shl(u32::from(shift));
+            if val >> shift != c {
+                return Err(Error::Format("constant shift overflow".into()));
+            }
+            IntStream::Const { len, val }
+        }
+        4 | 5 => {
+            let data = cur.slice(cur.remaining())?;
+            let leaf = if flags & 15 == 4 {
+                let mut leaf = Vec::with_capacity(data.len() + 12);
+                crate::wire::put_leaf(&mut leaf, EntropyBackend::Raw, data.len(), data);
+                leaf
+            } else {
+                data.to_vec()
+            };
+            IntStream::ZigZagVarint { len, leaf }
+        }
+        1 => IntStream::Rle {
+            len,
+            leaf: cur.slice(cur.remaining())?.to_vec(),
+        },
+        2 | 3 => {
+            let min = cur.ivar()?;
+            let bits = cur.u8()?;
+            if bits > 64 {
+                return Err(Error::Format("invalid integer bit width".into()));
+            }
+            let raw = cur.slice(cur.remaining())?;
+            let leaf = if flags & 15 == 3 {
+                if raw.len() != (u64::from(len) * u64::from(bits)).div_ceil(8) as usize {
+                    return Err(Error::Format("invalid packed width".into()));
+                }
+                let mut v = Vec::with_capacity(raw.len() + 12);
+                crate::wire::put_leaf(&mut v, EntropyBackend::Raw, raw.len(), raw);
+                v
+            } else {
+                raw.to_vec()
+            };
+            IntStream::ForBitpack {
+                len,
+                min,
+                bits,
+                leaf,
+            }
+        }
+        8 => IntStream::Rice {
+            len,
+            bytes: cur.slice(cur.remaining())?.to_vec(),
+        },
+        11 => {
+            let min = cur.ivar()?;
+            let radix =
+                u32::try_from(cur.uvar()?).map_err(|_| Error::Format("invalid radix".into()))?;
+            let layout = super::radix::Layout::new(radix)
+                .ok_or_else(|| Error::Format("invalid radix".into()))?;
+            IntStream::Radix {
+                len,
+                min,
+                radix,
+                bytes: cur.slice(layout.size(len as usize))?.to_vec(),
+            }
+        }
+        _ => return Err(Error::Format("unknown numeric stream".into())),
+    };
+    if cur.remaining() != 0 {
+        return Err(Error::Format("trailing numeric stream bytes".into()));
+    }
+    Ok((stream, prog, code))
 }
 
 fn decode_lane_program(bytes: &[u8]) -> Result<Program> {

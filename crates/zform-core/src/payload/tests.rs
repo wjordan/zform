@@ -1301,28 +1301,29 @@ fn compact_numeric_graphs_match_general_execution_and_reject_bad_frames() {
             let program = b.finish(&[(value, 8)]);
             let root = builder.add_prog_i64(program, vec![source], vec![]);
             let graph = builder.finish(root).fuse_numeric_programs();
-            let wire = graph.encode();
-            let parsed = PayloadGraph::decode(&wire, &budget).unwrap();
-            let expected = CoreDecoder::decode_ints(&graph, &ExtInputs::empty(), &budget).unwrap();
-            assert_eq!(
-                CoreDecoder::decode_ints_bytes(&wire, &budget).unwrap(),
-                expected
-            );
-            assert_eq!(
-                CoreDecoder::decode_ints(&parsed, &ExtInputs::empty(), &budget).unwrap(),
-                expected
-            );
-            for end in 0..wire.len() {
-                assert!(CoreDecoder::decode_ints_bytes(&wire[..end], &budget).is_err());
+            for wire in [graph.encode(), graph.encode_numeric()] {
+                let parsed = PayloadGraph::decode(&wire, &budget).unwrap();
+                let expected = CoreDecoder::decode_ints(&graph, &ExtInputs::empty(), &budget).unwrap();
+                assert_eq!(
+                    CoreDecoder::decode_ints_bytes(&wire, &budget).unwrap(),
+                    expected
+                );
+                assert_eq!(
+                    CoreDecoder::decode_ints(&parsed, &ExtInputs::empty(), &budget).unwrap(),
+                    expected
+                );
+                for end in 0..wire.len() {
+                    assert!(CoreDecoder::decode_ints_bytes(&wire[..end], &budget).is_err());
+                }
+                let mut trailing = wire.clone();
+                trailing.push(0);
+                assert!(CoreDecoder::decode_ints_bytes(&trailing, &budget).is_err());
+                let tight = DecodeBudget {
+                    max_single_alloc_bytes: 1,
+                    ..budget.clone()
+                };
+                assert!(CoreDecoder::decode_ints_bytes(&wire, &tight).is_err());
             }
-            let mut trailing = wire.clone();
-            trailing.push(0);
-            assert!(CoreDecoder::decode_ints_bytes(&trailing, &budget).is_err());
-            let tight = DecodeBudget {
-                max_single_alloc_bytes: 1,
-                ..budget.clone()
-            };
-            assert!(CoreDecoder::decode_ints_bytes(&wire, &tight).is_err());
         }
     }
     // One constant input, followed by a chain whose operation needs two operands.
