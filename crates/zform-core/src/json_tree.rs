@@ -3352,25 +3352,31 @@ fn decompose_target(t: &[u8], scope: &[(u16, &[u8])]) -> Option<(Vec<Vec<u8>>, V
     if t.len() > 384 {
         return None;
     }
+    // Most in-scope strings cannot occur in the target. Index its three-byte
+    // prefixes once and verify only the positions that share a bucket.
+    let bucket = |s: &[u8]| usize::from(s[0].wrapping_mul(13) ^ s[1].rotate_left(3) ^ s[2]);
+    let mut head = [0u16; 256];
+    let mut next = [0u16; 384];
+    for (pos, prefix) in t.windows(3).enumerate().rev() {
+        let h = bucket(prefix);
+        next[pos] = head[h];
+        head[h] = pos as u16 + 1;
+    }
     let mut spans: Vec<(usize, usize, u16)> = Vec::new();
     for &(rp, raw_rv) in scope {
         let rv = unquote_json_lexeme(raw_rv);
         if rv.len() < DERIV_MIN_REF || rv.len() >= t.len() {
             continue;
         }
-        // Both sides are short: a byte scan beats building a searcher per pair.
-        let mut s = 0usize;
-        while let Some(rel) = memchr::memchr(rv[0], &t[s..=t.len() - rv.len()]) {
-            s += rel;
-            if t[s..].starts_with(rv) {
-                spans.push((s, s + rv.len(), rp));
-                s += rv.len();
-            } else {
-                s += 1;
+        let mut link = head[bucket(rv)];
+        let mut end = 0;
+        while link != 0 {
+            let pos = usize::from(link - 1);
+            if pos >= end && t[pos..].starts_with(rv) {
+                end = pos + rv.len();
+                spans.push((pos, end, rp));
             }
-            if s + rv.len() > t.len() {
-                break;
-            }
+            link = next[pos];
         }
     }
     if spans.is_empty() {
