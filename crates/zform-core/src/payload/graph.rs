@@ -667,10 +667,10 @@ impl IntStream {
                 .ok()
                 .and_then(super::radix::Layout::new);
             let cost = radix.as_ref().map_or(usize::MAX, |layout| {
-                let mut header = Vec::new();
-                put_ivarint(&mut header, min);
-                put_uvarint(&mut header, u64::from(layout.radix));
-                layout.size(vals.len()) + header.len() + 4
+                let signed_min = ((min << 1) ^ (min >> 63)) as u64;
+                let min_bytes = (64 - signed_min.leading_zeros()).max(1).div_ceil(7);
+                let radix_bytes = (32 - layout.radix.leading_zeros()).div_ceil(7);
+                layout.size(vals.len()) + (min_bytes + radix_bytes) as usize + 4
             });
             if let Some(bytes) = super::rice::encode(vals, framed.len().min(cost).saturating_sub(6))
             {
@@ -1608,7 +1608,7 @@ impl PayloadGraph {
             }
             IntStream::Const { val, .. } => {
                 let shift = val.trailing_zeros().min(63);
-                if shift >= 14 {
+                if *val != 0 && shift >= 14 {
                     out.push(shift as u8);
                     put_ivarint(&mut out, *val >> shift);
                     7
@@ -1829,7 +1829,16 @@ impl PayloadGraph {
     /// Decodes a graph whose code references name entries of `lib`.
     pub fn decode_linked(b: &[u8], lib: &Library, budget: &DecodeBudget) -> Result<Self> {
         let mut cur = Cursor::new(b);
-        let rows_u64 = cur.uvar()?;
+        let rows = cur.uvar()?;
+        Self::decode_body(rows, cur, lib, budget)
+    }
+
+    fn decode_body(
+        rows_u64: u64,
+        mut cur: Cursor<'_>,
+        lib: &Library,
+        budget: &DecodeBudget,
+    ) -> Result<Self> {
         if rows_u64 == 0 {
             if cur.remaining() != 0 {
                 return Err(Error::Format(
@@ -2439,23 +2448,25 @@ impl GraphBuilder {
             let output = b.ri(super::ir::Op::AddI, value, min);
             return self.add_prog_i64(b.finish(&[(output, 8)]), vec![input], vec![]);
         }
-        let span = |v: &[i64]| {
-            let lo = *v.iter().min().unwrap();
-            let hi = *v.iter().max().unwrap();
-            64 - (hi as u64).wrapping_sub(lo as u64).leading_zeros()
-        };
+        let span = |lo: i64, hi: i64| 64 - (hi as u64).wrapping_sub(lo as u64).leading_zeros();
+        let bits = span(min, *vals.iter().max().unwrap()) as usize;
         let mut deltas = Vec::with_capacity(vals.len());
         // Use a real step in the first lane so centering sees no artificial outlier.
-        deltas.push(vals[1].wrapping_sub(vals[0]));
+        deltas.push(step);
         deltas.extend(vals.windows(2).map(|w| w[1].wrapping_sub(w[0])));
-        let delta_bytes = deltas
-            .iter()
-            .map(|&v| {
-                ((64 - (((v << 1) ^ (v >> 63)) as u64).leading_zeros()).max(1) as usize).div_ceil(7)
-            })
-            .sum::<usize>();
-        if (span(vals).saturating_sub(span(&deltas)) as usize) * vals.len() > 40
-            || delta_bytes * 8 + 40 < span(vals) as usize * vals.len()
+        let delta_bits =
+            span(*deltas.iter().min().unwrap(), *deltas.iter().max().unwrap()) as usize;
+        let varint_bytes = || {
+            deltas
+                .iter()
+                .map(|&v| {
+                    let zigzag = ((v << 1) ^ (v >> 63)) as u64;
+                    (64 - zigzag.leading_zeros()).max(1).div_ceil(7) as usize
+                })
+                .sum::<usize>()
+        };
+        if bits.saturating_sub(delta_bits) * vals.len() > 40
+            || varint_bytes() * 8 + 40 < bits * vals.len()
         {
             let input = self.push(GraphNode::IntStream(IntStream::encode_fast(&deltas)));
             let b = Builder::new(1);
@@ -3327,8 +3338,12 @@ impl CoreDecoder {
     pub fn decode_ints_bytes(bytes: &[u8], budget: &DecodeBudget) -> Result<Vec<i64>> {
         let mut cursor = Cursor::new(bytes);
         let rows = cursor.uvar()?;
+        Self::decode_ints_body(cursor.slice(cursor.remaining())?, rows, budget)
+    }
+
+    /// Decodes a numeric payload whose row count was supplied by its enclosing frame.
+    pub fn decode_ints_body(bytes: &[u8], rows: u64, budget: &DecodeBudget) -> Result<Vec<i64>> {
         let mut compact = Cursor::new(bytes);
-        compact.uvar()?;
         if rows > 0 && rows <= budget.max_records_per_block as u64 {
             let flags = compact.u8()?;
             if flags & 0x80 != 0 || matches!(flags, 8 | 16) {
@@ -3349,6 +3364,7 @@ impl CoreDecoder {
                 return Ok(values);
             }
         }
+        let mut cursor = Cursor::new(bytes);
         if rows > 0
             && rows <= budget.max_records_per_block as u64
             && cursor.u8()? == 0
@@ -3361,7 +3377,8 @@ impl CoreDecoder {
             }
             return stream.unpack(budget);
         }
-        let graph = PayloadGraph::decode(bytes, budget)?;
+        let graph =
+            PayloadGraph::decode_body(rows, Cursor::new(bytes), &Library::default(), budget)?;
         Self::decode_ints(&graph, &ExtInputs::empty(), budget)
     }
 
@@ -4829,7 +4846,7 @@ fn read_numeric(
         },
         7 => {
             let shift = cur.u8()?;
-            if shift >= 64 {
+            if !(1..64).contains(&shift) {
                 return Err(Error::Format("invalid constant shift".into()));
             }
             let c = cur.ivar()?;

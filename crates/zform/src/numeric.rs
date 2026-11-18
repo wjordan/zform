@@ -195,10 +195,27 @@ pub fn decode_f64(
     range: std::ops::Range<usize>,
     budget: &DecodeBudget,
 ) -> Result<Vec<f64>> {
+    let mut wire = zform_core::wire::Cursor::new(bytes);
+    if wire.uvar()? != count as u64 {
+        return Err(Error::Format("numeric row count mismatch".into()));
+    }
+    decode_f64_body(wire.slice(wire.remaining())?, count, range, budget)
+}
+
+/// Decodes the bytes following the row count when an enclosing frame supplies that count.
+pub fn decode_f64_body(
+    body: &[u8],
+    count: usize,
+    range: std::ops::Range<usize>,
+    budget: &DecodeBudget,
+) -> Result<Vec<f64>> {
     if range.start > range.end || range.end > count {
         return Err(Error::InvalidArgument("numeric selection range".into()));
     }
-    let mut values = decode_i64(bytes, count, budget)?;
+    let mut values = CoreDecoder::decode_ints_body(body, count as u64, budget)?;
+    if values.len() != count {
+        return Err(Error::Format("numeric row count mismatch".into()));
+    }
     values.truncate(range.end);
     if range.start > 0 {
         values.drain(..range.start);

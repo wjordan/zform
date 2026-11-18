@@ -236,7 +236,6 @@ Standalone numeric graphs omit the node directory and carry their inputs inline.
 - `flags = 0x10`: one `IntStream`, followed by a `Program` through the end of
   the payload. The root is a `ProgramI64` with that stream as its sole input and no
   buffers. Its only output is an eight-byte lane. The stream length must equal `rows`.
-
 - Bit 7 set encodes a short unary program and one integer stream. Bits 4–6 give
   the expanded instruction count, from zero to seven. The low nibble selects the
   stream layout below. The program instructions precede the stream. The graph
@@ -324,8 +323,8 @@ An `IntStream` starts with `kind: u8`, then `length: uvarint`, followed by the o
 | `6` | ZigZag byte head and exceptions | `head: leaf_blob`, `tail: IntStream` |
 | `7` | Shifted constant | `shift: u8`, `coefficient: ivarint` |
 | `8` | Centered Rice | `bytes: blob` |
-| `11` | Bounded radix | `min: ivarint`, `radix: uvarint`, packed words |
 | `10` | Nibble context mixture | `min: ivarint`, `bits: u8`, `table_bits: u8`, `escape: u8`, `bytes: blob` |
+| `11` | Bounded radix | `min: ivarint`, `radix: uvarint`, packed words |
 
 - **Constant:** repeat `value`. A shifted constant repeats `coefficient << shift`; the shift is 1–63 and must preserve the signed coefficient without overflow.
 - **Run length:** the expanded leaf holds `n_runs: uvarint`, then `(value: ivarint, count: uvarint)` pairs. Counts sum to `length`.
