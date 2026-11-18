@@ -99,7 +99,21 @@ pub fn scan_json_str(s: &[u8], i: usize) -> Option<(usize, bool)> {
     let mut j = i + 1;
     let mut esc = false;
     while j < s.len() {
-        while j + 8 <= s.len() {
+        #[cfg(target_arch = "x86_64")]
+        while let Some(chunk) = s.get(j..).and_then(|rest| rest.first_chunk::<16>()) {
+            use std::arch::x86_64::*;
+            // SSE2 is baseline on x86-64. The array bounds the unaligned load.
+            let mask = unsafe {
+                let v = _mm_loadu_si128(chunk.as_ptr().cast());
+                let quote = _mm_cmpeq_epi8(v, _mm_set1_epi8(b'"' as i8));
+                let slash = _mm_cmpeq_epi8(v, _mm_set1_epi8(b'\\' as i8));
+                let control = _mm_cmpeq_epi8(_mm_min_epu8(v, _mm_set1_epi8(31)), v);
+                _mm_movemask_epi8(_mm_or_si128(control, _mm_or_si128(quote, slash)))
+            };
+            if mask != 0 { j += mask.trailing_zeros() as usize; break; }
+            j += 16;
+        }
+        while j + 8 <= s.len() && (!cfg!(target_arch = "x86_64") || s.len() - j < 16) {
             let w = u64::from_le_bytes(s[j..j + 8].try_into().unwrap());
             let q = (w ^ Q).wrapping_sub(LO) & !(w ^ Q) & HI;
             let b = (w ^ BS).wrapping_sub(LO) & !(w ^ BS) & HI;
