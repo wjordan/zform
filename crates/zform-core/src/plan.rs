@@ -10,7 +10,7 @@ use crate::grammar::{
     logfmt_shape, match_template, parse_k8s_cri, parse_logfmt_line, parse_syslog_envelope,
     split_csv_exact, split_csv_fields, split_records_with_plan, tokenize_template_line,
 };
-use crate::json_tree::{JsonDoc, train_json_tree};
+use crate::json_tree::{JsonDoc, TreeTrainer, train_observed_json};
 use crate::lex::parse_exact_int;
 use crate::wire::{
     Cursor, DecodeBudget, EntropyBackend, Error, Result, compress_leaf, decompress_leaf,
@@ -225,6 +225,7 @@ pub fn train_from_records(
     // Partition sample rows into candidate buckets simultaneously (Zero 90% JSON cliff!)
     let mut jdoc = JsonDoc::default();
     let mut json_rows = Vec::<&[u8]>::new();
+    let mut tree = None;
     let mut cri_inners = Vec::<&[u8]>::new();
     let mut syslog_inners = Vec::<&[u8]>::new();
     let mut logfmt_rows = Vec::<&[u8]>::new();
@@ -233,6 +234,7 @@ pub fn train_from_records(
     for &line in samples {
         let first = line.iter().copied().find(|b| !b.is_ascii_whitespace());
         if first == Some(b'{') && jdoc.parse_root_object(line) {
+            tree.get_or_insert_with(TreeTrainer::with_root).observe_root(&jdoc, line);
             json_rows.push(line);
         } else if opts.depth == 0
             && let Some((_, _, _, inner)) = parse_k8s_cri(line)
@@ -251,7 +253,7 @@ pub fn train_from_records(
 
     // 2. Train Hierarchical JSON Tree (`JsonTreePlan` + cross-path derivations + nested JSON-in-string!)
     if json_rows.len() >= 2 {
-        if let Some(jt) = train_json_tree(&json_rows, opts, &mut plan) {
+        if let Some(jt) = train_observed_json(tree.unwrap(), &json_rows, opts, &mut plan) {
             for pdef in &jt.paths {
                 if pdef.value_col != u16::MAX && !pdef.dict_group.is_empty() {
                     plan.columns[pdef.value_col as usize].dict_group = pdef.dict_group.clone();

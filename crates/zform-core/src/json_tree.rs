@@ -2323,12 +2323,23 @@ impl TPath {
 }
 
 #[derive(Default)]
-struct TreeTrainer {
+pub(crate) struct TreeTrainer {
     paths: Vec<TPath>,
     index: HashMap<Vec<u8>, usize>,
 }
 
 impl TreeTrainer {
+    pub(crate) fn with_root() -> Self {
+        let mut trainer = Self::default();
+        trainer.add_path(b"$".to_vec(), false);
+        trainer
+    }
+
+    pub(crate) fn observe_root(&mut self, doc: &JsonDoc, row: &[u8]) {
+        self.observe(doc, row, 0, 0);
+    }
+
+
     fn add_path(&mut self, name: Vec<u8>, is_elem: bool) -> usize {
         if let Some(&idx) = self.index.get(&name) {
             return idx;
@@ -2436,21 +2447,31 @@ pub fn train_json_tree(
     opts: &crate::plan::TrainOptions,
     model_plan: &mut crate::grammar::ModelPlan,
 ) -> Option<JsonTreePlan> {
-    let mut tr = TreeTrainer::default();
-    let root = tr.add_path(b"$".to_vec(), false);
+    let mut tr = TreeTrainer::with_root();
     let mut doc = JsonDoc::default();
     let mut parsed_count = 0usize;
 
     for &row in json_rows {
         if doc.parse_root_object(row) {
             parsed_count += 1;
-            tr.observe(&doc, row, 0, root);
+            tr.observe_root(&doc, row);
         }
     }
     if parsed_count < 2 {
         return None;
     }
 
+    train_observed_json(tr, json_rows, opts, model_plan)
+}
+
+pub(crate) fn train_observed_json(
+    mut tr: TreeTrainer,
+    json_rows: &[&[u8]],
+    opts: &crate::plan::TrainOptions,
+    model_plan: &mut crate::grammar::ModelPlan,
+) -> Option<JsonTreePlan> {
+    let root = 0;
+    let mut doc = JsonDoc::default();
     // A scalar key that varies under one parent varies under every parent: the sample may have
     // missed the rare value here, and a value baked into a layout costs an opaque row later.
     let scalar = |tp: &TPath| tp.kinds[J_OBJECT as usize] == 0 && tp.kinds[J_ARRAY as usize] == 0;
