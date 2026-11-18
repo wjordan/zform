@@ -258,6 +258,19 @@ pub fn get_iv(b: &mut &[u8]) -> Result<i64, Invalid> {
     Ok(((z >> 1) as i64) ^ -((z & 1) as i64))
 }
 
+const DECIMAL_IMMEDIATES: [f64; 32] = {
+    let mut values = [0.0; 32];
+    let mut power = 1.0;
+    let mut index = 0;
+    while index < 16 {
+        values[index] = power;
+        values[index + 16] = 1.0 / power;
+        power *= 10.0;
+        index += 1;
+    }
+    values
+};
+
 impl Program {
     /// Maximum bytes emitted by one row.
     pub fn row_bytes(&self) -> usize {
@@ -301,9 +314,23 @@ impl Program {
             })
     }
 
-    pub(super) fn encode_linear_ops(&self, out: &mut Vec<u8>) {
-        for ins in &self.ops {
-            out.push(ins.op as u8);
+    pub(super) fn encode_linear_ops(&self, out: &mut Vec<u8>, compact: bool) {
+        // A cast following a unary instruction has no immediate or operand of its own.
+        // The decimal form stores the exact IEEE immediate by a small table index.
+        let mut ops = self.ops.iter().peekable();
+        while let Some(ins) = ops.next() {
+            let cast = compact && ops.next_if(|next| next.op == Op::I64ToF64).is_some();
+            let flag = u8::from(cast) << 6;
+            if compact && matches!(ins.op, Op::F64MulI | Op::F64DivI) {
+                if let Some(i) = DECIMAL_IMMEDIATES
+                    .iter()
+                    .position(|v| v.to_bits() == ins.imm as u64)
+                {
+                    out.push(0x80 | flag | (u8::from(ins.op == Op::F64DivI) << 5) | i as u8);
+                    continue;
+                }
+            }
+            out.push(ins.op as u8 | flag);
             if ins.op.is_shift_imm() {
                 out.push(ins.imm as u8);
             } else if matches!(
@@ -323,7 +350,7 @@ impl Program {
         if self.is_linear_lane() {
             let mut out = vec![0x81];
             put_uv(&mut out, self.ops.len() as u64);
-            self.encode_linear_ops(&mut out);
+            self.encode_linear_ops(&mut out, false);
             return out;
         }
         let mut out = Vec::new();
@@ -370,18 +397,32 @@ impl Program {
         out
     }
 
-    pub(super) fn decode_linear_ops(b: &mut &[u8], n: u32) -> Result<Self, Invalid> {
+    pub(super) fn decode_linear_ops(b: &mut &[u8], n: u32, compact: bool) -> Result<Self, Invalid> {
         let mut ops = Vec::with_capacity(n as usize);
-        for i in 0..n {
-            let (&code, rest) = b.split_first().ok_or(Invalid("truncated op"))?;
+        while ops.len() < n as usize {
+            let i = ops.len() as u32;
+            let (&byte, rest) = b.split_first().ok_or(Invalid("truncated op"))?;
             *b = rest;
-            let op = *ALL_OPS
-                .get(code as usize)
-                .ok_or(Invalid("unknown opcode"))?;
+            let decimal = compact && byte & 0x80 != 0;
+            let cast = compact && byte & 0x40 != 0;
+            let code = if compact { byte & 0x3f } else { byte };
+            let op = if decimal {
+                if code & 0x20 != 0 {
+                    Op::F64DivI
+                } else {
+                    Op::F64MulI
+                }
+            } else {
+                *ALL_OPS
+                    .get(code as usize)
+                    .ok_or(Invalid("unknown opcode"))?
+            };
             if op.arity() != 1 || matches!(op, Op::NibbleLut | Op::ByteLut32 | Op::Gather) {
                 return Err(Invalid("nonlinear opcode in lane chain"));
             }
-            let imm = if op.is_shift_imm() {
+            let imm = if decimal {
+                DECIMAL_IMMEDIATES[(code & 0x1f) as usize].to_bits() as i64
+            } else if op.is_shift_imm() {
                 let (&shift, rest) = b.split_first().ok_or(Invalid("truncated shift"))?;
                 *b = rest;
                 if shift >= 64 {
@@ -403,6 +444,19 @@ impl Program {
                 aux: 0,
                 imm,
             });
+            if cast {
+                if ops.len() >= n as usize {
+                    return Err(Invalid("cast exceeds lane program length"));
+                }
+                ops.push(Ins {
+                    op: Op::I64ToF64,
+                    a: i + 1,
+                    b: 0,
+                    c: 0,
+                    aux: 0,
+                    imm: 0,
+                });
+            }
         }
         Ok(Self {
             width: Width::W64,
@@ -423,7 +477,7 @@ impl Program {
             if n > 1 << 14 {
                 return Err(Invalid("program too large"));
             }
-            let program = Self::decode_linear_ops(b, n as u32)?;
+            let program = Self::decode_linear_ops(b, n as u32, false)?;
             if !b.is_empty() {
                 return Err(Invalid("trailing bytes in program"));
             }

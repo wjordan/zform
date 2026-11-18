@@ -230,13 +230,29 @@ A `src` entry with bit 31 set names column `src & 0x7fffffff` of the file's tabl
 
 All node references must point backward. `root` must name a node. Unknown flags, unknown node kinds, and trailing graph bytes are rejected. Graphs have no separate magic, version, or checksum; the enclosing column length bounds their bytes and frame checksums protect the record stream.
 
-Two standalone numeric graph forms omit the node directory. Their flags are exact
-values, not bits to combine with external dependencies:
+Standalone numeric graphs omit the node directory and carry their inputs inline.
 
 - `flags = 0x08`: one `IntStream`, which is the root.
 - `flags = 0x10`: one `IntStream`, followed by a `Program` through the end of
   the payload. The root is a `ProgramI64` with that stream as its sole input and no
   buffers. Its only output is an eight-byte lane. The stream length must equal `rows`.
+
+- Bit 7 set encodes a short unary program and one integer stream. Bits 4–6 give
+  the expanded instruction count, from zero to seven. The low nibble selects the
+  stream layout below. The program instructions precede the stream. The graph
+  supplies its row count and the enclosing payload supplies its end.
+
+| Low nibble | Stream operands through the end of the frame |
+|---:|---|
+| 0 | Constant signed varint |
+| 1 | Run-length entropy leaf |
+| 2, 3 | Minimum signed varint and bit-width byte, followed by an entropy leaf (2) or raw packed offsets (3) |
+| 4, 5 | Signed varints in raw bytes (4) or an entropy leaf (5) |
+| 7 | Shift byte and signed coefficient |
+| 8 | Centered Rice bytes |
+| 11 | Minimum signed varint, unsigned radix, and packed radix words |
+
+The program uses the unary instruction encoding in [PROGRAMS.md](PROGRAMS.md#compact-programs).
 
 These forms have inline code and no external dependencies or library references. General numeric graphs can also end at `IntStream` or `ProgramI64` nodes. `CoreDecoder::decode_ints_bytes` returns their native lanes; `decode_bytes` expects byte-string cells.
 
@@ -308,6 +324,7 @@ An `IntStream` starts with `kind: u8`, then `length: uvarint`, followed by the o
 | `6` | ZigZag byte head and exceptions | `head: leaf_blob`, `tail: IntStream` |
 | `7` | Shifted constant | `shift: u8`, `coefficient: ivarint` |
 | `8` | Centered Rice | `bytes: blob` |
+| `11` | Bounded radix | `min: ivarint`, `radix: uvarint`, packed words |
 | `10` | Nibble context mixture | `min: ivarint`, `bits: u8`, `table_bits: u8`, `escape: u8`, `bytes: blob` |
 
 - **Constant:** repeat `value`. A shifted constant repeats `coefficient << shift`; the shift is 1–63 and must preserve the signed coefficient without overflow.
@@ -317,6 +334,13 @@ An `IntStream` starts with `kind: u8`, then `length: uvarint`, followed by the o
 - **Byte planes:** `width` is 1, 2, 4, or 8. The expanded leaf holds `length * width` bytes: all low bytes of unsigned offsets from `min`, then all second bytes, and so on. Interleave and add `min` with 64-bit wrapping arithmetic.
 - **Byte head and exceptions:** the expanded head holds one byte per lane. Bytes 0–254 represent offsets from `min` (kind `5`) or ZigZag codes (kind `6`). Byte 255 consumes the next tail value and adds 255 to obtain the offset or ZigZag code. Each exception consumes exactly one tail value. Kind `5` tails must be nonnegative; kind `6` tails carry unsigned bit patterns in signed lanes. A tail is never itself kind `5` or `6`.
 - **Centered Rice:** `bytes` contains `center: ivarint`, `k: u8`, then a least-significant-bit-first bitstream. ZigZag-encode each signed difference from `center`. Write `code >> k` zero bits, one bit, then the low `k` bits. `k` is 0–63. Decoders reject arithmetic overflow, truncation, trailing bytes, and nonzero padding.
+- **Bounded radix.** Each digit is an unsigned offset from `min`. The radix is
+  3–65,535 excluding powers of two. For each digit count `d` with `radix^d`
+  representable in a `u64`, find the minimum byte width `w` holding
+  `radix^d - 1`. Choose the smallest `d` minimizing `w/d`. Write each group
+  as a little-endian word with the first digit least significant. The final
+  group uses the width for its actual digit count. Reject values outside the
+  group's range and minima whose maximum digit would overflow a signed lane.
 - **Nibble context mixture:** `length` is nonzero, `bits` is 1–16, and `table_bits` is 8–14.
   Each value is an unsigned `bits`-wide offset from `min`; add `min` with wrapping arithmetic
   to reconstruct signed lanes. `bytes` is the arithmetic stream itself, without another

@@ -83,6 +83,14 @@ eight-byte output. Only unary opcodes that need no table or buffer are allowed.
 Shift immediates are one byte in 0–63, integer immediates are `ivarint`, and floating
 immediates are `uvarint` of their byte-swapped IEEE-754 bits. The compact form uses the same instruction set. It can appear wherever a `Program` is stored, including an inline or library code body.
 
+Within a numeric graph whose flags have bit 7 set, each instruction byte has
+two additional fields. Bit 6 appends an `I64ToF64` instruction after this
+instruction. Both count toward the declared program length. When bit 7 is
+clear, bits 0–5 give the usual opcode and its immediate follows. When bit 7
+is set, bit 5 selects `F64MulI` (0) or `F64DivI` (1). The immediate is the
+exact binary64 value of `10^(byte & 15)` when bit 4 is clear, or its
+binary64 reciprocal when bit 4 is set. No immediate bytes follow.
+
 ## recurrences
 
 `RecurBuf` describes `n_state` sequences of state words that advance together. Each next word depends on earlier words of any of them and on optional integer columns:

@@ -1326,6 +1326,9 @@ fn compact_numeric_graphs_match_general_execution_and_reject_bad_frames() {
             }
         }
     }
+    // One coded instruction expands to two, exceeding the declared program length.
+    let overlong = [2, 0x90, 0x40 | Op::Bswap as u8, 0];
+    assert!(CoreDecoder::decode_ints_bytes(&overlong, &budget).is_err());
     // One constant input, followed by a chain whose operation needs two operands.
     let bad = [2, 16, 0, 2, 0, 0x81, 1, Op::Add as u8];
     assert!(PayloadGraph::decode(&bad, &budget).is_err());

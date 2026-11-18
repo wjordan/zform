@@ -1582,7 +1582,7 @@ impl PayloadGraph {
         let tag = out.len();
         out.push(0x80 | (prog.map_or(0, |p| p.ops.len() as u8) << 4));
         if let Some(prog) = prog {
-            prog.encode_linear_ops(&mut out);
+            prog.encode_linear_ops(&mut out, true);
         }
         fn raw_bytes(leaf: &[u8]) -> Option<&[u8]> {
             let mut input = Cursor::new(leaf);
@@ -4814,7 +4814,7 @@ fn read_numeric(
     let ops = (flags >> 4) & 7;
     let mut rest = &cur.buf[cur.pos..];
     let prog = if ops > 0 {
-        Some(Program::decode_linear_ops(&mut rest, u32::from(ops))?)
+        Some(Program::decode_linear_ops(&mut rest, u32::from(ops), true)?)
     } else {
         None
     };
