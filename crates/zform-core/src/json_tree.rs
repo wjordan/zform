@@ -2966,39 +2966,206 @@ fn spread_order(n: usize) -> impl Iterator<Item = usize> {
     (0..n).map(move |k| k * step % n)
 }
 
-fn discover_json_derivations(json_rows: &[&[u8]], jt: &mut JsonTreePlan) {
-    let n_paths = jt.paths.len();
-    let mut occs: Vec<Vec<ScopeOcc<'_>>> = (0..n_paths).map(|_| Vec::new()).collect();
-    let mut doc = JsonDoc::default();
-    let mut scope: Vec<Option<&[u8]>> = vec![None; n_paths];
+// Values live in the sampled input. Cache their traversal order once per row. On
+// overflow the input itself backs replay, including for a single oversized row.
+const DERIV_CACHE_EVENTS: usize = 1 << 19;
 
-    // Collect up to `DERIV_MAX_OCC` occurrences with active in-scope predecessors!
-    // Strided, not the head: rows sorted by kind would show one kind's paths only. Visited in
-    // bit-reversed order, so a path that fills its cap early still saw rows from the whole span.
-    let strided: Vec<&[u8]> = json_rows
-        .iter()
-        .step_by(json_rows.len().div_ceil(2048).max(1))
-        .copied()
-        .collect();
-    for row in spread_order(strided.len()).map(|i| strided[i]) {
-        if !doc.parse_root_object(row) {
-            continue;
+#[derive(Clone, Copy)]
+struct FieldEvent {
+    path: u16,
+    start: u32,
+    end: u32,
+}
+
+impl FieldEvent {
+    fn value(self, row: &[u8]) -> &[u8] {
+        &row[self.start as usize..self.end as usize]
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Observation {
+    row: usize,
+    event: usize,
+}
+
+struct SampleRow<'a> {
+    bytes: &'a [u8],
+    cached: Option<std::ops::Range<usize>>,
+}
+
+struct DerivationSample<'a> {
+    rows: Vec<SampleRow<'a>>,
+    events: Vec<FieldEvent>,
+    observations: Vec<Vec<Observation>>,
+}
+
+impl<'a> DerivationSample<'a> {
+    fn collect(input: &[&'a [u8]], jt: &JsonTreePlan, cache_limit: usize) -> Self {
+        let mut sample = Self {
+            rows: Vec::new(),
+            events: Vec::new(),
+            observations: vec![Vec::new(); jt.paths.len()],
+        };
+        let mut doc = JsonDoc::default();
+        let mut active = vec![false; jt.paths.len()];
+        let strided: Vec<_> = input
+            .iter()
+            .step_by(input.len().div_ceil(2048).max(1))
+            .copied()
+            .collect();
+        for bytes in spread_order(strided.len()).map(|i| strided[i]) {
+            if !doc.parse_root_object(bytes) {
+                continue;
+            }
+            active.fill(false);
+            let mut active_count = 0;
+            let start = sample.events.len();
+            let mut count = 0;
+            let mut needed = false;
+            walk_deriv_fields(0, 0, 0, bytes, &doc, jt, &mut |id, v| {
+                let event = FieldEvent {
+                    path: id as u16,
+                    start: v.start,
+                    end: v.end,
+                };
+                if sample.events.len() < cache_limit {
+                    sample.events.push(event);
+                }
+                let path = &mut sample.observations[id];
+                if path.len() < DERIV_MAX_OCC
+                    && !jt.paths[id].is_text
+                    && v.kind >= J_STRING
+                    && active_count > usize::from(active[id])
+                {
+                    path.push(Observation {
+                        row: sample.rows.len(),
+                        event: count,
+                    });
+                    needed = true;
+                }
+                let len = v.end - v.start;
+                let usable = len > 0 && len <= 256;
+                active_count = active_count - usize::from(active[id]) + usize::from(usable);
+                active[id] = usable;
+                count += 1;
+            });
+            let cached = if needed && count == sample.events.len() - start {
+                Some(start..sample.events.len())
+            } else {
+                sample.events.truncate(start);
+                None
+            };
+            if needed {
+                sample.rows.push(SampleRow { bytes, cached });
+            }
         }
-        scope.fill(None);
-        collect_deriv_walk(0, 0, 0, row, &doc, jt, &mut scope, &mut occs);
+        sample
     }
 
+    fn expand(&self, observations: &[Observation], jt: &JsonTreePlan) -> Vec<ScopeOcc<'a>> {
+        let mut list = Vec::with_capacity(observations.len());
+        let mut scope = FieldScope::new(jt.paths.len());
+        let mut doc = JsonDoc::default();
+        for group in observations.chunk_by(|a, b| a.row == b.row) {
+            let row = &self.rows[group[0].row];
+            scope.present.fill(0);
+            if let Some(range) = &row.cached {
+                let events = &self.events[range.clone()];
+                let mut start = 0;
+                for obs in group {
+                    for &event in &events[start..obs.event] {
+                        scope.set(event);
+                    }
+                    list.push(scope.snapshot(events[obs.event], row.bytes));
+                    start = obs.event;
+                }
+            } else {
+                // This row was validated during collection.
+                let valid = doc.parse_root_object(row.bytes);
+                debug_assert!(valid);
+                let mut wanted = group.iter().peekable();
+                let mut pos = 0;
+                walk_deriv_fields(0, 0, 0, row.bytes, &doc, jt, &mut |path, v| {
+                    let event = FieldEvent {
+                        path: path as u16,
+                        start: v.start,
+                        end: v.end,
+                    };
+                    if wanted.next_if(|obs| obs.event == pos).is_some() {
+                        list.push(scope.snapshot(event, row.bytes));
+                    }
+                    scope.set(event);
+                    pos += 1;
+                });
+            }
+        }
+        list
+    }
+}
+
+// Keep only the paths present in this row when materializing a predecessor list.
+// Iterating the set bits preserves the path order used to break ties in training.
+struct FieldScope {
+    present: Vec<u64>,
+    values: Vec<(u32, u32)>,
+}
+
+impl FieldScope {
+    fn new(paths: usize) -> Self {
+        Self {
+            present: vec![0; paths.div_ceil(64)],
+            values: vec![(0, 0); paths],
+        }
+    }
+
+    fn set(&mut self, event: FieldEvent) {
+        let id = event.path as usize;
+        let mask = 1u64 << (id % 64);
+        let word = &mut self.present[id / 64];
+        if (1..=256).contains(&(event.end - event.start)) {
+            *word |= mask;
+            self.values[id] = (event.start, event.end);
+        } else {
+            *word &= !mask;
+        }
+    }
+
+    fn snapshot<'a>(&self, target: FieldEvent, row: &'a [u8]) -> ScopeOcc<'a> {
+        let count: usize = self
+            .present
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum();
+        let mut refs = Vec::with_capacity(count);
+        for (block, &word) in self.present.iter().enumerate() {
+            let mut remaining = word;
+            while remaining != 0 {
+                let id = 64 * block + remaining.trailing_zeros() as usize;
+                if id != target.path as usize {
+                    let (start, end) = self.values[id];
+                    refs.push((id as u16, &row[start as usize..end as usize]));
+                }
+                remaining &= remaining - 1;
+            }
+        }
+        ScopeOcc {
+            target: target.value(row),
+            refs,
+        }
+    }
+}
+
+fn discover_json_derivations(json_rows: &[&[u8]], jt: &mut JsonTreePlan) {
+    let sample = DerivationSample::collect(json_rows, jt, DERIV_CACHE_EVENTS);
     let mut tmp = Vec::new();
-    for p in 1..n_paths {
-        if !jt.paths[p].shapes.is_empty() || jt.paths[p].is_text {
+    for (p, observations) in sample.observations.iter().enumerate().skip(1) {
+        if observations.len() < DERIV_MIN_OCC {
             continue;
         }
-        let list = &occs[p];
-        if list.len() < DERIV_MIN_OCC {
-            continue;
-        }
-        let props = propose_cands(list, p, &mut tmp);
-        let cands = pick_cands(list, p, props, &mut tmp);
+        let list = sample.expand(observations, jt);
+        let props = propose_cands(&list, p, &mut tmp);
+        let cands = pick_cands(&list, p, props, &mut tmp);
         if !cands.is_empty() {
             let sel_s = jt.n_struct_streams as u16;
             jt.n_struct_streams += 1;
@@ -3248,40 +3415,21 @@ fn decompose_target(t: &[u8], scope: &[(u16, &[u8])]) -> Option<(Vec<Vec<u8>>, V
     Some((lits, refs))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn collect_deriv_walk<'a>(
+fn walk_deriv_fields(
     ni: usize,
     path_idx: usize,
     trie_node: usize,
-    s: &'a [u8],
+    s: &[u8],
     doc: &JsonDoc,
     jt: &JsonTreePlan,
-    scope: &mut [Option<&'a [u8]>],
-    occs: &mut [Vec<ScopeOcc<'a>>],
+    visit: &mut impl FnMut(usize, JVal),
 ) {
     let pdef = &jt.paths[path_idx];
     let v = doc.nodes[ni];
     if pdef.shapes.is_empty() {
-        let val = &s[v.start as usize..v.end as usize];
-        if occs[path_idx].len() < DERIV_MAX_OCC && !pdef.is_text && v.kind >= J_STRING {
-            let mut refs = Vec::new();
-            for (rp, &sv_opt) in scope.iter().enumerate() {
-                if rp != path_idx
-                    && let Some(sv) = sv_opt
-                    && !sv.is_empty()
-                    && sv.len() <= 256
-                {
-                    refs.push((rp as u16, sv));
-                }
-            }
-            if !refs.is_empty() {
-                occs[path_idx].push(ScopeOcc { target: val, refs });
-            }
-        }
-        scope[path_idx] = Some(val);
+        visit(path_idx, v);
         return;
     }
-
     if v.kind != J_OBJECT {
         return;
     }
@@ -3307,20 +3455,19 @@ fn collect_deriv_walk<'a>(
                 let elem_p = jt.paths[cp].elem_path as usize;
                 let elem_ct = jt.runtime.trie[ct].elem_node.max(0) as usize;
                 for ek in doc.kid_range(kid.node as usize) {
-                    collect_deriv_walk(
+                    walk_deriv_fields(
                         doc.kids[ek].node as usize,
                         elem_p,
                         elem_ct,
                         s,
                         doc,
                         jt,
-                        scope,
-                        occs,
+                        visit,
                     );
                 }
             }
         } else {
-            collect_deriv_walk(kid.node as usize, cp, ct, s, doc, jt, scope, occs);
+            walk_deriv_fields(kid.node as usize, cp, ct, s, doc, jt, visit);
         }
     }
 }
@@ -3453,6 +3600,47 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn predecessor_snapshots_keep_only_live_paths_in_order() {
+        let row = [b'x'; 260];
+        let mut scope = FieldScope::new(100);
+        let event = |path, start, end| FieldEvent { path, start, end };
+        scope.set(event(71, 1, 2));
+        scope.set(event(64, 0, 1));
+        scope.set(event(1, 2, 3));
+        scope.set(event(0, 0, 256));
+        scope.set(event(71, 0, 257));
+        let snapshot = scope.snapshot(event(64, 3, 4), &row);
+        assert_eq!(snapshot.target, &row[3..4]);
+        assert_eq!(snapshot.refs, [(0, &row[..256]), (1, &row[2..3])]);
+    }
+
+    #[test]
+    fn replay_from_input_matches_cached_field_history() {
+        let rows: Vec<_> = (0..32).map(|i| format!(
+            r#"{{"id":{i},"items":[{{"name":"a{i}","url":"a{i}"}},{{"name":"b{i}","url":"b{i}"}}],"last":"b{i}"}}"#
+        )).collect();
+        let refs: Vec<_> = rows.iter().map(|row| row.as_bytes()).collect();
+        let mut model = crate::grammar::ModelPlan::residual_only();
+        let jt = train_json_tree(&refs, &Default::default(), &mut model).unwrap();
+        let cached = DerivationSample::collect(&refs, &jt, DERIV_CACHE_EVENTS);
+        assert!(cached.rows.iter().all(|row| row.cached.is_some()));
+        assert!(cached.observations.iter().any(|obs| obs.len() > rows.len()));
+        for limit in [0, cached.events.len() / 2] {
+            let sample = DerivationSample::collect(&refs, &jt, limit);
+            assert!(sample.events.len() <= limit);
+            assert!(sample.rows.iter().any(|row| row.cached.is_none()));
+            for (a, b) in cached.observations.iter().zip(&sample.observations) {
+                let left = cached.expand(a, &jt);
+                let right = sample.expand(b, &jt);
+                assert_eq!(left.len(), right.len());
+                for (x, y) in left.iter().zip(right) {
+                    assert_eq!((x.target, &x.refs), (y.target, &y.refs));
+                }
+            }
+        }
     }
 
     #[test]
