@@ -510,6 +510,31 @@ mod tests {
         }
     }
 
+    /// Lines of three templates that begin with the same stamp and pid, and hold an `id_` number.
+    fn stamped_lines() -> Vec<u8> {
+        let mut raw = Vec::new();
+        for i in 0..900u64 {
+            let (t, pid, id, host) = (i % 60, 100 + i * 13 % 37, 7919 * i % 1_000_003, i % 9);
+            let line = match i % 3 {
+                0 => format!("081109 2035{t:02} {pid} INFO Receiving block id_{id} src: /10.0.0.{host}:50010\n"),
+                1 => format!("081109 2035{t:02} {pid} INFO PacketResponder {host} for block id_{id} terminating\n"),
+                _ => format!("081109 2035{t:02} {pid} WARN Served block id_{id} to /10.0.0.{host}\n"),
+            };
+            raw.extend_from_slice(line.as_bytes());
+        }
+        raw
+    }
+
+    #[test]
+    fn a_word_at_a_cell_edge_needs_no_word_byte_beside_the_cell() {
+        let raw = stamped_lines();
+        let comp = assert_roundtrip(&raw, &PackOptions::default());
+        let recs = lines(&raw);
+        // `id_` ends in a word byte, so no id stands as a word.
+        assert!(assert_grep(&comp, &recs, &word("71271")).0.is_empty());
+        assert!(!assert_grep(&comp, &recs, &word("id_71271")).0.is_empty());
+    }
+
     #[test]
     fn a_time_range_prunes_blocks_of_a_field_copied_from_another() {
         // Most rows repeat the nested stamp at the top level, so the field is coded as a copy.

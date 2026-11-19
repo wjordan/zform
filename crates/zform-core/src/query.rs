@@ -847,6 +847,18 @@ impl NeedlePlan {
                         use_cols(&mut std::iter::once(c), !nested);
                     }
                     let n = s.literals.len();
+                    // A word found at a cell's edge stands only where the record has no word
+                    // byte beside that edge, and beside an empty literal between cells is another cell.
+                    for (i, l) in s.literals.iter().enumerate().filter(|_| word) {
+                        let inner = i > 0 && i + 1 < n;
+                        let edge = |b: Option<&u8>| b.map_or(inner, |&b| is_word(b));
+                        if i > 0 && edge(l.first()) {
+                            unscanned.push(s.slots[i - 1]);
+                        }
+                        if i + 1 < n && edge(l.last()) {
+                            unscanned.push(s.slots[i]);
+                        }
+                    }
                     let inner = s
                         .literals
                         .iter()
