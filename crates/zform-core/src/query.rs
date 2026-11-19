@@ -89,9 +89,13 @@ pub fn logical(lexeme: &[u8]) -> Cow<'_, [u8]> {
 /// Calls `f` with each value of `field` in `rec`, as the record writes it: the values at that
 /// path of a JSON record, or the value of that key of a logfmt line.
 pub fn raw_field_values(rec: &[u8], field: &str, f: &mut dyn FnMut(&[u8])) {
-    let target = field_target(field);
+    raw_values_at(rec, &field_target(field), f)
+}
+
+/// `raw_field_values` for a field as `field_target` spells it.
+fn raw_values_at(rec: &[u8], target: &[u8], f: &mut dyn FnMut(&[u8])) {
     let mut doc = JsonDoc::default();
-    if json_values_at(&mut doc, rec, &target, &mut |s, e| f(&rec[s..e])) {
+    if json_values_at(&mut doc, rec, target, &mut |s, e| f(&rec[s..e])) {
         return;
     }
     if let Some(pairs) = parse_logfmt_line(rec) {
@@ -198,18 +202,48 @@ impl<'a> Test<'a> {
 
 /// Evaluates `pred` on one record. A field test holds when any value of the field passes it.
 pub fn eval_raw_record(rec: &[u8], pred: &Predicate) -> bool {
-    match pred {
-        Predicate::All => true,
-        Predicate::Contains(needle) => memchr::memmem::find(rec, needle).is_some(),
-        Predicate::Word(needle) => found(&Finder::new(needle), needle.len(), true, rec),
-        Predicate::And(v) => v.iter().all(|p| eval_raw_record(rec, p)),
-        Predicate::Or(v) => v.iter().any(|p| eval_raw_record(rec, p)),
-        Predicate::Not(inner) => !eval_raw_record(rec, inner),
-        _ => {
-            let (field, test) = Test::of(pred).unwrap();
-            let mut hit = false;
-            raw_field_values(rec, field, &mut |v| hit = hit || test.ok(&logical(v)));
-            hit
+    RawTest::new(pred).holds(rec)
+}
+
+/// A predicate made ready to test many raw records: its searchers and field paths built once.
+pub(crate) enum RawTest<'p> {
+    All,
+    Text(Finder<'p>, bool),
+    Field(Vec<u8>, Test<'p>),
+    And(Vec<RawTest<'p>>),
+    Or(Vec<RawTest<'p>>),
+    Not(Box<RawTest<'p>>),
+}
+
+impl<'p> RawTest<'p> {
+    pub fn new(pred: &'p Predicate) -> Self {
+        let list = |v: &'p [Predicate]| v.iter().map(RawTest::new).collect();
+        match pred {
+            Predicate::All => RawTest::All,
+            Predicate::Contains(needle) => RawTest::Text(Finder::new(needle), false),
+            Predicate::Word(needle) => RawTest::Text(Finder::new(needle), true),
+            Predicate::And(v) => RawTest::And(list(v)),
+            Predicate::Or(v) => RawTest::Or(list(v)),
+            Predicate::Not(inner) => RawTest::Not(Box::new(RawTest::new(inner))),
+            _ => {
+                let (field, test) = Test::of(pred).unwrap();
+                RawTest::Field(field_target(field), test)
+            }
+        }
+    }
+
+    pub fn holds(&self, rec: &[u8]) -> bool {
+        match self {
+            RawTest::All => true,
+            RawTest::Text(f, word) => found(f, f.needle().len(), *word, rec),
+            RawTest::And(v) => v.iter().all(|t| t.holds(rec)),
+            RawTest::Or(v) => v.iter().any(|t| t.holds(rec)),
+            RawTest::Not(inner) => !inner.holds(rec),
+            RawTest::Field(target, test) => {
+                let mut hit = false;
+                raw_values_at(rec, target, &mut |v| hit = hit || test.ok(&logical(v)));
+                hit
+            }
         }
     }
 }

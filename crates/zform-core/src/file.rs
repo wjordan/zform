@@ -16,7 +16,7 @@ use crate::index::{
     page_filters, row_map_span, row_page,
 };
 use crate::query::{
-    BlockMeta, FieldEv, Need, Plans, Predicate, UNKNOWN, YES, eval, eval_raw_record, field_events,
+    BlockMeta, FieldEv, Need, Plans, Predicate, RawTest, UNKNOWN, YES, eval, field_events,
     filter_use, json_variant, may_match, needs, plain_may_contain, raw_field_values,
 };
 use crate::codecs::PoolParts;
@@ -1065,6 +1065,7 @@ impl<'f> Session<'f> {
         dir: &BlockDir,
     ) -> Result<Option<Vec<(u32, u32)>>> {
         let budget = &self.file.budget;
+        let test = RawTest::new(pred);
         let mut hits = Vec::<(u32, u32)>::new();
         let mut hit = |r: usize| match hits.last_mut() {
             Some(last) if last.1 as usize == r => last.1 += 1,
@@ -1081,7 +1082,7 @@ impl<'f> Session<'f> {
                 self.stats.blocks_verbatim += 1;
                 self.stats.rebuilt += spans.len();
                 for (r, &(s, t)) in spans.iter().enumerate() {
-                    if eval_raw_record(&raw[s as usize..t as usize], pred) {
+                    if test.holds(&raw[s as usize..t as usize]) {
                         hit(r);
                     }
                 }
@@ -1124,7 +1125,7 @@ impl<'f> Session<'f> {
                 rows.emit(&mut rec, budget)?;
                 self.stats.rebuilt += 1;
             }
-            if t == YES || (t == UNKNOWN && eval_raw_record(&rec, pred)) {
+            if t == YES || (t == UNKNOWN && test.holds(&rec)) {
                 hit(r);
             }
         }
