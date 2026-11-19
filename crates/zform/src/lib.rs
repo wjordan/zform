@@ -1731,6 +1731,13 @@ mod tests {
         drive(&mut cache, fetch, |c| ahead.load_dictionary(c)).unwrap();
         assert_eq!(ahead.dictionary().map(|d| d.id()), Some(dict.id()));
         assert_eq!(fetched.get().1, low);
+
+        // Reopened, it reads the same, and holds no dictionary until it has read one.
+        let copy = file.reopen();
+        assert!(copy.dictionary().is_none() && copy.rows() == 4000);
+        assert_eq!(copy.mem_bytes(), file.mem_bytes());
+        check(&mut copy.session(), &mut RangeCache::default());
+        assert!(copy.dictionary().is_some());
     }
 
     #[test]

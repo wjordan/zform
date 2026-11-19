@@ -330,10 +330,12 @@ impl RowSet {
 
 /// An open file: its root and models.
 pub struct File {
-    root: Root,
-    plans: Vec<ModelPlan>,
+    root: Arc<Root>,
+    plans: Arc<[ModelPlan]>,
     /// First row of each block, then the row count.
-    starts: Vec<u64>,
+    starts: Arc<[u64]>,
+    /// Length of the root as stored.
+    root_len: usize,
     budget: DecodeBudget,
     /// Query plans, shared by the file's sessions.
     query_plans: Arc<Mutex<Plans>>,
@@ -400,13 +402,34 @@ impl File {
         }
         starts.push(row);
         Ok(Step::Ready(File {
-            root,
-            plans,
-            starts,
+            root: Arc::new(root),
+            plans: plans.into(),
+            starts: starts.into(),
+            root_len: len as usize,
             budget,
             query_plans: Arc::default(),
             dict: OnceLock::new(),
         }))
+    }
+
+    /// The file as `open` gave it, without parsing its root again: a host that keeps an open
+    /// file hands each reader one of these. It shares neither the dictionary nor query plans.
+    pub fn reopen(&self) -> File {
+        File {
+            root: self.root.clone(),
+            plans: self.plans.clone(),
+            starts: self.starts.clone(),
+            root_len: self.root_len,
+            budget: self.budget.clone(),
+            query_plans: Arc::default(),
+            dict: OnceLock::new(),
+        }
+    }
+
+    /// About the memory the open file holds, less its dictionary and query plans: the root and
+    /// models as decoded, measured at 26 to 32 times the root as stored.
+    pub fn mem_bytes(&self) -> usize {
+        self.root_len * 32
     }
 
     /// The id of the dictionary the file's blocks were written with, if any. The first read of
