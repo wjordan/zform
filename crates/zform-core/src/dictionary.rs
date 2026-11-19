@@ -4,9 +4,11 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
+use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use zstd_safe::{CCtx, CParameter, DCtx, DictAttachPref, ResetDirective};
+use zstd_safe::zstd_sys as zs;
+use zstd_safe::{CCtx, CParameter, DCtx};
 
 use crate::container::PackOptions;
 use crate::grammar::{ModelPlan, split_records_with_plan};
@@ -23,7 +25,7 @@ const ID_SEED: u64 = 0x5a46_4d31;
 const ZSTD_DICT_MAGIC: [u8; 4] = 0xEC30_A437u32.to_le_bytes();
 /// The level the content itself is stored at: it is written once and read whole.
 const STORE_LEVEL: i32 = 16;
-/// Levels a dictionary keeps a compressor for.
+/// Levels a dictionary keeps its content digested at.
 const KEPT_LEVELS: usize = 2;
 /// The window the content is digested under, whatever leaf comes first. Above 14, so the lazy
 /// levels search it by rows rather than chains, which finds more of it; the window also caps the
@@ -32,13 +34,13 @@ const KEPT_LEVELS: usize = 2;
 const DIGEST_WINDOW_LOG: u32 = 17;
 
 pub struct Dictionary {
+    /// The content digested, by level. A writer prices leaves at one level and keeps them at
+    /// another, and digesting the content costs more than most leaves do. Declared first: a
+    /// digest refers to `bytes`, so it must be dropped before them.
+    digests: Mutex<Vec<(i32, Arc<Digest>)>>,
     bytes: Vec<u8>,
     /// Computed when first asked for: a writer's tables may still be encoding their wire.
     id: OnceLock<u64>,
-    /// Compressors that have digested the content, each with the level it did so at. A writer
-    /// prices leaves at one level and keeps them at another, and digesting the content costs
-    /// more than most leaves do.
-    enc: Mutex<Vec<(i32, CCtx<'static>)>>,
     tables: Option<Arc<Tables>>,
 }
 
@@ -54,7 +56,7 @@ impl Dictionary {
         if bytes.starts_with(&ZSTD_DICT_MAGIC) {
             bytes.insert(0, 0);
         }
-        Self { id: OnceLock::new(), bytes, enc: Mutex::new(Vec::new()), tables: None }
+        Self { digests: Mutex::default(), id: OnceLock::new(), bytes, tables: None }
     }
 
     /// This dictionary carrying `tables` too.
@@ -120,7 +122,7 @@ impl Dictionary {
             return Err(Error::Format("dictionary content reads as zstd tables".into()));
         }
         let id = OnceLock::from(id);
-        Ok(Self { bytes, id, enc: Mutex::new(Vec::new()), tables: tables.map(Arc::new) })
+        Ok(Self { digests: Mutex::default(), bytes, id, tables: tables.map(Arc::new) })
     }
 
     /// Compresses `src` into `dst` as a frame that decodes only against this dictionary.
@@ -128,37 +130,26 @@ impl Dictionary {
         if self.is_empty() {
             return None;
         }
-        let mut enc = self.enc.lock().unwrap();
-        let at = match enc.iter().position(|e| e.0 == level) {
-            Some(at) => at,
-            None => {
-                let mut ctx = CCtx::try_create()?;
-                // The tables hold a position per byte of content, so a value is found wherever
-                // it sits. Attached, they are searched in place: a leaf pays for its own bytes
-                // only. The binary tree of levels 13 and up holds half the positions its chain
-                // log spans, hence one more.
-                let log = self.len().max(2).ilog2().clamp(20, 29);
-                ctx.set_parameter(CParameter::CompressionLevel(level)).ok()?;
-                ctx.set_parameter(CParameter::ChecksumFlag(false)).ok()?;
-                ctx.set_parameter(CParameter::HashLog(log)).ok()?;
-                ctx.set_parameter(CParameter::ChainLog(log + 1)).ok()?;
-                ctx.set_parameter(CParameter::ForceAttachDict(DictAttachPref::ForceAttach)).ok()?;
-                ctx.load_dictionary(&self.bytes).ok()?;
-                // zstd digests the content at the first compression, under the window set then.
-                ctx.set_parameter(CParameter::WindowLog(DIGEST_WINDOW_LOG)).ok()?;
-                ctx.compress2(&mut [0u8; 64][..], &[0]).ok()?;
-                if enc.len() == KEPT_LEVELS {
-                    enc.remove(0);
+        let digest = {
+            let mut digests = self.digests.lock().unwrap();
+            match digests.iter().find(|d| d.0 == level) {
+                Some(d) => Arc::clone(&d.1),
+                None => {
+                    let d = Arc::new(Digest::new(&self.bytes, level)?);
+                    if digests.len() == KEPT_LEVELS {
+                        digests.remove(0);
+                    }
+                    digests.push((level, Arc::clone(&d)));
+                    d
                 }
-                enc.push((level, ctx));
-                enc.len() - 1
             }
         };
-        let ctx = &mut enc[at].1;
-        ctx.reset(ResetDirective::SessionOnly).ok()?;
-        // The content stays in reach only within a frame's first window.
-        ctx.set_parameter(CParameter::WindowLog(window_log(src.len()))).ok()?;
-        ctx.compress2(dst, src).ok()
+        COMPRESSOR.with_borrow_mut(|c| {
+            if c.is_none() {
+                *c = NonNull::new(unsafe { zs::ZSTD_createCCtx() }).map(Compressor);
+            }
+            c.as_ref()?.compress(&digest, dst, src, level)
+        })
     }
 
     /// Expands a frame `compress` wrote. The content is referred to, not copied.
@@ -179,8 +170,96 @@ fn content_id(bytes: &[u8], tables: Option<&Tables>) -> u64 {
     }
 }
 
+/// Whether a zstd call succeeded.
+fn zok(code: usize) -> Option<()> {
+    (unsafe { zs::ZSTD_isError(code) } == 0).then_some(())
+}
+
+/// Content digested at one level: tables that compressors on any thread search in place.
+struct Digest(NonNull<zs::ZSTD_CDict>);
+
+// zstd only reads a digest once it is made.
+unsafe impl Send for Digest {}
+unsafe impl Sync for Digest {}
+
+impl Digest {
+    /// `content` must outlive the digest, which refers to it.
+    fn new(content: &[u8], level: i32) -> Option<Self> {
+        use zs::ZSTD_cParameter::*;
+        // The tables hold a position per byte of content, so a value is found wherever it
+        // sits. Attached, they are searched in place: a leaf pays for its own bytes only. The
+        // binary tree of levels 13 and up holds half the positions its chain log spans, hence
+        // one more.
+        let log = content.len().max(2).ilog2().clamp(20, 29) as i32;
+        let params = [
+            (ZSTD_c_compressionLevel, level),
+            (ZSTD_c_hashLog, log),
+            (ZSTD_c_chainLog, log + 1),
+            (ZSTD_c_windowLog, DIGEST_WINDOW_LOG as i32),
+        ];
+        unsafe {
+            let p = NonNull::new(zs::ZSTD_createCCtxParams())?;
+            let made = params
+                .iter()
+                .all(|&(k, v)| zok(zs::ZSTD_CCtxParams_setParameter(p.as_ptr(), k, v)).is_some())
+                .then(|| {
+                    zs::ZSTD_createCDict_advanced2(
+                        content.as_ptr().cast(),
+                        content.len(),
+                        zs::ZSTD_dictLoadMethod_e::ZSTD_dlm_byRef,
+                        zs::ZSTD_dictContentType_e::ZSTD_dct_rawContent,
+                        p.as_ptr(),
+                        // No allocator of its own: zstd's.
+                        zs::ZSTD_customMem { customAlloc: None, customFree: None, opaque: std::ptr::null_mut() },
+                    )
+                });
+            zs::ZSTD_freeCCtxParams(p.as_ptr());
+            NonNull::new(made?).map(Self)
+        }
+    }
+}
+
+impl Drop for Digest {
+    fn drop(&mut self) {
+        unsafe { zs::ZSTD_freeCDict(self.0.as_ptr()) };
+    }
+}
+
+/// A thread's compressor for frames against a digest.
+struct Compressor(NonNull<zs::ZSTD_CCtx>);
+
+impl Compressor {
+    fn compress(&self, digest: &Digest, dst: &mut [u8], src: &[u8], level: i32) -> Option<usize> {
+        use zs::ZSTD_cParameter::*;
+        let c = self.0.as_ptr();
+        unsafe {
+            zok(zs::ZSTD_CCtx_reset(c, zs::ZSTD_ResetDirective::ZSTD_reset_session_and_parameters))?;
+            zok(zs::ZSTD_CCtx_setParameter(c, ZSTD_c_compressionLevel, level))?;
+            // A digest made with explicit parameters carries no level, so the frame would
+            // settle what the digest leaves open (block splitting) as for the default level.
+            let strategy = zs::ZSTD_getCParams(level, src.len() as u64, 0).strategy as i32;
+            zok(zs::ZSTD_CCtx_setParameter(c, ZSTD_c_strategy, strategy))?;
+            zok(zs::ZSTD_CCtx_setParameter(c, ZSTD_c_checksumFlag, 0))?;
+            // The content stays in reach only within a frame's first window.
+            zok(zs::ZSTD_CCtx_setParameter(c, ZSTD_c_windowLog, window_log(src.len()) as i32))?;
+            // `ZSTD_c_forceAttachDict`: the leaf searches the digest in place, never a copy.
+            zok(zs::ZSTD_CCtx_setParameter(c, ZSTD_c_experimentalParam4, 1))?;
+            zok(zs::ZSTD_CCtx_refCDict(c, digest.0.as_ptr()))?;
+            let n = zs::ZSTD_compress2(c, dst.as_mut_ptr().cast(), dst.len(), src.as_ptr().cast(), src.len());
+            zok(n).map(|_| n)
+        }
+    }
+}
+
+impl Drop for Compressor {
+    fn drop(&mut self) {
+        unsafe { zs::ZSTD_freeCCtx(self.0.as_ptr()) };
+    }
+}
+
 thread_local! {
     static CURRENT: RefCell<Option<Arc<Dictionary>>> = const { RefCell::new(None) };
+    static COMPRESSOR: RefCell<Option<Compressor>> = const { RefCell::new(None) };
 }
 
 /// While it lives, the column leaves this thread writes and reads are compressed against `dict`.
