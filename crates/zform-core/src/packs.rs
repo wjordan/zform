@@ -2304,19 +2304,20 @@ impl CodecPack for PythonMtPack {
         }
         // 1. Decimal `u32` draws (`>= 625` consecutive words).
         if n >= 625 && rows[0].len() <= 10 && rows[0].iter().all(|b| b.is_ascii_digit()) {
-            let mut words = Vec::with_capacity(n);
-            let mut ok = true;
-            for &r in rows {
-                if let Some(v) = ExactIntPack::parse_canonical_i64(r)
-                    && (0..=(u32::MAX as i64)).contains(&v)
-                {
-                    words.push(v as u32);
-                } else {
-                    ok = false;
-                    break;
-                }
-            }
-            if ok {
+            let word = |r: &&[u8]| {
+                ExactIntPack::parse_canonical_i64(r).and_then(|v| u32::try_from(v).ok())
+            };
+            // The first 624 words fix the stream: the next must follow before the column is read.
+            let follows = |w: &[u32]| {
+                let mut s = MtStream::after(&w[..MT_N]);
+                s.grow(MT_N + 1);
+                s.words[MT_N] == w[MT_N]
+            };
+            let head: Option<Vec<u32>> = rows[..=MT_N].iter().map(word).collect();
+            let words = head
+                .filter(|w| follows(w))
+                .and_then(|_| rows.iter().map(word).collect::<Option<Vec<u32>>>());
+            if let Some(words) = words {
                 let mut head624 = [0u32; MT_N];
                 for i in 0..MT_N {
                     head624[i] = mt_untemper(words[i]);
@@ -2337,7 +2338,11 @@ impl CodecPack for PythonMtPack {
 
         // 2. Fixed-width binary draws (`4..=64` bytes multiple of 4, `Le` or `Be`).
         let w = rows[0].len();
-        if (4..=64).contains(&w) && w.is_multiple_of(4) && rows.iter().all(|r| r.len() == w) {
+        // Draws are random bytes, and the search gives up on a column whose first 32 rows miss
+        // the stream 16 times: 32 rows of ASCII are text.
+        let text = rows.iter().take(32).all(|r| r.is_ascii());
+        if !text && (4..=64).contains(&w) && w.is_multiple_of(4) && rows.iter().all(|r| r.len() == w)
+        {
             let mut flat = Vec::with_capacity(n * w);
             for &r in rows {
                 flat.extend_from_slice(r);
