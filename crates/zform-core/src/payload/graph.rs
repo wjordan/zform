@@ -187,7 +187,7 @@ impl From<Invalid> for Error {
 
 /// Fast non-cryptographic 64-bit multiply-xor hasher (`FxHash`-style, 8B chunks) for encoder tables.
 #[derive(Default, Clone)]
-pub(crate) struct FastHasher(u64);
+pub struct FastHasher(u64);
 
 impl core::hash::Hasher for FastHasher {
     #[inline]

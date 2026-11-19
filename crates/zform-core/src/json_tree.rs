@@ -13,7 +13,7 @@ use crate::container::block_col;
 use crate::grammar::ModelPlan;
 use crate::lex::{escape_json_str_exact, unescape_json_str_exact};
 use crate::wire::{Cursor, DecodeBudget, EntropyBackend, Error, Result, put_bytes, put_uvarint};
-use std::collections::{HashMap, HashSet};
+use crate::payload::graph::{FastMap as HashMap, FastSet as HashSet};
 
 pub const J_NONE: u8 = 0;
 pub const J_OBJECT: u8 = 1;
@@ -767,7 +767,7 @@ impl JsonTreePlan {
         let trie = build_path_trie(&names);
         let mut shape_maps = Vec::with_capacity(self.paths.len());
         for p in &self.paths {
-            let mut m = HashMap::with_capacity(p.shapes.len());
+            let mut m = crate::payload::graph::fast_map_with_capacity(p.shapes.len());
             for (si, sh) in p.shapes.iter().enumerate() {
                 m.insert(encode_shape_match_key(sh), (si + 1) as u32);
             }
@@ -815,7 +815,7 @@ fn parse_path_step(p: &[u8], i: usize) -> Option<(Option<Vec<u8>>, usize)> {
 fn build_path_trie(paths: &[&[u8]]) -> Vec<PathTrieNode> {
     let mut nodes = vec![PathTrieNode {
         path_idx: -1,
-        kids: HashMap::new(),
+        kids: HashMap::default(),
         elem_node: -1,
     }];
     for (idx, &p) in paths.iter().enumerate() {
@@ -839,7 +839,7 @@ fn build_path_trie(paths: &[&[u8]]) -> Vec<PathTrieNode> {
                         let next = nodes.len();
                         nodes.push(PathTrieNode {
                             path_idx: -1,
-                            kids: HashMap::new(),
+                            kids: HashMap::default(),
                             elem_node: -1,
                         });
                         nodes[cur].kids.insert(key, next);
@@ -853,7 +853,7 @@ fn build_path_trie(paths: &[&[u8]]) -> Vec<PathTrieNode> {
                         let next = nodes.len();
                         nodes.push(PathTrieNode {
                             path_idx: -1,
-                            kids: HashMap::new(),
+                            kids: HashMap::default(),
                             elem_node: -1,
                         });
                         nodes[cur].elem_node = next as i32;
@@ -2475,7 +2475,7 @@ pub(crate) fn train_observed_json(
     // A scalar key that varies under one parent varies under every parent: the sample may have
     // missed the rare value here, and a value baked into a layout costs an opaque row later.
     let scalar = |tp: &TPath| tp.kinds[J_OBJECT as usize] == 0 && tp.kinds[J_ARRAY as usize] == 0;
-    let mut varying: HashSet<&[u8]> = HashSet::new();
+    let mut varying: HashSet<&[u8]> = HashSet::default();
     for tp in &tr.paths {
         for (key, &c) in &tp.kids {
             if tr.paths[c].varies && scalar(&tr.paths[c]) {
@@ -2527,7 +2527,7 @@ pub(crate) fn train_observed_json(
         let prov_trie = build_path_trie(&name_refs);
 
         // Census shape occurrences for every `ROLE_TABLED` path
-        let mut census: Vec<HashMap<Vec<u8>, u32>> = vec![HashMap::new(); tr.paths.len()];
+        let mut census: Vec<HashMap<Vec<u8>, u32>> = vec![HashMap::default(); tr.paths.len()];
         for &row in json_rows {
             if doc.parse_root_object(row) {
                 census_node(
@@ -2600,7 +2600,7 @@ pub(crate) fn train_observed_json(
     };
 
     // Map kept `TPath` indices -> `0..kept_order.len()` in `JsonTreePlan::paths`
-    let mut tp_to_plan: HashMap<usize, u16> = HashMap::with_capacity(kept_order.len());
+    let mut tp_to_plan: HashMap<usize, u16> = crate::payload::graph::fast_map_with_capacity(kept_order.len());
     for (pi, &tpi) in kept_order.iter().enumerate() {
         tp_to_plan.insert(tpi, pi as u16);
     }
@@ -3214,8 +3214,8 @@ fn discover_json_derivations(json_rows: &[&[u8]], jt: &mut JsonTreePlan) {
 /// in scope, templates over values in scope (also under Base64), and templates that differ
 /// between two values in one literal only, with the part that differs left free.
 fn propose_cands(list: &[ScopeOcc<'_>], own: usize, tmp: &mut Vec<u8>) -> Vec<JsonCand> {
-    let mut counts: HashMap<JsonCand, usize> = HashMap::new();
-    let mut by_refs: HashMap<Vec<u16>, Vec<Vec<Vec<u8>>>> = HashMap::new();
+    let mut counts: HashMap<JsonCand, usize> = HashMap::default();
+    let mut by_refs: HashMap<Vec<u16>, Vec<Vec<Vec<u8>>>> = HashMap::default();
     let mut add = |c: JsonCand| *counts.entry(c).or_insert(0) += 1;
     for oc in list {
         // A `null`, `true` or `false` costs its column next to nothing.
@@ -3520,7 +3520,7 @@ fn discover_nested_json_strings(
     model_plan: &mut crate::grammar::ModelPlan,
 ) {
     let mut doc = JsonDoc::default();
-    let mut string_samples: HashMap<u16, Vec<Vec<u8>>> = HashMap::new();
+    let mut string_samples: HashMap<u16, Vec<Vec<u8>>> = HashMap::default();
 
     for &row in json_rows.iter().step_by(json_rows.len().div_ceil(512).max(1)) {
         if !doc.parse_root_object(row) {
