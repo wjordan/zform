@@ -280,6 +280,17 @@ pub struct FrameFit {
     pub residual_bytes: usize,
 }
 
+impl FrameFit {
+    fn plus(self, o: &Self) -> Self {
+        Self {
+            rows: self.rows + o.rows,
+            bytes: self.bytes + o.bytes,
+            residual_rows: self.residual_rows + o.residual_rows,
+            residual_bytes: self.residual_bytes + o.residual_bytes,
+        }
+    }
+}
+
 /// About 256 KiB of `samples`: a layout of a few percent there still clears the trainer's floor.
 fn keep_rows(samples: &[&[u8]]) -> Vec<Vec<u8>> {
     sample_strided(samples, 4096, 256 << 10)
@@ -2260,6 +2271,137 @@ pub fn pack_stream<R: Read, W: Write>(reader: R, mut writer: W, opts: &PackOptio
     })
 }
 
+/// Frames encoding `threads` at a time on threads of their own, written in order, for a
+/// writer handed one chunk at a time. The bytes match [`StreamEncoder::encode_framed`]'s, as
+/// [`pack_stream`]'s do.
+pub(crate) struct FrameQueue {
+    opts: Arc<PackOptions>,
+    pool: Pool,
+    fl: Inflight<(FrameTask, EncodedFrame)>,
+    plan: Option<Arc<ModelPlan>>,
+    group: Option<Arc<Link>>,
+    /// Of the frames written since it was last taken.
+    fit: Option<FrameFit>,
+}
+
+impl FrameQueue {
+    pub(crate) fn new(opts: &PackOptions) -> Self {
+        Self {
+            opts: Arc::new(opts.clone()),
+            pool: Pool::new(opts.threads),
+            fl: Inflight::new(),
+            plan: None,
+            group: None,
+            fit: None,
+        }
+    }
+
+    /// Queues `raw`, one chunk, behind the ones before it, and writes those that are done.
+    pub(crate) fn push<W: Write>(
+        &mut self,
+        enc: &mut StreamEncoder,
+        raw: Vec<u8>,
+        out: &mut W,
+    ) -> Result<()> {
+        let fc = split_chunk(&raw, enc.opts.framing);
+        let task = enc.decide(&fc);
+        if task.plan_changed || self.plan.is_none() {
+            self.plan = enc.active_plan.clone().map(Arc::new);
+        }
+        let (wait, publish) = if task.passthrough {
+            (None, None)
+        } else if task.reuse {
+            (self.group.clone(), None)
+        } else {
+            let next = Arc::new(Link::default());
+            self.group = Some(Arc::clone(&next));
+            (None, Some(next))
+        };
+        // A small frame may fall back to passthrough, which changes the next frame's kind.
+        let small = !task.passthrough && raw.len() <= SMALL_FRAME;
+        let (framing, prefix, suffix, spans) =
+            (fc.framing, fc.prefix.to_vec(), fc.suffix.to_vec(), fc.spans);
+        let c = OwnedChunk { framing, prefix, suffix, spans, raw };
+        let (opts, plan) = (Arc::clone(&self.opts), self.plan.clone());
+        self.fl.spawn_on(&self.pool, move || {
+            let (mut plan, mut seeds) = (plan, Seeds::default());
+            if let Some(l) = wait {
+                let (p, sd) = l.get();
+                (plan, seeds) = (Some(p), sd);
+            }
+            let frame = encode_task(&opts, &task, &c.view(), plan.as_deref(), &mut seeds);
+            if let Some(l) = publish {
+                let p = frame.plan.clone().map(Arc::new).or(plan);
+                l.set(p.expect("a structural frame has a model"), seeds);
+            }
+            (task, frame)
+        });
+        // The dictionary frame is stored while the first frame encodes.
+        enc.start(&mut *out)?;
+        loop {
+            self.fl.poll(false);
+            self.write(enc, out)?;
+            let (queued, threads) = (self.fl.queue.len(), self.opts.threads);
+            if queued == 0 || self.fl.running < threads && queued < 2 * threads && !small {
+                return Ok(());
+            }
+            self.fl.poll(true);
+        }
+    }
+
+    /// Writes every queued frame.
+    pub(crate) fn drain<W: Write>(&mut self, enc: &mut StreamEncoder, out: &mut W) -> Result<()> {
+        while !self.fl.queue.is_empty() {
+            self.fl.poll(true);
+            self.write(enc, out)?;
+        }
+        Ok(())
+    }
+
+    /// `fit` with that of the frames written since this was last called.
+    pub(crate) fn take_fit(&mut self, fit: Option<FrameFit>) -> Option<FrameFit> {
+        match (fit, self.fit.take()) {
+            (Some(a), Some(b)) => Some(a.plus(&b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    fn write<W: Write>(&mut self, enc: &mut StreamEncoder, out: &mut W) -> Result<()> {
+        while let Some((task, mut frame)) = self.fl.pop() {
+            if let Some(p) = frame.plan.take() {
+                enc.active_plan = Some(p);
+            }
+            let f = enc.emit(&task, frame, &mut *out)?;
+            self.fit = Some(self.fit.take().unwrap_or_default().plus(&f));
+        }
+        Ok(())
+    }
+}
+
+/// Threads that run jobs until the pool is dropped, so what a thread keeps between jobs,
+/// such as its compressors, is made once.
+struct Pool(mpsc::Sender<Box<dyn FnOnce() + Send>>);
+
+impl Pool {
+    fn new(threads: usize) -> Self {
+        let (tx, rx) = mpsc::channel::<Box<dyn FnOnce() + Send>>();
+        let rx = Arc::new(Mutex::new(rx));
+        for _ in 0..threads {
+            let rx = Arc::clone(&rx);
+            std::thread::spawn(move || {
+                loop {
+                    // The guard goes at the end of the statement, before the job runs.
+                    let Ok(job) = rx.lock().unwrap().recv() else {
+                        return;
+                    };
+                    job();
+                }
+            });
+        }
+        Self(tx)
+    }
+}
+
 /// Jobs in stream order from `written`, each with its result once done.
 struct Inflight<T> {
     queue: VecDeque<Option<T>>,
@@ -2286,13 +2428,25 @@ impl<T: Send> Inflight<T> {
     where
         T: 's,
     {
+        s.spawn(self.job(f));
+    }
+
+    /// Queues `f`, run on a thread of `pool`.
+    fn spawn_on(&mut self, pool: &Pool, f: impl FnOnce() -> T + Send + 'static)
+    where
+        T: 'static,
+    {
+        let _ = pool.0.send(Box::new(self.job(f)));
+    }
+
+    fn job<F: FnOnce() -> T + Send>(&mut self, f: F) -> impl FnOnce() + Send + use<F, T> {
         let (seq, tx) = (self.written + self.queue.len(), self.tx.clone());
-        s.spawn(move || {
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-            let _ = tx.send((seq, r));
-        });
         self.queue.push_back(None);
         self.running += 1;
+        move || {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            let _ = tx.send((seq, r));
+        }
     }
 
     /// Queues a job that is already done.

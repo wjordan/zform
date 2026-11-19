@@ -1577,6 +1577,35 @@ mod tests {
     }
 
     #[test]
+    fn writer_threads_write_the_serial_bytes() {
+        let (_, rows) = shared_texts(12_000);
+        let recs: Vec<&[u8]> = rows.iter().map(|r| r.as_bytes()).collect();
+        let profile = train(rows.join("\n").as_bytes(), &TrainOptions::default(), None).unwrap();
+        let mut opts = PackOptions {
+            // Blocks past the size that may fall back to passthrough, then a short one.
+            block_rows: 5000,
+            profile: Some(profile),
+            ..Default::default()
+        };
+        let mut builder = DictionaryBuilder::new(&opts, 1 << 20).unwrap();
+        recs.iter().for_each(|r| builder.push(r));
+        opts.dictionary = Some(std::sync::Arc::new(builder.finish().unwrap()));
+        let write = |threads| {
+            let mut w = Writer::new(Vec::new(), PackOptions { threads, ..opts.clone() });
+            let mut rows = 0;
+            for r in &recs {
+                rows += w.push(r).unwrap().map_or(0, |f| f.rows);
+            }
+            rows += w.cut().unwrap().map_or(0, |f| f.rows);
+            let (data, index) = w.finish().unwrap();
+            (data, index, rows)
+        };
+        let serial = write(1);
+        assert_eq!(serial.2, recs.len());
+        assert!(write(3) == serial);
+    }
+
+    #[test]
     fn file_dictionary_holds_what_blocks_share() {
         let (texts, rows) = shared_texts(4000);
         let recs: Vec<&[u8]> = rows.iter().map(|r| r.as_bytes()).collect();

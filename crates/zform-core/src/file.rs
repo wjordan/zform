@@ -6,7 +6,7 @@
 
 use crate::dictionary::{Dictionary, Scope};
 use crate::container::{
-    BlockParts, BlockRows, FrameFit, PackOptions, StreamEncoder, Structure,
+    BlockParts, BlockRows, FrameFit, FrameQueue, PackOptions, StreamEncoder, Structure,
     decode_single_block_records, sort_records,
 };
 use crate::framing::{FramingSpec, split_passthrough};
@@ -1530,17 +1530,21 @@ pub struct Writer<W: Write> {
     block_rows: usize,
     block_bytes: usize,
     rows: u64,
+    /// Blocks encoding on other threads, with more than one of `opts.threads`.
+    queue: Option<FrameQueue>,
 }
 
 impl<W: Write> Writer<W> {
     /// `opts.framing`, `opts.chunk_bytes` and `opts.sync_interval_frames` are not used: records
     /// arrive already split, a frame is one block, and a model is written when it changes.
+    /// Blocks encode `opts.threads` at a time; the bytes are the same for any number.
     pub fn new(out: W, mut opts: PackOptions) -> Self {
         opts.framing = FramingSpec::LengthU32Le;
         opts.index = true;
         opts.sync_interval_frames = usize::MAX;
         let (block_rows, block_bytes) = (opts.block_rows.max(1), opts.block_bytes.max(1));
         Self {
+            queue: (opts.threads > 1).then(|| FrameQueue::new(&opts)),
             enc: StreamEncoder::new(opts),
             out,
             buf: Vec::new(),
@@ -1573,14 +1577,15 @@ impl<W: Write> Writer<W> {
         self.enc.active_plan()
     }
 
-    /// Adds a record. Returns the fit of a block this completed.
+    /// Adds a record. Returns the fit of the blocks written meanwhile: on more than one thread,
+    /// a block may be written some calls after it is completed.
     pub fn push(&mut self, rec: &[u8]) -> Result<Option<FrameFit>> {
         if rec.len() > u32::MAX as usize {
             return Err(Error::InvalidArgument("record longer than 4 GiB".into()));
         }
         let full = self.buf_rows == self.block_rows
             || (self.buf_rows > 0 && self.buf_bytes + rec.len() > self.block_bytes);
-        let fit = if full { self.cut()? } else { None };
+        let fit = if full { self.end_block()? } else { None };
         self.buf
             .extend_from_slice(&(rec.len() as u32).to_le_bytes());
         self.buf.extend_from_slice(rec);
@@ -1590,15 +1595,36 @@ impl<W: Write> Writer<W> {
         Ok(fit)
     }
 
-    /// Ends the open block, if it has rows, and returns its fit.
+    /// Ends the open block, if it has rows, and writes every block. Returns the fit of the
+    /// blocks written meanwhile.
     pub fn cut(&mut self) -> Result<Option<FrameFit>> {
+        let fit = self.end_block()?;
+        let Some(q) = &mut self.queue else {
+            return Ok(fit);
+        };
+        q.drain(&mut self.enc, &mut self.out)?;
+        Ok(q.take_fit(fit))
+    }
+
+    fn end_block(&mut self) -> Result<Option<FrameFit>> {
         if self.buf_rows == 0 {
             return Ok(None);
         }
-        let fit = self.enc.encode_frame(&self.buf, &mut self.out)?;
-        self.buf.clear();
+        let fit = match &mut self.queue {
+            None => {
+                let fit = self.enc.encode_frame(&self.buf, &mut self.out)?;
+                self.buf.clear();
+                Some(fit)
+            }
+            Some(q) => {
+                let cap = self.buf.capacity();
+                let raw = std::mem::replace(&mut self.buf, Vec::with_capacity(cap));
+                q.push(&mut self.enc, raw, &mut self.out)?;
+                q.take_fit(None)
+            }
+        };
         (self.buf_rows, self.buf_bytes) = (0, 0);
-        Ok(Some(fit))
+        Ok(fit)
     }
 
     /// Ends the file: returns the sink and the index region.
