@@ -536,6 +536,33 @@ mod tests {
     }
 
     #[test]
+    fn needles_across_shape_text_and_cells_rebuild_no_record() {
+        let raw = stamped_lines();
+        let comp = assert_roundtrip(&raw, &PackOptions::default());
+        let recs = lines(&raw);
+        // Into a cell from the text before it, out of one into the text after, and over whole cells.
+        for (needle, hits) in [
+            ("block id_7127", true),
+            ("71271 src: /10.0", true),
+            ("id_7919 terminating", true),
+            ("block id_15838 to /10.0.0.2", true),
+            ("id_71271 to", false),
+            ("id_7919 term1", false),
+        ] {
+            let (rows, stats) = assert_grep(&comp, &recs, &contains(needle));
+            assert_eq!(!rows.is_empty(), hits, "{needle}");
+            assert_eq!(stats.rebuilt, 0, "{needle}");
+        }
+        // Pieces of records from anywhere in them find the rows a scan of the records does.
+        for i in 0..300usize {
+            let rec = recs[i * 7 % recs.len()];
+            let (at, len) = (i * 11 % (rec.len() - 2), 2 + i % 23);
+            let piece = &rec[at..rec.len().min(at + len)];
+            assert_grep(&comp, &recs, &Predicate::Contains(piece.to_vec()));
+        }
+    }
+
+    #[test]
     fn needles_in_columns_several_shapes_share_rebuild_no_record() {
         let raw = stamped_lines();
         let comp = assert_roundtrip(&raw, &PackOptions::default());

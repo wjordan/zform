@@ -6,7 +6,7 @@
 use crate::cells::{Col, NOT_HELD, NULL_CELL, underflow};
 use crate::codecs::{ANY_LETTERS, ColSummary, ESCAPES, letters_of};
 use crate::container::BlockRows;
-use crate::grammar::{ModelPlan, PlanVariant, parse_logfmt_line};
+use crate::grammar::{ModelPlan, PlanVariant, Shape, parse_logfmt_line};
 use crate::index::{
     BlockDir, Filter, KIND_JSON, KIND_RESIDUAL, KIND_SHAPE, KIND_SHAPE_CELL, needle_tokens,
 };
@@ -586,10 +586,96 @@ enum VarNeedle {
     Unknown,
     /// The needle is in the row exactly when it is in one of the row's cells.
     Scan,
+    /// As `Scan`, or when the row's cells pass one of the variant's `crossings`.
+    Cross,
+}
+
+/// Where a part of the needle lies in a cell: at its end, as all of it, or at its start.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Lie {
+    End,
+    Whole,
+    Start,
+}
+
+/// The cell of a shape's slot `slot` holds `needle[from..to]` as `lie` says.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct CellTest {
+    slot: usize,
+    lie: Lie,
+    from: usize,
+    to: usize,
+}
+
+/// The ways `needle` can lie in a shape's records outside any one literal or cell, each as what
+/// the cells it reaches must hold. `None` when there are more than a few, as between cells with
+/// no text between them.
+fn crossings(s: &Shape, needle: &[u8]) -> Option<Vec<Vec<CellTest>>> {
+    const MOST: usize = 8;
+    struct Walk<'a> {
+        s: &'a Shape,
+        needle: &'a [u8],
+        tests: Vec<CellTest>,
+        out: Vec<Vec<CellTest>>,
+    }
+    impl Walk<'_> {
+        /// The needle goes on from its byte `pos` at the start of literal `i`.
+        fn literal(&mut self, i: usize, pos: usize) {
+            let (l, rest) = (&self.s.literals[i], &self.needle[pos..]);
+            if rest.len() <= l.len() {
+                if l.starts_with(rest) {
+                    self.out.push(self.tests.clone());
+                }
+            } else if rest.starts_with(l) && i < self.s.slots.len() {
+                self.cell(i, pos + l.len());
+            }
+        }
+
+        /// The needle goes on from its byte `pos` at the start of the cell of slot `slot`.
+        fn cell(&mut self, slot: usize, pos: usize) {
+            let n = self.needle.len();
+            let test = |lie, to| CellTest { slot, lie, from: pos, to };
+            self.tests.push(test(Lie::Start, n));
+            self.out.push(self.tests.clone());
+            for to in pos..n {
+                if self.out.len() > MOST {
+                    break;
+                }
+                *self.tests.last_mut().unwrap() = test(Lie::Whole, to);
+                self.literal(slot + 1, to);
+            }
+            self.tests.pop();
+        }
+    }
+    let n = needle.len();
+    let mut w = Walk { s, needle, tests: Vec::new(), out: Vec::new() };
+    for slot in 0..s.slots.len() {
+        // It starts in the literal before the cell, or in the cell.
+        let l = &s.literals[slot];
+        for m in 1..=l.len().min(n - 1) {
+            if l.ends_with(&needle[..m]) {
+                w.cell(slot, m);
+            }
+        }
+        for to in 1..n {
+            if w.out.len() > MOST {
+                return None;
+            }
+            w.tests.push(CellTest { slot, lie: Lie::End, from: 0, to });
+            w.literal(slot + 1, to);
+            w.tests.pop();
+        }
+    }
+    (w.out.len() <= MOST).then_some(w.out)
 }
 
 pub(crate) struct NeedlePlan {
     vars: Vec<VarNeedle>,
+    /// By variant that is `Cross`: its `crossings`.
+    cross: Vec<Vec<Vec<CellTest>>>,
+    /// The columns `cross` tests, and the `KIND_*` bits of its variants.
+    cross_cols: Vec<usize>,
+    cross_kinds: u16,
     /// `KIND_*` bits of the variants that are `Unknown`.
     unknown_kinds: u16,
     /// By column: its cells appear in records verbatim and one variant alone writes it.
@@ -840,6 +926,7 @@ impl NeedlePlan {
             }
         };
         let mut vars = Vec::with_capacity(plan.variants.len());
+        let mut cross = vec![Vec::new(); plan.variants.len()];
         let mut unknown_kinds = 0u16;
         let mut derived = None;
         let mut unscanned = Vec::new();
@@ -878,7 +965,13 @@ impl NeedlePlan {
                     } else if s.literals.iter().any(|l| has(l) || !joins(l))
                         || literals_can_overlap_needle(inner.map(|(_, l)| l.as_slice()), needle)
                     {
-                        VarNeedle::Unknown
+                        match crossings(s, needle).filter(|_| !word) {
+                            Some(ways) => {
+                                cross[vi] = ways;
+                                VarNeedle::Cross
+                            }
+                            None => VarNeedle::Unknown,
+                        }
                     } else {
                         VarNeedle::Scan
                     };
@@ -1040,15 +1133,31 @@ impl NeedlePlan {
             };
             if bad && vars[vi] != VarNeedle::AllTrue {
                 vars[vi] = VarNeedle::Unknown;
+                cross[vi].clear();
                 unknown_kinds |= kind;
             }
         }
+        let (mut cross_cols, mut cross_kinds) = (Vec::new(), 0u16);
+        for (vi, v) in plan.variants.iter().enumerate() {
+            if let (VarNeedle::Cross, PlanVariant::Shape(s)) = (vars[vi], v) {
+                cross_cols.extend(cross[vi].iter().flatten().map(|t| s.slots[t.slot] as usize));
+                cross_kinds |= if vi == 0 { KIND_RESIDUAL } else { KIND_SHAPE };
+            }
+        }
+        cross_cols.sort_unstable();
+        cross_cols.dedup();
         let all_true = vars.contains(&VarNeedle::AllTrue);
         let derived_open = if derived.is_some() { KIND_JSON } else { 0 };
         NeedlePlan {
             vars,
+            cross,
+            cross_cols,
+            cross_kinds,
             unknown_kinds,
-            open_kinds: unknown_kinds | derived_open | if all_true { KIND_SHAPE } else { 0 },
+            open_kinds: unknown_kinds
+                | cross_kinds
+                | derived_open
+                | if all_true { KIND_SHAPE } else { 0 },
             scan_cols,
             letters: letters_of(needle),
             finder: finder.into_owned(),
@@ -1253,10 +1362,17 @@ pub(crate) fn needs(pred: &Predicate, m: &BlockMeta<'_>, plans: &mut Plans, need
                 (need.cols[c], want[c]) = (true, !m.dir.col(c).summary.per_row);
                 pooled |= m.dir.col(c).deps.pool;
             }
+            // A cell the needle lies across may hold none of its tokens.
+            let mut across = false;
+            for &c in np.cross_cols.iter().filter(|_| m.kinds & np.cross_kinds != 0) {
+                let col = m.dir.col(c);
+                need.cols[c] |= !col.summary.all_null;
+                across |= !col.summary.all_null && col.deps.pool;
+            }
             // The pages whose filters hold every token of the needle.
-            if pooled && let Some(pages) = &mut need.pages {
+            if (pooled || across) && let Some(pages) = &mut need.pages {
                 let word = matches!(pred, Predicate::Word(_));
-                match needle_tokens(needle, word) {
+                match needle_tokens(needle, word).filter(|_| !across) {
                     Some(ts) => pages
                         .iter_mut()
                         .zip(m.pages)
@@ -1557,7 +1673,7 @@ fn eval_contains(
         .map(|&v| match np.vars[v as usize] {
             VarNeedle::AllTrue => YES,
             VarNeedle::Unknown => UNKNOWN,
-            VarNeedle::Scan => NO,
+            VarNeedle::Scan | VarNeedle::Cross => NO,
         })
         .collect();
     // By candidate column with a cell that holds the needle: those cells.
@@ -1593,6 +1709,9 @@ fn eval_contains(
             occs.iter()
                 .for_each(|&occ| tri[at[occ as usize] as usize] = YES);
         }
+    }
+    if m.kinds & np.cross_kinds != 0 {
+        cross_rows(&np, m, rows, &mut tri, budget)?;
     }
     // Only rows no cell has settled need the walk.
     let walked = match &np.derived {
@@ -1653,6 +1772,85 @@ fn eval_contains(
         }
     }
     Ok(tri)
+}
+
+/// Sets `YES` for the rows of `Cross` variants whose cells pass one of their crossings.
+fn cross_rows(
+    np: &NeedlePlan,
+    m: &BlockMeta<'_>,
+    rows: &mut BlockRows<'_>,
+    tri: &mut [u8],
+    budget: &DecodeBudget,
+) -> Result<()> {
+    let (plan, needle) = (m.plan, np.finder.needle());
+    let variant_ids = rows.variant_ids.clone();
+    // By row of a `Cross` variant: the crossings no cell has ruled out yet, as bits.
+    let mut open = Vec::new();
+    let mut scratch = Vec::new();
+    for &c in np.cross_cols.iter().filter(|&&c| !m.dir.col(c).summary.all_null) {
+        if open.is_empty() {
+            open = variant_ids
+                .iter()
+                .zip(tri.iter())
+                .map(|(&v, &t)| match t {
+                    NO => (1u16 << np.cross[v as usize].len()) - 1,
+                    _ => 0,
+                })
+                .collect();
+        }
+        // By variant: how many cells of the column a row has, and the tests on them as
+        // (crossing, cell of the row, test).
+        let per_variant: Vec<(usize, Vec<(usize, usize, CellTest)>)> = plan
+            .variants
+            .iter()
+            .enumerate()
+            .map(|(vi, v)| {
+                let PlanVariant::Shape(s) = v else {
+                    return (0, Vec::new());
+                };
+                let nth = |slot: usize| s.slots[..slot].iter().filter(|&&x| x as usize == c).count();
+                let tests = np.cross[vi]
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(w, way)| way.iter().map(move |&t| (w, t)))
+                    .filter(|(_, t)| s.slots[t.slot] as usize == c)
+                    .map(|(w, t)| (w, nth(t.slot), t))
+                    .collect();
+                (nth(s.slots.len()), tests)
+            })
+            .collect();
+        let col = rows.col(c, budget)?;
+        let mut at = 0;
+        for (r, &v) in variant_ids.iter().enumerate() {
+            let (cells, tests) = &per_variant[v as usize];
+            for &(w, nth, t) in tests {
+                if open[r] & (1 << w) == 0 {
+                    continue;
+                }
+                let cell = col.get(at + nth, &mut scratch)?;
+                let part = &needle[t.from..t.to];
+                let holds = match t.lie {
+                    Lie::End => cell.ends_with(part),
+                    Lie::Whole => cell == part,
+                    Lie::Start => cell.starts_with(part),
+                };
+                if !holds {
+                    open[r] &= !(1 << w);
+                }
+            }
+            at += cells;
+        }
+        if at != col.len() {
+            return Err(Error::Format(
+                "column occurrences do not match the row structure".into(),
+            ));
+        }
+    }
+    tri.iter_mut()
+        .zip(&open)
+        .filter(|(_, o)| **o != 0)
+        .for_each(|(t, _)| *t = YES);
+    Ok(())
 }
 
 /// Appends the text a Base64 candidate's value encodes.
@@ -2085,6 +2283,30 @@ mod tests {
             b"plain text",
             &Predicate::FieldExists("a".into())
         ));
+    }
+
+    #[test]
+    fn crossings_say_what_each_cell_must_hold() {
+        let shape = |lits: &[&str], slots: &[u16]| Shape {
+            literals: lits.iter().map(|l| l.as_bytes().to_vec()).collect(),
+            slots: slots.to_vec(),
+        };
+        let t = |slot, lie, from, to| CellTest { slot, lie, from, to };
+        let s = shape(&["block id_", " src: /", ""], &[0, 1]);
+        assert_eq!(crossings(&s, b"id_71"), Some(vec![vec![t(0, Lie::Start, 3, 5)]]));
+        assert_eq!(crossings(&s, b"71 src"), Some(vec![vec![t(0, Lie::End, 0, 2)]]));
+        // A cell may hold any text, the next literal's included.
+        assert_eq!(
+            crossings(&s, b"id_7 src: /10"),
+            Some(vec![
+                vec![t(0, Lie::Start, 3, 13)],
+                vec![t(0, Lie::Whole, 3, 4), t(1, Lie::Start, 11, 13)],
+                vec![t(0, Lie::End, 0, 4), t(1, Lie::Start, 11, 13)],
+            ])
+        );
+        assert_eq!(crossings(&s, b"zzz"), Some(Vec::new()));
+        // Cells with no text between them split a needle anywhere.
+        assert_eq!(crossings(&shape(&["", "", ""], &[0, 1]), b"0123456789"), None);
     }
 
     #[test]

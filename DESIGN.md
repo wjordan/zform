@@ -290,7 +290,8 @@ yields its values in order.
 
 A block containing rows outside the JSON tree, such as templates or verbatim records, is read
 whole for field predicates. Predicates on whole objects or arrays rebuild the tested rows.
-A substring or word in a shape's constant text also requires rebuilding rows of that shape.
+A substring that reaches from a shape's constant text into its cells is tested on those cells;
+a word there, or a substring with more than eight such placements, rebuilds rows of that shape.
 JSON records with leading whitespace are stored verbatim and are rebuilt for queries.
 
 One query keeps its decoded column state in a session. A `File` shares its models, query-plan
