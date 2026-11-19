@@ -354,6 +354,16 @@ pub fn root_offset(index: &[u8]) -> Result<u64> {
     Ok(locate_root(&index[tail..], index.len() as u64)?.0)
 }
 
+/// Where the directory pages start in an index region. Every read of rows takes the root and
+/// a directory page, so a host can keep both apart from the filter pages before them.
+pub fn directories_offset(index: &[u8]) -> Result<u64> {
+    let off = root_offset(index)?;
+    let (_, len, crc) = locate_root(&index[index.len() - INDEX_TAIL_LEN..], index.len() as u64)?;
+    let root = &index[off as usize..(off + len) as usize];
+    let root = Root::decode(root, crc, &DecodeBudget::default())?;
+    Ok(root.blocks.first().map_or(off, |b| b.dir_off.min(off)))
+}
+
 impl File {
     /// Opens the file whose index region is `index_len` bytes long.
     pub fn open(src: &dyn Source, index_len: u64, budget: DecodeBudget) -> Result<Step<File>> {

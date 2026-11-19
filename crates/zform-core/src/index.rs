@@ -1115,6 +1115,7 @@ mod tests {
         assert_eq!(&region[a.pages_off as usize..][..5], &[2u8; 5]);
         assert_eq!(&region[b.filter_off as usize..][..16], &[1u8; 16]);
         assert_eq!(&region[a.dir_off as usize..][..page.len()], &page[..]);
+        assert_eq!(crate::file::directories_offset(&region).unwrap(), a.dir_off);
         assert!(locate_root(&region[region.len() - INDEX_TAIL_LEN..], len + 1).is_err());
     }
 }
