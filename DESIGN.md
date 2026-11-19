@@ -236,7 +236,7 @@ gain grows with the run: 6%, 8% and 10% for runs of 32, 64 and 128 MiB.
   They sit together before the root, and every query reads the ones for the blocks it may
   touch.
 - **Filter pages**, one per block, hold a bit filter over the letter runs of its records, case
-  kept: each run of 3 to 7 letters, and each 8 letters of a longer run. A needle prunes a block
+  kept: each run of 3 or 4 letters, and each 5 letters of a longer run. A needle prunes a block
   when one of its own runs is missing. A query fetches a block's filter only when the filter is
   smaller than the parts it might save.
 
@@ -276,7 +276,7 @@ for the whole line.
 A predicate is a tree of and/or/not over substring and whole-word tests on the record and
 equality, set membership, substring, integer range, time range and presence tests on a field.
 Substring and word tests prune blocks by their filter and columns by their letters, and read
-only the columns left. A needle with no run of 8 letters and no run of 3 to 7 letters bounded
+only the columns left. A needle with no run of 5 letters and no run of 3 or 4 letters bounded
 by non-letters inside it is not prunable by filter and scans; digits and punctuation carry no
 tokens. An equality test on a field prunes the same way, so a value made of common words reads
 its column in most blocks; a host whose own index chose the rows opens the session

@@ -9,10 +9,12 @@ use crate::wire::{
 };
 
 pub const INDEX_MAGIC: &[u8; 4] = b"ZFIX";
-pub const INDEX_END_MAGIC: &[u8; 4] = b"ZFIE";
+/// Its last byte counts the changes that would make a reader misread an older region; this one
+/// is to what the filters hold.
+pub const INDEX_END_MAGIC: &[u8; 4] = b"ZFI2";
 /// `ZFIX` and the body length that follows it.
 pub const INDEX_HEAD_LEN: usize = 12;
-/// Root CRC32, root length, region length, `ZFIE`.
+/// Root CRC32, root length, region length, `ZFI2`.
 pub const INDEX_TAIL_LEN: usize = 24;
 
 // What a block's rows are made of. A reader plans from these before it has any of the block.
@@ -27,11 +29,13 @@ pub const KIND_SHAPE_CELL: u16 = 1 << 3;
 // Substring filter
 // ============================================================================
 
-// A longer run is known by its grams. Each token sets two bits: measured on 8 MiB blocks of
-// GitHub events, about 30,000 distinct tokens each, 128 Kbit with two bits lets through 2% of
-// the blocks that lack a ten-letter needle, and with one bit 11%.
+// A longer run is known by its grams of five letters. Measured on 8 MiB blocks of GitHub
+// events, about 34,000 distinct tokens each, with needles taken from them: most blocks hold
+// every gram of four letters a needle has, and a gram of six to eight cannot test a shorter
+// needle, which then reads every block. Each token sets two bits, which at these sizes passes
+// fewer blocks than one.
 const WORD_MIN: usize = 3;
-const GRAM: usize = 8;
+const GRAM: usize = 5;
 
 /// Every bit of the result depends on every bit of `h`: a token's two filter bits come from its
 /// two halves.
@@ -42,24 +46,28 @@ fn mix(h: u64) -> u64 {
     h ^ (h >> 33)
 }
 
-/// Calls `f(token, complete)` for the tokens of `text`: each run of ASCII letters of 3 to 7
-/// letters, and every 8 consecutive letters of a longer run, case kept. `complete` is false for a
+/// Calls `f(token, complete)` for the tokens of `text`: each run of ASCII letters of 3 or 4
+/// letters, and every 5 consecutive letters of a longer run, case kept. `complete` is false for a
 /// run that touches an end of `text`, where the text it was cut from may continue the run.
 pub fn tokens(text: &[u8], mut f: impl FnMut(u64, bool)) {
+    spellings(text, |w, complete| f(mix(w), complete))
+}
+
+/// `tokens`, with each token as the letters it stands for, read as one little-endian word.
+#[inline]
+fn spellings(text: &[u8], mut f: impl FnMut(u64, bool)) {
     let n = text.len();
     let mut run = |start: usize, end: usize| {
         let run = &text[start..end];
-        if run.len() >= GRAM {
-            // A gram is its eight letters read as one little-endian word.
-            for w in run.windows(GRAM) {
-                let window = u64::from_le_bytes(w.try_into().unwrap());
-                f(mix(window ^ 0x6772_616d), true);
-            }
-        } else if run.len() >= WORD_MIN {
-            let word = run.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &l| {
-                (h ^ l as u64).wrapping_mul(0x0000_0100_0000_01b3)
-            });
-            f(mix(word), start > 0 && end < n);
+        if run.len() < WORD_MIN {
+            return;
+        }
+        let (head, rest) = run.split_at(run.len().min(GRAM));
+        let mut w = head.iter().rev().fold(0u64, |w, &l| (w << 8) | l as u64);
+        f(w, run.len() >= GRAM || (start > 0 && end < n));
+        for &l in rest {
+            w = (w >> 8) | ((l as u64) << (8 * GRAM - 8));
+            f(w, true);
         }
     };
     // Eight bytes at a time: a byte's top bit marks a letter, and a run's ends are where the
@@ -110,7 +118,12 @@ pub fn needle_tokens(needle: &[u8], whole: bool) -> Option<Vec<u64>> {
 
 pub struct FilterBuilder {
     bits: Vec<u64>,
+    /// Spellings `add_text` has added, each where its hash puts it. Records repeat their words,
+    /// and most tokens of a text are found here.
+    recent: Box<[u64; RECENT]>,
 }
+
+const RECENT: usize = 1 << 12;
 
 impl FilterBuilder {
     /// `max_bits` is rounded up to a power of two of at least 64.
@@ -118,7 +131,19 @@ impl FilterBuilder {
         let n = max_bits.max(64).next_power_of_two();
         Self {
             bits: vec![0u64; n / 64],
+            recent: Box::new([0; RECENT]),
         }
+    }
+
+    /// Adds the tokens of `text`.
+    pub fn add_text(&mut self, text: &[u8]) {
+        spellings(text, |w, _| {
+            let slot = (w.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - RECENT.trailing_zeros())) as usize;
+            if self.recent[slot] != w {
+                self.recent[slot] = w;
+                self.add(mix(w));
+            }
+        })
     }
 
     #[inline]
@@ -130,11 +155,11 @@ impl FilterBuilder {
         }
     }
 
-    /// The filter's bytes, halved while under a quarter of its bits are set.
+    /// The filter's bytes, halved while under three tenths of its bits are set.
     pub fn finish(mut self) -> Vec<u8> {
         while self.bits.len() > 1 {
             let set: u32 = self.bits.iter().map(|w| w.count_ones()).sum();
-            if set as usize * 4 >= self.bits.len() * 64 {
+            if set as usize * 10 >= self.bits.len() * 64 * 3 {
                 break;
             }
             let half = self.bits.len() / 2;
@@ -168,7 +193,7 @@ impl FilterBuilder {
 pub const MAX_PAGES: usize = 255;
 
 /// Most bits a page filter has set, per mille.
-const PAGE_FILL: usize = 700;
+const PAGE_FILL: usize = 780;
 
 /// A paged pool's index page: each page filter's size as `log2` of its bytes, the row page map,
 /// then the filters back to back. The map gives row `r` the value `page + 1`, or `0` for a row
@@ -855,33 +880,25 @@ mod tests {
 
     /// The letter-at-a-time form `tokens` must match: the tokens are stored in every filter.
     fn tokens_reference(text: &[u8], mut f: impl FnMut(u64, bool)) {
-        let letter = |b: u8| b.is_ascii_alphabetic().then_some(b);
         let n = text.len();
         let mut i = 0usize;
         while i < n {
-            let Some(first) = letter(text[i]) else {
-                i += 1;
-                continue;
-            };
             let start = i;
-            let mut word = 0xcbf2_9ce4_8422_2325u64;
-            let mut window = 0u64;
-            let mut l = first;
-            loop {
-                word = (word ^ l as u64).wrapping_mul(0x0000_0100_0000_01b3);
-                window = (window >> 8) | ((l as u64) << 56);
+            while i < n && text[i].is_ascii_alphabetic() {
                 i += 1;
-                if i - start >= GRAM {
-                    f(mix(window ^ 0x6772_616d), true);
-                }
-                match text.get(i).and_then(|&b| letter(b)) {
-                    Some(next) => l = next,
-                    None => break,
-                }
             }
-            if (WORD_MIN..GRAM).contains(&(i - start)) {
-                f(mix(word), start > 0 && i < n);
+            let run = &text[start..i];
+            let spelled = |w: &[u8]| {
+                let mut b = [0u8; 8];
+                b[..w.len()].copy_from_slice(w);
+                mix(u64::from_le_bytes(b))
+            };
+            if run.len() >= GRAM {
+                run.windows(GRAM).for_each(|w| f(spelled(w), true));
+            } else if run.len() >= WORD_MIN {
+                f(spelled(run), start > 0 && i < n);
             }
+            i += usize::from(run.is_empty());
         }
     }
 
@@ -902,6 +919,16 @@ mod tests {
             tokens_reference(&text, |t, c| b.push((t, c)));
             assert_eq!(a, b);
         }
+    }
+
+    #[test]
+    fn text_adds_its_tokens_once_seen_or_not() {
+        let text = b"the parser parses; the Parser parsed the parse, then the parser again";
+        let (mut by_token, mut by_text) = (FilterBuilder::new(1 << 12), FilterBuilder::new(1 << 12));
+        tokens(text, |t, _| by_token.add(t));
+        by_text.add_text(text);
+        by_text.add_text(text);
+        assert_eq!(by_token.bits, by_text.bits);
     }
 
     #[test]
@@ -928,7 +955,7 @@ mod tests {
             needle_tokens(needle.as_bytes(), whole).map(|ts| ts.iter().all(|t| held.contains(t)))
         };
         assert_eq!(all("ClickHouse", false), Some(true));
-        assert_eq!(all("lickHous", false), Some(true));
+        assert_eq!(all("ickHo", false), Some(true));
         assert_eq!(all("clickhouse", false), Some(false), "case is kept");
         assert_eq!(
             all("ClickHouse/", true),
@@ -937,10 +964,12 @@ mod tests {
         );
         assert_eq!(all("postgresql", false), Some(false));
         // A word inside the needle is a token; one at its edge may be part of a longer run.
-        assert_eq!(all(" parser,", false), Some(true));
-        assert_eq!(all(" parse,", false), Some(false));
-        assert_eq!(all("parse", false), None);
-        assert_eq!(all("parse", true), Some(false));
+        assert_eq!(all(" fix:", false), Some(true));
+        assert_eq!(all(" the ", false), Some(true));
+        assert_eq!(all(" pars,", false), Some(false));
+        assert_eq!(all("pars", false), None);
+        assert_eq!(all("pars", true), Some(false));
+        assert_eq!(all("parse", false), Some(true), "part of a longer run");
         assert_eq!(all("42", true), None);
     }
 

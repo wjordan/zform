@@ -57,6 +57,13 @@ pub enum Predicate {
     Not(Box<Predicate>),
 }
 
+impl Predicate {
+    /// Whether a block's filter can rule the block out for this predicate.
+    pub fn filtered(&self) -> bool {
+        filter_use(self).0
+    }
+}
+
 // ============================================================================
 // Raw records
 // ============================================================================

@@ -3,7 +3,7 @@
 `zform` has three binary formats:
 
 1. **`ZFM1`**: a stream of frames, the data region of a `.zfm` file. Streams concatenate.
-2. **`ZFIX` / `ZFIE`**: the index region over a data region, appended to it or stored apart.
+2. **`ZFIX` / `ZFI2`**: the index region over a data region, appended to it or stored apart.
 3. **`ZFP1`**: a trained model saved as a profile (`.zfp`).
 
 None of them is released or carries a compatibility promise: the format changes in place, and a reader decodes what its own writer produces.
@@ -415,14 +415,14 @@ row_modes: u32_seq | child_block: blob | [fallback_graph: blob]
 
 ---
 
-## 5. `ZFIX` / `ZFIE` index region and `ZFP1` profiles
+## 5. `ZFIX` / `ZFI2` index region and `ZFP1` profiles
 
 ### `ZFIX` index region
 Derived from the data region and rebuilt by scanning it. `pack` appends it at EOF; the file writer returns it apart.
 ```text
 "ZFIX" (4B) | body_len: u64 LE
 | page filter pages | filter pages | directory pages | root: EntropyLeaf
-| root_crc32: u32 LE | root_len: u64 LE | region_len: u64 LE | "ZFIE" (4B)
+| root_crc32: u32 LE | root_len: u64 LE | region_len: u64 LE | "ZFI2" (4B)
 ```
 `body_len` counts the bytes after it, `region_len` the whole region, and `root_crc32` is the IEEE CRC32 of the root leaf as stored. Each block has one filter page and one directory page, and a block with a paged pool one page filter page, each kind in block order from offset 12; a page may be empty, and a verbatim block has no directory page. A streaming decoder skips the region. A reader takes the last 24 bytes to find the root, and the directories and root are the contiguous tail every query reads.
 
@@ -442,8 +442,8 @@ All fields below are `uvarint` unless typed.
   - `0x40`: cell `i` is row `i`'s, every row having one.
 
   `flags = 0x80` followed by a count stands for a run of that many empty one-byte columns.
-- **Filter page**: a power-of-two number of bytes, at least 8, read as bits: bit `p` is bit `p & 7` of byte `p >> 3`. The tokens of a block's records come from the runs of ASCII letters in them, case kept. A run of 3 to 7 letters is one token, `mix(h)` with `h` the FNV-1a 64 hash of its letters. A run of 8 or more gives no such token and one token for every 8 consecutive letters in it, `mix(w ^ 0x6772616d)` with `w` those 8 letters as a `u64 LE`. `mix` is the MurmurHash3 64-bit finalizer. A token sets the bits at its low and its high 32 bits, each modulo the filter's size in bits. The writer starts at 2^17 bits and, while under a quarter of the bits are set, halves the filter by OR-ing its upper half into its lower.
-- **Page filter page**: for a pool of `n` pages, `n` bytes giving each page filter's size as `log2` of its bytes, at least 3; then the row page map, row `r`'s value in `w` bits from bit `r * w`, `w` the bit length of `n`, `page + 1` for the page holding the row's pool cells or `0` for none, in `ceil(rows * w / 8)` bytes; then the page filters back to back. A page filter is a filter page of the tokens of that page's cells; the writer halves it while at most 70% of the half's bits would be set. A reader may skip a page whose filter lacks a token that a needle held within one pooled cell must have.
+- **Filter page**: a power-of-two number of bytes, at least 8, read as bits: bit `p` is bit `p & 7` of byte `p >> 3`. The tokens of a block's records come from the runs of ASCII letters in them, case kept. A run of 3 or 4 letters is one token, and a run of 5 or more gives one token for every 5 consecutive letters in it: `mix(w)` with `w` the token's letters as a `u64 LE`, zero above them. `mix` is the MurmurHash3 64-bit finalizer. A token sets the bits at its low and its high 32 bits, each modulo the filter's size in bits. The writer starts at 2^17 bits and, while under three tenths of the bits are set, halves the filter by OR-ing its upper half into its lower.
+- **Page filter page**: for a pool of `n` pages, `n` bytes giving each page filter's size as `log2` of its bytes, at least 3; then the row page map, row `r`'s value in `w` bits from bit `r * w`, `w` the bit length of `n`, `page + 1` for the page holding the row's pool cells or `0` for none, in `ceil(rows * w / 8)` bytes; then the page filters back to back. A page filter is a filter page of the tokens of that page's cells; the writer halves it while at most 78% of the half's bits would be set. A reader may skip a page whose filter lacks a token that a needle held within one pooled cell must have.
 
 ### `ZFP1` profile (`.zfp`)
 ```text

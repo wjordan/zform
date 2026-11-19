@@ -9,7 +9,7 @@
 use crate::container::DEFAULT_FILTER_BITS;
 use crate::dictionary::with_current;
 use crate::tables::{TABLE_PEER, Tables};
-use crate::index::{FilterBuilder, MAX_PAGES, tokens};
+use crate::index::{FilterBuilder, MAX_PAGES};
 use std::cell::{OnceCell, RefCell};
 use std::fmt;
 use std::sync::Arc;
@@ -4782,7 +4782,7 @@ fn page_pool(cols: &[&[&[u8]]], rows: &[Vec<u32>], page_bytes: usize, level: i32
         let bases: Vec<usize> = pages.iter().map(Vec::len).collect();
         for (v, &p) in vals.iter().zip(&ids) {
             pages[p as usize].extend_from_slice(v);
-            tokens(v, |t, _| filters[p as usize].add(t));
+            filters[p as usize].add_text(v);
         }
         col_pages.push(ids);
         col_bases.push(bases);

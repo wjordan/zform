@@ -16,7 +16,7 @@ use crate::grammar::{
 };
 use crate::index::{
     BlockDir, BlockKind, ColEntry, FilterBuilder, INDEX_MAGIC, IndexBuilder, KIND_JSON,
-    KIND_RESIDUAL, KIND_SHAPE, KIND_SHAPE_CELL, page_filter_page, tokens,
+    KIND_RESIDUAL, KIND_SHAPE, KIND_SHAPE_CELL, page_filter_page,
 };
 use crate::json_tree::{decode_json_struct_streams, encode_json_struct_streams};
 use crate::lex::parse_base64;
@@ -816,7 +816,7 @@ fn encode_task(
     let verbatim_filter = (opts.index && final_passthrough && !fc.is_empty()).then(|| {
         let mut fb = FilterBuilder::new(opts.filter_bits);
         for r in &all_recs {
-            tokens(r, |t, _| fb.add(t));
+            fb.add_text(r);
         }
         fb.finish()
     });
@@ -1317,7 +1317,7 @@ fn encode_block_columns(
     let index = filter_bits.map(|bits| {
         let mut fb = FilterBuilder::new(bits);
         for r in recs {
-            tokens(r, |t, _| fb.add(t));
+            fb.add_text(r);
         }
         (fb.finish(), row_kinds(plan, &split.variant_ids), recs.len())
     });
