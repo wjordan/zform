@@ -23,13 +23,22 @@ const ID_SEED: u64 = 0x5a46_4d31;
 const ZSTD_DICT_MAGIC: [u8; 4] = 0xEC30_A437u32.to_le_bytes();
 /// The level the content itself is stored at: it is written once and read whole.
 const STORE_LEVEL: i32 = 16;
+/// Levels a dictionary keeps a compressor for.
+const KEPT_LEVELS: usize = 2;
+/// The window the content is digested under, whatever leaf comes first. Above 14, so the lazy
+/// levels search it by rows rather than chains, which finds more of it; the window also caps the
+/// tables each leaf builds over its own bytes, and a larger one buys a fraction of a percent
+/// for a hundred megabytes of them.
+const DIGEST_WINDOW_LOG: u32 = 17;
 
 pub struct Dictionary {
     bytes: Vec<u8>,
     /// Computed when first asked for: a writer's tables may still be encoding their wire.
     id: OnceLock<u64>,
-    /// A compressor that has digested the content, with the level it did so at.
-    enc: Mutex<Option<(i32, CCtx<'static>)>>,
+    /// Compressors that have digested the content, each with the level it did so at. A writer
+    /// prices leaves at one level and keeps them at another, and digesting the content costs
+    /// more than most leaves do.
+    enc: Mutex<Vec<(i32, CCtx<'static>)>>,
     tables: Option<Arc<Tables>>,
 }
 
@@ -45,7 +54,7 @@ impl Dictionary {
         if bytes.starts_with(&ZSTD_DICT_MAGIC) {
             bytes.insert(0, 0);
         }
-        Self { id: OnceLock::new(), bytes, enc: Mutex::new(None), tables: None }
+        Self { id: OnceLock::new(), bytes, enc: Mutex::new(Vec::new()), tables: None }
     }
 
     /// This dictionary carrying `tables` too.
@@ -111,7 +120,7 @@ impl Dictionary {
             return Err(Error::Format("dictionary content reads as zstd tables".into()));
         }
         let id = OnceLock::from(id);
-        Ok(Self { bytes, id, enc: Mutex::new(None), tables: tables.map(Arc::new) })
+        Ok(Self { bytes, id, enc: Mutex::new(Vec::new()), tables: tables.map(Arc::new) })
     }
 
     /// Compresses `src` into `dst` as a frame that decodes only against this dictionary.
@@ -120,22 +129,32 @@ impl Dictionary {
             return None;
         }
         let mut enc = self.enc.lock().unwrap();
-        if enc.as_ref().is_none_or(|e| e.0 != level) {
-            let mut ctx = CCtx::try_create()?;
-            // The tables hold a position per byte of content, so a value is found wherever it
-            // sits. Attached, they are searched in place: a leaf pays for its own bytes only.
-            // The binary tree of levels 13 and up holds half the positions its chain log
-            // spans, hence one more.
-            let log = self.len().max(2).ilog2().clamp(20, 29);
-            ctx.set_parameter(CParameter::CompressionLevel(level)).ok()?;
-            ctx.set_parameter(CParameter::ChecksumFlag(false)).ok()?;
-            ctx.set_parameter(CParameter::HashLog(log)).ok()?;
-            ctx.set_parameter(CParameter::ChainLog(log + 1)).ok()?;
-            ctx.set_parameter(CParameter::ForceAttachDict(DictAttachPref::ForceAttach)).ok()?;
-            ctx.load_dictionary(&self.bytes).ok()?;
-            *enc = Some((level, ctx));
-        }
-        let ctx = &mut enc.as_mut()?.1;
+        let at = match enc.iter().position(|e| e.0 == level) {
+            Some(at) => at,
+            None => {
+                let mut ctx = CCtx::try_create()?;
+                // The tables hold a position per byte of content, so a value is found wherever
+                // it sits. Attached, they are searched in place: a leaf pays for its own bytes
+                // only. The binary tree of levels 13 and up holds half the positions its chain
+                // log spans, hence one more.
+                let log = self.len().max(2).ilog2().clamp(20, 29);
+                ctx.set_parameter(CParameter::CompressionLevel(level)).ok()?;
+                ctx.set_parameter(CParameter::ChecksumFlag(false)).ok()?;
+                ctx.set_parameter(CParameter::HashLog(log)).ok()?;
+                ctx.set_parameter(CParameter::ChainLog(log + 1)).ok()?;
+                ctx.set_parameter(CParameter::ForceAttachDict(DictAttachPref::ForceAttach)).ok()?;
+                ctx.load_dictionary(&self.bytes).ok()?;
+                // zstd digests the content at the first compression, under the window set then.
+                ctx.set_parameter(CParameter::WindowLog(DIGEST_WINDOW_LOG)).ok()?;
+                ctx.compress2(&mut [0u8; 64][..], &[0]).ok()?;
+                if enc.len() == KEPT_LEVELS {
+                    enc.remove(0);
+                }
+                enc.push((level, ctx));
+                enc.len() - 1
+            }
+        };
+        let ctx = &mut enc[at].1;
         ctx.reset(ResetDirective::SessionOnly).ok()?;
         // The content stays in reach only within a frame's first window.
         ctx.set_parameter(CParameter::WindowLog(window_log(src.len()))).ok()?;
@@ -493,5 +512,29 @@ mod tests {
         let mut again = Vec::new();
         crate::wire::compress_leaf_with(&mut again, &raw, EntropyBackend::Zstd, 3, Some(&stored));
         assert_eq!(again, leaf);
+    }
+
+    #[test]
+    fn leaves_compress_alike_whatever_came_before() {
+        let vals: Vec<String> = (0..4096).map(|i| format!("value-{:06}-{}", i * 7919 % 100_003, i % 13)).collect();
+        let text = |from: usize, n: usize| -> Vec<u8> {
+            (0..n).map(|i| vals[(from + i * 31) % vals.len()].as_str()).collect::<String>().into_bytes()
+        };
+        let big = text(5, 12_000);
+        let leaf = |dict: &Dictionary, src: &[u8], level| {
+            let mut out = Vec::new();
+            crate::wire::compress_leaf_with(&mut out, src, EntropyBackend::Zstd, level, Some(dict));
+            out
+        };
+        let fresh = || Dictionary::new(vals.concat().into_bytes());
+        let want = [3, 9].map(|level| leaf(&fresh(), &big, level));
+        // A small leaf first, and the levels taken in turn, change nothing.
+        let dict = fresh();
+        leaf(&dict, &text(1, 20), 9);
+        for _ in 0..2 {
+            assert_eq!(leaf(&dict, &big, 3), want[0]);
+            assert_eq!(leaf(&dict, &big, 9), want[1]);
+        }
+        assert!(want[1].len() < want[0].len() && want[0].len() < big.len() / 8);
     }
 }
