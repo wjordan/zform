@@ -536,6 +536,18 @@ mod tests {
     }
 
     #[test]
+    fn needles_in_columns_several_shapes_share_rebuild_no_record() {
+        let raw = stamped_lines();
+        let comp = assert_roundtrip(&raw, &PackOptions::default());
+        let recs = lines(&raw);
+        for pred in [contains("203517"), contains("7919"), contains("71271")] {
+            let (rows, stats) = assert_grep(&comp, &recs, &pred);
+            assert!(!rows.is_empty(), "{pred:?}");
+            assert_eq!(stats.rebuilt, 0, "{pred:?}");
+        }
+    }
+
+    #[test]
     fn a_time_range_prunes_blocks_of_a_field_copied_from_another() {
         // Most rows repeat the nested stamp at the top level, so the field is coded as a copy.
         let mut raw = Vec::new();

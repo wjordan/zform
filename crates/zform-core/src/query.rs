@@ -821,13 +821,15 @@ impl NeedlePlan {
                     .flatten()
                     .any(|&b| is_word(b))
         };
-        // Columns each variant writes, to find the ones exactly one variant writes verbatim.
+        // Columns each variant writes, to find the ones only shapes write, verbatim.
         let mut users = vec![0u8; n_cols];
         let mut verbatim = vec![false; n_cols];
-        let mut use_cols = |cols: &mut dyn Iterator<Item = u16>, plain: bool| {
+        let mut shaped = vec![true; n_cols];
+        let mut use_cols = |cols: &mut dyn Iterator<Item = u16>, plain: bool, shape: bool| {
             for c in cols {
                 users[c as usize] = users[c as usize].saturating_add(1);
                 verbatim[c as usize] = plain;
+                shaped[c as usize] &= shape;
             }
         };
         let mut vars = Vec::with_capacity(plan.variants.len());
@@ -844,7 +846,7 @@ impl NeedlePlan {
                         // `scan_col` reads a nested column's cells as JSON-tagged, which a
                         // shape's are not.
                         let nested = plan.columns[c as usize].nested_plan.is_some();
-                        use_cols(&mut std::iter::once(c), !nested);
+                        use_cols(&mut std::iter::once(c), !nested, true);
                     }
                     let n = s.literals.len();
                     // A word found at a cell's edge stands only where the record has no word
@@ -876,7 +878,7 @@ impl NeedlePlan {
                     (var, if vi == 0 { KIND_RESIDUAL } else { KIND_SHAPE })
                 }
                 PlanVariant::ShapeCell { cols, .. } => {
-                    use_cols(&mut cols.iter().copied(), false);
+                    use_cols(&mut cols.iter().copied(), false, false);
                     (VarNeedle::Unknown, KIND_SHAPE_CELL)
                 }
                 PlanVariant::JsonTree => {
@@ -892,6 +894,7 @@ impl NeedlePlan {
                             .map(|p| p.value_col)
                             .filter(|&c| c != u16::MAX),
                         true,
+                        false,
                     );
                     let mut lits = Vec::<&[u8]>::new();
                     // A value built from others repeats their cells, which are tested where
@@ -1004,8 +1007,10 @@ impl NeedlePlan {
             }
             vars.push(var);
         }
-        // A column two variants write has occurrences this code cannot place on rows.
-        let mut scan_cols: Vec<bool> = (0..n_cols).map(|c| users[c] == 1 && verbatim[c]).collect();
+        // Shape rows read a column's cells in row order, so `cell_rows` places the cells of a
+        // column that only shapes write; one that other variants share it cannot.
+        let mut scan_cols: Vec<bool> =
+            (0..n_cols).map(|c| verbatim[c] && (users[c] == 1 || shaped[c])).collect();
         for c in unscanned.into_iter().filter(|&c| c != u16::MAX) {
             scan_cols[c as usize] = false;
         }
