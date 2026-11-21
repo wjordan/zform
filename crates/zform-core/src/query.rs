@@ -1251,6 +1251,7 @@ pub(crate) fn may_match(pred: &Predicate, m: &BlockMeta<'_>, plans: &mut Plans) 
         Predicate::All | Predicate::Not(_) => true,
         Predicate::And(list) => list.iter().all(|p| may_match(p, m, plans)),
         Predicate::Or(list) => list.iter().any(|p| may_match(p, m, plans)),
+        Predicate::Contains(needle) | Predicate::Word(needle) if needle.is_empty() => true,
         Predicate::Contains(needle) | Predicate::Word(needle) => {
             let word = matches!(pred, Predicate::Word(_));
             plain_may_contain(needle, word, m.filter) && {
