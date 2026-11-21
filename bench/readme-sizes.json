@@ -1,0 +1,77 @@
+[
+  {
+    "name": "HDFS DataNode logs",
+    "raw_bytes": 1577982906,
+    "sha256": "0783096174d7832c618337f9609e06e04abd86ddd7089b3c12b407e63bfebc52",
+    "codecs": {
+      "zstd -3": {
+        "size": 152967821
+      },
+      "zstd -19": {
+        "size": 98416369
+      },
+      "xz -6": {
+        "size": 99694708
+      },
+      "zform": {
+        "size": 35028351
+      },
+      "zform --best": {
+        "size": 33244150
+      },
+      "zform HDFS predictors": {
+        "size": 17700720
+      }
+    }
+  },
+  {
+    "name": "GitHub Archive NDJSON",
+    "raw_bytes": 499460323,
+    "sha256": "51796a11afd3645a5c8d60ea939ec94ad550653750003d04c3fad886589f2cf7",
+    "codecs": {
+      "zstd -3": {
+        "size": 52999880
+      },
+      "zstd -19": {
+        "size": 37777544
+      },
+      "xz -6": {
+        "size": 38016648
+      },
+      "zform": {
+        "size": 30017022
+      },
+      "zform --best": {
+        "size": 21049996
+      },
+      "zform ordered": {
+        "size": 23563187
+      },
+      "zform --best ordered": {
+        "size": 18315487
+      }
+    }
+  },
+  {
+    "name": "Silesia sao",
+    "raw_bytes": 7251944,
+    "sha256": "c2d0ea2cc59d4c21b7fe43a71499342a00cbe530a1d5548770e91ecd6214adcc",
+    "codecs": {
+      "zstd -3": {
+        "size": 5552283
+      },
+      "zstd -19": {
+        "size": 5000515
+      },
+      "xz -6": {
+        "size": 4415072
+      },
+      "zform": {
+        "size": 3746714
+      },
+      "zform --best": {
+        "size": 3539095
+      }
+    }
+  }
+]

@@ -3,6 +3,11 @@
 `zform` is a lossless compressor for logs, telemetry and event streams, available as a CLI and a Rust library. It learns the structure of its input, compresses it and lets you search the archive directly.
 
 <!-- bench:comparison -->
+| Corpus | Raw | `zstd -3` | `zstd -19` | `xz -6` | `zform` |
+|---|---:|---:|---:|---:|---:|
+| HDFS DataNode logs | 1,504.88 MiB | 145.88 MiB (10.3x) | 93.86 MiB (16x) | 95.08 MiB (15.8x) | 33.41 MiB (45x) |
+| GitHub Archive NDJSON | 476.32 MiB | 50.54 MiB (9.42x) | 36.03 MiB (13.2x) | 36.26 MiB (13.1x) | 28.63 MiB (16.6x) |
+| Silesia sao | 6.92 MiB | 5.30 MiB (1.31x) | 4.77 MiB (1.45x) | 4.21 MiB (1.64x) | 3.57 MiB (1.94x) |
 <!-- /bench:comparison -->
 
 ```bash
@@ -157,6 +162,14 @@ The wire format is experimental and changes without notice; keep original copies
 The comparison uses the full Loghub HDFS log, the complete GitHub Archive hour `2020-06-17-16`, and the whole Silesia `sao` star catalog. `zform` sizes include the query index.
 
 <!-- bench:presets -->
+| Corpus | Pack flags | Archive |
+|---|---|---:|
+| HDFS DataNode logs | `--best` | 31.70 MiB (47.5x) |
+| HDFS DataNode logs | `-l 6 --hdfs-predictors --context-mixing` | 16.88 MiB (89.1x) |
+| GitHub Archive NDJSON | `--best` | 20.07 MiB (23.7x) |
+| GitHub Archive NDJSON | `--order-by type,repo.id` | 22.47 MiB (21.2x) |
+| GitHub Archive NDJSON | `--best --order-by type,repo.id` | 17.47 MiB (27.3x) |
+| Silesia sao | `--best` | 3.38 MiB (2.05x) |
 <!-- /bench:presets -->
 
 `--best` builds a shared dictionary from recurring values. `--order-by type,repo.id` groups events in stored order, which `grep` and `select` use. Unpack buffers one run, up to 512 MiB by default, to restore input order. The HDFS predictor preset models block IDs, write pipelines and per-node clocks.
