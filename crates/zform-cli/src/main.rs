@@ -405,7 +405,10 @@ fn file_profile(path: &str, opts: &mut PackOptions, max_bytes: usize) -> Result<
         f.seek(SeekFrom::Start(0)).map_err(io_err)?;
         let rdr = BufReader::with_capacity(256 << 10, f);
         if let Some(t) = build_tables(rdr, opts).map_err(err)? {
-            d = Some(d.unwrap_or_else(|| Dictionary::new(Vec::new())).with_tables(t));
+            d = Some(
+                d.unwrap_or_else(|| Dictionary::new(Vec::new()))
+                    .with_tables(t),
+            );
         }
     }
     opts.dictionary = d.map(Arc::new);

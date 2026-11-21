@@ -66,12 +66,16 @@ impl RecurrenceSpec {
             return Err(Invalid("recurrence program has fewer inputs than taps"));
         }
         if p.has_scans() || p.has_gathers() {
-            return Err(Invalid("recurrence program cannot contain scans or gathers"));
+            return Err(Invalid(
+                "recurrence program cannot contain scans or gathers",
+            ));
         }
         let full = Len::Fixed(p.width.bits() as u8 / 8);
         let n = self.n_state as usize;
         if !(n..=n + 1).contains(&p.sinks.len()) || p.sinks.iter().any(|s| s.1 != full) {
-            return Err(Invalid("recurrence program must emit full words per state lane"));
+            return Err(Invalid(
+                "recurrence program must emit full words per state lane",
+            ));
         }
         Ok(())
     }
@@ -174,7 +178,9 @@ impl CompiledRecurrence {
         while j < len {
             let (n, i) = (step.min(len - j), max + j);
             run.chunk(n, &[], |k, d| match taps.get(k) {
-                Some(&(lane, lag)) => d.copy_from_slice(&st[lane as usize][i - lag as usize..][..n]),
+                Some(&(lane, lag)) => {
+                    d.copy_from_slice(&st[lane as usize][i - lag as usize..][..n])
+                }
                 None => d
                     .iter_mut()
                     .zip(&cols[k - taps.len()][j..])

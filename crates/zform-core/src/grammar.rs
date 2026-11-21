@@ -1831,13 +1831,16 @@ mod tests {
         let rows: Vec<Vec<u8>> = (0..16)
             .map(|i| {
                 let msg = if i < 8 { "boot task" } else { "exit code" };
-                format!("{} 2024-02-29-23.59.{i:02}.123456 {msg} {}", 100 + i, i * 3)
-                    .into_bytes()
+                format!("{} 2024-02-29-23.59.{i:02}.123456 {msg} {}", 100 + i, i * 3).into_bytes()
             })
             .collect();
         let rows: Vec<&[u8]> = rows.iter().map(|r| r.as_slice()).collect();
         let (plan, _) = round_trip(&rows, &rows);
-        let timestamps: Vec<_> = plan.columns.iter().filter(|c| c.name.starts_with("$ts.")).collect();
+        let timestamps: Vec<_> = plan
+            .columns
+            .iter()
+            .filter(|c| c.name.starts_with("$ts."))
+            .collect();
         assert_eq!(timestamps.len(), 1);
         assert_eq!(timestamps[0].name, "$ts.0");
     }

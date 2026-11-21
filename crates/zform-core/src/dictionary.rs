@@ -46,7 +46,12 @@ pub struct Dictionary {
 
 impl fmt::Debug for Dictionary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Dictionary({} bytes, {:016x?})", self.len(), self.id.get())
+        write!(
+            f,
+            "Dictionary({} bytes, {:016x?})",
+            self.len(),
+            self.id.get()
+        )
     }
 }
 
@@ -56,7 +61,12 @@ impl Dictionary {
         if bytes.starts_with(&ZSTD_DICT_MAGIC) {
             bytes.insert(0, 0);
         }
-        Self { digests: Mutex::default(), id: OnceLock::new(), bytes, tables: None }
+        Self {
+            digests: Mutex::default(),
+            id: OnceLock::new(),
+            bytes,
+            tables: None,
+        }
     }
 
     /// This dictionary carrying `tables` too.
@@ -87,7 +97,9 @@ impl Dictionary {
     }
 
     pub fn id(&self) -> u64 {
-        *self.id.get_or_init(|| content_id(&self.bytes, self.tables.as_deref()))
+        *self
+            .id
+            .get_or_init(|| content_id(&self.bytes, self.tables.as_deref()))
     }
 
     /// The content as a leaf, at `level` or [`STORE_LEVEL`], whichever is higher.
@@ -114,15 +126,24 @@ impl Dictionary {
         let mut cur = Cursor::new(stored);
         let bytes = decompress_leaf(&mut cur, budget)?;
         let rest = &stored[stored.len() - cur.remaining()..];
-        let tables = (!rest.is_empty()).then(|| Tables::decode(rest, budget)).transpose()?;
+        let tables = (!rest.is_empty())
+            .then(|| Tables::decode(rest, budget))
+            .transpose()?;
         if budget.verify_checksums && content_id(&bytes, tables.as_ref()) != id {
             return Err(Error::ChecksumMismatch("dictionary XXH64"));
         }
         if bytes.starts_with(&ZSTD_DICT_MAGIC) {
-            return Err(Error::Format("dictionary content reads as zstd tables".into()));
+            return Err(Error::Format(
+                "dictionary content reads as zstd tables".into(),
+            ));
         }
         let id = OnceLock::from(id);
-        Ok(Self { digests: Mutex::default(), bytes, id, tables: tables.map(Arc::new) })
+        Ok(Self {
+            digests: Mutex::default(),
+            bytes,
+            id,
+            tables: tables.map(Arc::new),
+        })
     }
 
     /// Compresses `src` into `dst` as a frame that decodes only against this dictionary.
@@ -193,7 +214,8 @@ impl Digest {
         // bytes; a quarter of the positions there costs 2e-5 of a file priced at such a level,
         // and 48 MiB less for 16 MiB of content.
         let log = content.len().max(2).ilog2().clamp(20, 29) as i32;
-        let double_fast = unsafe { zs::ZSTD_getCParams(level, 0, 0) }.strategy == zs::ZSTD_strategy::ZSTD_dfast;
+        let double_fast =
+            unsafe { zs::ZSTD_getCParams(level, 0, 0) }.strategy == zs::ZSTD_strategy::ZSTD_dfast;
         let params = [
             (ZSTD_c_compressionLevel, level),
             (ZSTD_c_hashLog, log),
@@ -213,7 +235,11 @@ impl Digest {
                         zs::ZSTD_dictContentType_e::ZSTD_dct_rawContent,
                         p.as_ptr(),
                         // No allocator of its own: zstd's.
-                        zs::ZSTD_customMem { customAlloc: None, customFree: None, opaque: std::ptr::null_mut() },
+                        zs::ZSTD_customMem {
+                            customAlloc: None,
+                            customFree: None,
+                            opaque: std::ptr::null_mut(),
+                        },
                     )
                 });
             zs::ZSTD_freeCCtxParams(p.as_ptr());
@@ -236,19 +262,36 @@ impl Compressor {
         use zs::ZSTD_cParameter::*;
         let c = self.0.as_ptr();
         unsafe {
-            zok(zs::ZSTD_CCtx_reset(c, zs::ZSTD_ResetDirective::ZSTD_reset_session_and_parameters))?;
-            zok(zs::ZSTD_CCtx_setParameter(c, ZSTD_c_compressionLevel, level))?;
+            zok(zs::ZSTD_CCtx_reset(
+                c,
+                zs::ZSTD_ResetDirective::ZSTD_reset_session_and_parameters,
+            ))?;
+            zok(zs::ZSTD_CCtx_setParameter(
+                c,
+                ZSTD_c_compressionLevel,
+                level,
+            ))?;
             // A digest made with explicit parameters carries no level, so the frame would
             // settle what the digest leaves open (block splitting) as for the default level.
             let strategy = zs::ZSTD_getCParams(level, src.len() as u64, 0).strategy as i32;
             zok(zs::ZSTD_CCtx_setParameter(c, ZSTD_c_strategy, strategy))?;
             zok(zs::ZSTD_CCtx_setParameter(c, ZSTD_c_checksumFlag, 0))?;
             // The content stays in reach only within a frame's first window.
-            zok(zs::ZSTD_CCtx_setParameter(c, ZSTD_c_windowLog, window_log(src.len()) as i32))?;
+            zok(zs::ZSTD_CCtx_setParameter(
+                c,
+                ZSTD_c_windowLog,
+                window_log(src.len()) as i32,
+            ))?;
             // `ZSTD_c_forceAttachDict`: the leaf searches the digest in place, never a copy.
             zok(zs::ZSTD_CCtx_setParameter(c, ZSTD_c_experimentalParam4, 1))?;
             zok(zs::ZSTD_CCtx_refCDict(c, digest.0.as_ptr()))?;
-            let n = zs::ZSTD_compress2(c, dst.as_mut_ptr().cast(), dst.len(), src.as_ptr().cast(), src.len());
+            let n = zs::ZSTD_compress2(
+                c,
+                dst.as_mut_ptr().cast(),
+                dst.len(),
+                src.as_ptr().cast(),
+                src.len(),
+            );
             zok(n).map(|_| n)
         }
     }
@@ -298,7 +341,11 @@ const KEEP_FACTOR: usize = 4;
 /// The most content a dictionary used at `level` is searched over: zstd loads only the last
 /// 16 MiB at levels 4 and below.
 fn max_content(level: i32) -> usize {
-    if level <= 4 { (1 << 24) - 2 } else { usize::MAX }
+    if level <= 4 {
+        (1 << 24) - 2
+    } else {
+        usize::MAX
+    }
 }
 
 /// Chooses a file's dictionary in a pass over its records before they are written: the values
@@ -336,7 +383,10 @@ struct Found {
 
 /// A value the hex pack codes as the bytes it spells, as those bytes: its leaves hold them so.
 fn hex_bytes(v: &[u8]) -> Option<Vec<u8>> {
-    let inner = v.strip_prefix(b"\"").and_then(|v| v.strip_suffix(b"\"")).unwrap_or(v);
+    let inner = v
+        .strip_prefix(b"\"")
+        .and_then(|v| v.strip_suffix(b"\""))
+        .unwrap_or(v);
     if !matches!(inner.len(), 16 | 32 | 40 | 64) {
         return None;
     }
@@ -358,7 +408,15 @@ impl Tally {
                 None => self.arena.extend_from_slice(v),
             }
             let len = self.arena.len() - off;
-            self.found.insert(h, Found { off, len, blocks: 2, last: self.block });
+            self.found.insert(
+                h,
+                Found {
+                    off,
+                    len,
+                    blocks: 2,
+                    last: self.block,
+                },
+            );
         }
     }
 
@@ -417,7 +475,10 @@ impl DictionaryBuilder {
             block_bytes: opts.block_bytes.max(1),
             buf: Vec::new(),
             ends: Vec::new(),
-            tally: Tally { max_bytes: max_bytes.min(max_content(opts.level)), ..Tally::default() },
+            tally: Tally {
+                max_bytes: max_bytes.min(max_content(opts.level)),
+                ..Tally::default()
+            },
         })
     }
 
@@ -458,12 +519,16 @@ impl DictionaryBuilder {
         if !self.ends.is_empty() {
             self.cut();
         }
-        let Tally { max_bytes, found, arena, .. } = self.tally;
+        let Tally {
+            max_bytes,
+            found,
+            arena,
+            ..
+        } = self.tally;
         let value = |f: &Found| &arena[f.off..f.off + f.len];
         let mut picks: Vec<&Found> = found.values().collect();
-        picks.sort_unstable_by(|a, b| {
-            (b.blocks, b.len, value(a)).cmp(&(a.blocks, a.len, value(b)))
-        });
+        picks
+            .sort_unstable_by(|a, b| (b.blocks, b.len, value(a)).cmp(&(a.blocks, a.len, value(b))));
         let mut total = 0usize;
         picks.retain(|f| {
             let fits = total + f.len <= max_bytes;
@@ -486,7 +551,11 @@ mod tests {
     fn build(blocks: &[&[&str]], max_bytes: usize) -> Option<Dictionary> {
         let rec = |v: &&str| format!("{{\"id\":7,\"note\":\"{v}\"}}");
         let rows = blocks.iter().map(|b| b.len()).max().unwrap();
-        let sample: String = blocks.iter().flat_map(|b| b.iter()).map(|v| rec(v) + "\n").collect();
+        let sample: String = blocks
+            .iter()
+            .flat_map(|b| b.iter())
+            .map(|v| rec(v) + "\n")
+            .collect();
         let plan = train_from_bytes(sample.as_bytes(), &TrainOptions::default(), None);
         let opts = PackOptions {
             profile: Some(Profile::from_plan(plan)),
@@ -511,7 +580,8 @@ mod tests {
             &[&a, &b, &c, &u, &short],
             &[&a, &c, &w, &x, &short],
         ];
-        let holds = |dict: &Dictionary, v: &str| dict.bytes.windows(v.len()).any(|w| w == v.as_bytes());
+        let holds =
+            |dict: &Dictionary, v: &str| dict.bytes.windows(v.len()).any(|w| w == v.as_bytes());
         let all = build(&blocks, 1 << 20).unwrap();
         assert!([&a, &b, &c].iter().all(|v| holds(&all, v)));
         assert!(
@@ -522,7 +592,11 @@ mod tests {
 
         let one = build(&blocks, 40).unwrap();
         assert!(holds(&one, &a) && !holds(&one, &b) && !holds(&one, &c));
-        assert_eq!(one.id(), build(&blocks, 40).unwrap().id(), "the choice is repeatable");
+        assert_eq!(
+            one.id(),
+            build(&blocks, 40).unwrap().id(),
+            "the choice is repeatable"
+        );
         assert!(build(&blocks[..1], 1 << 20).is_none() && build(&blocks, 8).is_none());
     }
 
@@ -531,9 +605,14 @@ mod tests {
         let sha = "0123456789abcdef".repeat(3)[..40].to_string();
         let other = "x".repeat(24);
         let dict = build(&[&[&sha, &other], &[&sha, &other]], 1 << 20).unwrap();
-        let bytes: Vec<u8> =
-            (0..20).map(|i| u8::from_str_radix(&sha[2 * i..2 * i + 2], 16).unwrap()).collect();
-        assert!(dict.bytes.windows(20).any(|w| w == bytes), "{:?}", dict.bytes);
+        let bytes: Vec<u8> = (0..20)
+            .map(|i| u8::from_str_radix(&sha[2 * i..2 * i + 2], 16).unwrap())
+            .collect();
+        assert!(
+            dict.bytes.windows(20).any(|w| w == bytes),
+            "{:?}",
+            dict.bytes
+        );
         assert_eq!(dict.len(), 20 + other.len() + 2);
     }
 
@@ -552,7 +631,12 @@ mod tests {
         vals.sort();
         let dict = Dictionary::new(vals.concat().into_bytes());
         // Values from the first quarter, which a tree spanning half the content misses.
-        let src: String = vals[..8192].iter().rev().step_by(4).map(String::as_str).collect();
+        let src: String = vals[..8192]
+            .iter()
+            .rev()
+            .step_by(4)
+            .map(String::as_str)
+            .collect();
         let mut leaf = Vec::new();
         let src = src.as_bytes();
         crate::wire::compress_leaf_with(&mut leaf, src, EntropyBackend::Zstd, 19, Some(&dict));
@@ -598,9 +682,14 @@ mod tests {
 
     #[test]
     fn leaves_compress_alike_whatever_came_before() {
-        let vals: Vec<String> = (0..4096).map(|i| format!("value-{:06}-{}", i * 7919 % 100_003, i % 13)).collect();
+        let vals: Vec<String> = (0..4096)
+            .map(|i| format!("value-{:06}-{}", i * 7919 % 100_003, i % 13))
+            .collect();
         let text = |from: usize, n: usize| -> Vec<u8> {
-            (0..n).map(|i| vals[(from + i * 31) % vals.len()].as_str()).collect::<String>().into_bytes()
+            (0..n)
+                .map(|i| vals[(from + i * 31) % vals.len()].as_str())
+                .collect::<String>()
+                .into_bytes()
         };
         let big = text(5, 12_000);
         let leaf = |dict: &Dictionary, src: &[u8], level| {

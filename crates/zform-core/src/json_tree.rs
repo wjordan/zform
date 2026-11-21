@@ -12,8 +12,8 @@ use crate::codecs::{BlockDecodeCtx, decode_u32_seq, encode_u32_seq};
 use crate::container::block_col;
 use crate::grammar::ModelPlan;
 use crate::lex::{escape_json_str_exact, unescape_json_str_exact};
-use crate::wire::{Cursor, DecodeBudget, EntropyBackend, Error, Result, put_bytes, put_uvarint};
 use crate::payload::graph::{FastMap as HashMap, FastSet as HashSet};
+use crate::wire::{Cursor, DecodeBudget, EntropyBackend, Error, Result, put_bytes, put_uvarint};
 
 pub const J_NONE: u8 = 0;
 pub const J_OBJECT: u8 = 1;
@@ -110,7 +110,10 @@ pub fn scan_json_str(s: &[u8], i: usize) -> Option<(usize, bool)> {
                 let control = _mm_cmpeq_epi8(_mm_min_epu8(v, _mm_set1_epi8(31)), v);
                 _mm_movemask_epi8(_mm_or_si128(control, _mm_or_si128(quote, slash)))
             };
-            if mask != 0 { j += mask.trailing_zeros() as usize; break; }
+            if mask != 0 {
+                j += mask.trailing_zeros() as usize;
+                break;
+            }
             j += 16;
         }
         while j + 8 <= s.len() && (!cfg!(target_arch = "x86_64") || s.len() - j < 16) {
@@ -729,7 +732,9 @@ impl JsonTreePlan {
                         let own = paths.len();
                         let free = refs.iter().filter(|&&r| r as usize == own).count();
                         if b64 && !lits.iter().all(|l| b64_text_ok(l)) {
-                            return Err(Error::Format("Base64 candidate text not printable".into()));
+                            return Err(Error::Format(
+                                "Base64 candidate text not printable".into(),
+                            ));
                         }
                         if free > usize::from(!b64) {
                             return Err(Error::Format("invalid MultiConcat free part".into()));
@@ -1627,7 +1632,12 @@ impl JsonTreeBlockReconstructor {
             if v > 0 && pdef.shapes.is_empty() {
                 stored = v;
                 if !pdef.cands.is_empty() {
-                    let sels = take(&self.struct_streams, &mut self.struct_pos, pdef.sel_stream, v)?;
+                    let sels = take(
+                        &self.struct_streams,
+                        &mut self.struct_pos,
+                        pdef.sel_stream,
+                        v,
+                    )?;
                     for &s in sels {
                         let s = s as usize;
                         if s > pdef.cands.len() {
@@ -1643,7 +1653,12 @@ impl JsonTreeBlockReconstructor {
                     hist[0] = 0;
                 }
             } else if v > 0 {
-                let ids = take(&self.struct_streams, &mut self.struct_pos, pdef.shape_stream, v)?;
+                let ids = take(
+                    &self.struct_streams,
+                    &mut self.struct_pos,
+                    pdef.shape_stream,
+                    v,
+                )?;
                 for &s in ids {
                     let s = s as usize;
                     if s > pdef.shapes.len() {
@@ -1673,7 +1688,12 @@ impl JsonTreeBlockReconstructor {
                 *c += stored;
             }
             if a > 0 {
-                let counts = take(&self.struct_streams, &mut self.struct_pos, pdef.count_stream, a)?;
+                let counts = take(
+                    &self.struct_streams,
+                    &mut self.struct_pos,
+                    pdef.count_stream,
+                    a,
+                )?;
                 let mut elems = 0usize;
                 for &c in counts {
                     if c as usize > budget.max_records_per_block {
@@ -1769,7 +1789,9 @@ impl JsonTreeBlockReconstructor {
 fn take<'s>(streams: &'s [Vec<u32>], pos: &mut [usize], si: u16, n: usize) -> Result<&'s [u32]> {
     let si = si as usize;
     let (Some(s), Some(at)) = (streams.get(si), pos.get_mut(si)) else {
-        return Err(Error::Format("json struct stream index out of bounds".into()));
+        return Err(Error::Format(
+            "json struct stream index out of bounds".into(),
+        ));
     };
     let vals = s
         .get(*at..*at + n)
@@ -2124,7 +2146,9 @@ impl StructWalk<'_> {
                 .cands
                 .get(sel - 1)
                 .ok_or_else(|| Error::Format("JsonTree sel out of range".into()))?;
-            let free = cand.has_free(path_idx).then(|| self.count_cell(path_idx, row));
+            let free = cand
+                .has_free(path_idx)
+                .then(|| self.count_cell(path_idx, row));
             if self.tracked(path_idx) {
                 let srcs = self.map.srcs.len() as u32;
                 let one;
@@ -2338,7 +2362,6 @@ impl TreeTrainer {
     pub(crate) fn observe_root(&mut self, doc: &JsonDoc, row: &[u8]) {
         self.observe(doc, row, 0, 0);
     }
-
 
     fn add_path(&mut self, name: Vec<u8>, is_elem: bool) -> usize {
         if let Some(&idx) = self.index.get(&name) {
@@ -2600,7 +2623,8 @@ pub(crate) fn train_observed_json(
     };
 
     // Map kept `TPath` indices -> `0..kept_order.len()` in `JsonTreePlan::paths`
-    let mut tp_to_plan: HashMap<usize, u16> = crate::payload::graph::fast_map_with_capacity(kept_order.len());
+    let mut tp_to_plan: HashMap<usize, u16> =
+        crate::payload::graph::fast_map_with_capacity(kept_order.len());
     for (pi, &tpi) in kept_order.iter().enumerate() {
         tp_to_plan.insert(tpi, pi as u16);
     }
@@ -3365,7 +3389,9 @@ fn pick_cands(
     for i in kept {
         out.push(match &props[i] {
             // One ref and no free part is an affix, which the plan writes shorter.
-            JsonCand::MultiConcat { lits, refs, b64 } if !b64 && refs.len() == 1 && refs[0] as usize != own => {
+            JsonCand::MultiConcat { lits, refs, b64 }
+                if !b64 && refs.len() == 1 && refs[0] as usize != own =>
+            {
                 JsonCand::Affix {
                     prefix: lits[0].clone(),
                     ref_path: refs[0],
@@ -3519,7 +3545,10 @@ fn discover_nested_json_strings(
     let mut doc = JsonDoc::default();
     let mut string_samples: HashMap<u16, Vec<Vec<u8>>> = HashMap::default();
 
-    for &row in json_rows.iter().step_by(json_rows.len().div_ceil(512).max(1)) {
+    for &row in json_rows
+        .iter()
+        .step_by(json_rows.len().div_ceil(512).max(1))
+    {
         if !doc.parse_root_object(row) {
             continue;
         }
@@ -3699,7 +3728,12 @@ mod tests {
         let mut buf = Vec::new();
         jt.encode(&mut buf);
         let back = JsonTreePlan::decode(&mut Cursor::new(&buf)).unwrap();
-        assert!(back.paths.iter().zip(&jt.paths).all(|(a, b)| a.cands == b.cands));
+        assert!(
+            back.paths
+                .iter()
+                .zip(&jt.paths)
+                .all(|(a, b)| a.cands == b.cands)
+        );
     }
 
     #[test]
@@ -3717,7 +3751,10 @@ mod tests {
         let jt = train_json_tree(&refs, &crate::plan::TrainOptions::default(), &mut model).unwrap();
         let b = jt.paths.iter().find(|p| p.name == "$.b").unwrap();
         assert!(b.cands.is_empty(), "{:?}", b.cands);
-        assert_eq!(spread_order(10).collect::<Vec<_>>(), [0, 7, 4, 1, 8, 5, 2, 9, 6, 3]);
+        assert_eq!(
+            spread_order(10).collect::<Vec<_>>(),
+            [0, 7, 4, 1, 8, 5, 2, 9, 6, 3]
+        );
     }
 
     #[test]
@@ -3725,7 +3762,9 @@ mod tests {
         // `url` is in one row of 300, always built from `login`: 20 values in 6000 rows.
         let rows: Vec<String> = (0..6000u64)
             .map(|i| match i % 300 {
-                1 => format!("{{\"login\":\"dev{i}\",\"url\":\"https://api.test/users/dev{i}/repos\"}}"),
+                1 => format!(
+                    "{{\"login\":\"dev{i}\",\"url\":\"https://api.test/users/dev{i}/repos\"}}"
+                ),
                 _ => format!("{{\"login\":\"dev{i}\"}}"),
             })
             .collect();
@@ -3764,6 +3803,9 @@ mod tests {
         assert!(plan(3, &[0], b"x").is_err(), "a free part under Base64");
         assert!(plan(3, &[1], b"x").is_err(), "a ref past the paths");
         let err = plan(3, &[0], b"\xff").err().map(|e| e.to_string());
-        assert!(err.is_some_and(|e| e.contains("printable")), "Base64 of text not printable");
+        assert!(
+            err.is_some_and(|e| e.contains("printable")),
+            "Base64 of text not printable"
+        );
     }
 }

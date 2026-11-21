@@ -7,11 +7,10 @@ use std::fmt::Write as _;
 use std::io::Read;
 use std::sync::Arc;
 
-use crate::tables::TABLE_PEER;
 use crate::container::{
-    BlockParts, FLAG_DICTIONARY, FLAG_ORDER, FLAG_HAS_CHECKSUM, FLAG_PASSTHROUGH, FLAG_REUSE_PREV_MODEL,
-    FLAG_SYNC_POINT, InspectReport, NextFrameKind, Structure, parse_frame_blocks,
-    read_next_frame_header,
+    BlockParts, FLAG_DICTIONARY, FLAG_HAS_CHECKSUM, FLAG_ORDER, FLAG_PASSTHROUGH,
+    FLAG_REUSE_PREV_MODEL, FLAG_SYNC_POINT, InspectReport, NextFrameKind, Structure,
+    parse_frame_blocks, read_next_frame_header,
 };
 use crate::grammar::{ColumnDef, ModelPlan};
 use crate::payload::graph::{
@@ -19,6 +18,7 @@ use crate::payload::graph::{
 };
 use crate::payload::ir::{Len, Program};
 use crate::payload::library::{Code, LibEntry, Library};
+use crate::tables::TABLE_PEER;
 use crate::wire::{Cursor, DecodeBudget, Error, Result};
 
 /// Frame and column totals, without the per-column graph parse [`inspect_breakdown`] does.
@@ -630,7 +630,11 @@ impl Render<'_> {
     fn col(&self, slot: u16) -> String {
         match self.g.ext_peers.get(slot as usize) {
             Some(&c) if c & TABLE_PEER != 0 => format!("table.{}", c & !TABLE_PEER),
-            Some(&c) => self.cols.get(c as usize).map_or("?", |c| c.name.as_str()).to_string(),
+            Some(&c) => self
+                .cols
+                .get(c as usize)
+                .map_or("?", |c| c.name.as_str())
+                .to_string(),
             None => "?".to_string(),
         }
     }
@@ -664,7 +668,9 @@ impl Render<'_> {
             GraphNode::KeyedSum { order, seed, .. } => match (order, seed) {
                 (None, crate::payload::graph::SumSeed::Previous) => "KeyedSum".into(),
                 (None, crate::payload::graph::SumSeed::Zero) => "KeyedSum(zero)".into(),
-                (Some(_), crate::payload::graph::SumSeed::Previous) => "KeyedSum(ordered,previous)".into(),
+                (Some(_), crate::payload::graph::SumSeed::Previous) => {
+                    "KeyedSum(ordered,previous)".into()
+                }
                 (Some(_), crate::payload::graph::SumSeed::Zero) => "KeyedSum(ordered,zero)".into(),
             },
             GraphNode::ExtVariant => "Variant".into(),

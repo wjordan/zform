@@ -174,7 +174,6 @@ impl Pool {
         let i = self.missing.partition_point(|m| (m.1 as usize) <= s);
         !self.missing.get(i).is_some_and(|m| (m.0 as usize) < e)
     }
-
 }
 
 #[derive(Debug, Clone)]

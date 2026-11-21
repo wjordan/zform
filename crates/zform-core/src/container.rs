@@ -20,6 +20,7 @@ use crate::index::{
 };
 use crate::json_tree::{decode_json_struct_streams, encode_json_struct_streams};
 use crate::lex::parse_base64;
+use crate::order::{OrderReader, OrderSink, Restore};
 use crate::packs::{EncodedDenseBlock, PackRegistry, Paging};
 use crate::payload::graph::{NESTED_COLUMN_TAG, PayloadGraph};
 use crate::payload::library::{Harvest, Library, with_code_pricing};
@@ -29,7 +30,6 @@ use crate::wire::{
     Cursor, DecodeBudget, EntropyBackend, Error, Result, compress_leaf, crc32, decompress_leaf,
     leaf_raw_len, put_bytes, put_uvarint, xxh64,
 };
-use crate::order::{OrderReader, OrderSink, Restore};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -573,7 +573,9 @@ impl StreamEncoder {
         } = enc;
         for (start, run) in &task.orders {
             // The chunker reads into a run only for the chunk the run starts in or just after.
-            let skip = start.checked_sub(self.raw_offset).expect("a run starts in a later frame");
+            let skip = start
+                .checked_sub(self.raw_offset)
+                .expect("a run starts in a later frame");
             let payload = crate::order::payload(skip, run);
             self.write_order(&payload, &mut out)?;
         }
@@ -903,7 +905,10 @@ fn encode_structural_blocks(
         s = e;
     }
     // Every block of the frame must sort back into its records for any to be stored reordered.
-    let sorted = reorder && bounds.iter().all(|&(s, e)| collation_sorted(&all_recs[s..e]));
+    let sorted = reorder
+        && bounds
+            .iter()
+            .all(|&(s, e)| collation_sorted(&all_recs[s..e]));
     // A library this frame makes is shared by its blocks and, when the stream goes on, by the
     // frames that reuse the model: code is priced as that many uses.
     let (keep_single, share) = match code {
@@ -1942,7 +1947,9 @@ impl<'a> BlockRows<'a> {
             return Ok(false);
         };
         let n = self.len();
-        let distinct = fields.iter().all(|f| fields.iter().filter(|g| g.2 == f.2).count() == 1);
+        let distinct = fields
+            .iter()
+            .all(|f| fields.iter().filter(|g| g.2 == f.2).count() == 1);
         if self.next != 0 || !distinct || self.variant_ids.iter().any(|v| v != vi) {
             return Ok(false);
         }
@@ -2053,7 +2060,8 @@ fn fill<const W: usize>(rows: &mut [u8], (stride, off): (usize, usize), col: &Co
         }
         _ => match col.laid() {
             Some((bytes, ends)) if bytes.len() >= n * W && even(ends, n) => {
-                rows.zip(bytes.chunks_exact(W)).for_each(|(row, cell)| copy(row, cell));
+                rows.zip(bytes.chunks_exact(W))
+                    .for_each(|(row, cell)| copy(row, cell));
                 return true;
             }
             _ => {}
@@ -2147,7 +2155,9 @@ fn decode_frame(
             let recs = decode_single_block_records(bslice, *nrows, plan, budget)?;
             for i in sort_records(&recs) {
                 let rec = recs.get(i as usize).unwrap();
-                put(&mut frame_out, &mut emitted, &mut |o| Ok(o.extend_from_slice(rec)))?;
+                put(&mut frame_out, &mut emitted, &mut |o| {
+                    Ok(o.extend_from_slice(rec))
+                })?;
             }
         } else {
             // Rows go straight into the frame, each byte copied once.
@@ -2323,7 +2333,13 @@ impl FrameQueue {
         let small = !task.passthrough && raw.len() <= SMALL_FRAME;
         let (framing, prefix, suffix, spans) =
             (fc.framing, fc.prefix.to_vec(), fc.suffix.to_vec(), fc.spans);
-        let c = OwnedChunk { framing, prefix, suffix, spans, raw };
+        let c = OwnedChunk {
+            framing,
+            prefix,
+            suffix,
+            spans,
+            raw,
+        };
         let (opts, plan) = (Arc::clone(&self.opts), self.plan.clone());
         self.fl.spawn_on(&self.pool, move || {
             let (mut plan, mut seeds) = (plan, Seeds::default());
@@ -2837,7 +2853,9 @@ mod nested_tests {
 
     #[test]
     fn framed_rows_unpack_exactly() {
-        let lines: String = (0..300).map(|i| format!("id={i} k=v{}\r\n", i % 7)).collect();
+        let lines: String = (0..300)
+            .map(|i| format!("id={i} k=v{}\r\n", i % 7))
+            .collect();
         let mut lp = Vec::new();
         for i in 0..300 {
             let r = format!("rec {i} {}", "x".repeat(i % 5));
@@ -2852,7 +2870,10 @@ mod nested_tests {
             bin.extend(((i * 7) as u16).to_le_bytes());
             bin.push(b'a' + (i % 3) as u8);
         }
-        let fixed = |header_bytes| FramingSpec::FixedStride { stride: 15, header_bytes };
+        let fixed = |header_bytes| FramingSpec::FixedStride {
+            stride: 15,
+            header_bytes,
+        };
         let cases = [
             (lines.as_bytes(), FramingSpec::Crlf),
             (&lines.as_bytes()[..lines.len() - 2], FramingSpec::Crlf),

@@ -516,9 +516,15 @@ mod tests {
         for i in 0..900u64 {
             let (t, pid, id, host) = (i % 60, 100 + i * 13 % 37, 7919 * i % 1_000_003, i % 9);
             let line = match i % 3 {
-                0 => format!("081109 2035{t:02} {pid} INFO Receiving block id_{id} src: /10.0.0.{host}:50010\n"),
-                1 => format!("081109 2035{t:02} {pid} INFO PacketResponder {host} for block id_{id} terminating\n"),
-                _ => format!("081109 2035{t:02} {pid} WARN Served block id_{id} to /10.0.0.{host}\n"),
+                0 => format!(
+                    "081109 2035{t:02} {pid} INFO Receiving block id_{id} src: /10.0.0.{host}:50010\n"
+                ),
+                1 => format!(
+                    "081109 2035{t:02} {pid} INFO PacketResponder {host} for block id_{id} terminating\n"
+                ),
+                _ => {
+                    format!("081109 2035{t:02} {pid} WARN Served block id_{id} to /10.0.0.{host}\n")
+                }
             };
             raw.extend_from_slice(line.as_bytes());
         }
@@ -1227,14 +1233,20 @@ mod tests {
             ..PackOptions::default()
         };
         let plain = assert_roundtrip(&raw, &opts);
-        let tables = build_tables(&raw[..], &opts).unwrap().expect("addStoredBlock rows");
+        let tables = build_tables(&raw[..], &opts)
+            .unwrap()
+            .expect("addStoredBlock rows");
         assert_eq!(tables.col(0).unwrap().len(), 400);
         let dict = Dictionary::new(Vec::new()).with_tables(tables);
         opts.dictionary = Some(std::sync::Arc::new(dict));
         let comp = assert_roundtrip(&raw, &opts);
         let size = |c: &[u8]| {
             let (_, root) = inspect::inspect_breakdown(c, &DecodeBudget::default()).unwrap();
-            let col = root.children.into_iter().find(|n| n.name == "$ip.dsetof").unwrap();
+            let col = root
+                .children
+                .into_iter()
+                .find(|n| n.name == "$ip.dsetof")
+                .unwrap();
             let table = col.sigs.iter().any(|s| s.shape.contains("Peer(table.1)"));
             (col.bytes, table)
         };
@@ -1646,7 +1658,13 @@ mod tests {
         recs.iter().for_each(|r| builder.push(r));
         opts.dictionary = Some(std::sync::Arc::new(builder.finish().unwrap()));
         let write = |threads| {
-            let mut w = Writer::new(Vec::new(), PackOptions { threads, ..opts.clone() });
+            let mut w = Writer::new(
+                Vec::new(),
+                PackOptions {
+                    threads,
+                    ..opts.clone()
+                },
+            );
             let mut rows = 0;
             for r in &recs {
                 rows += w.push(r).unwrap().map_or(0, |f| f.rows);

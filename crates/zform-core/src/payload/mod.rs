@@ -14,9 +14,9 @@ pub mod graph;
 pub mod ir;
 pub mod library;
 mod nibble_mix;
+mod radix;
 pub mod recur;
 mod rice;
-mod radix;
 pub(crate) mod tape;
 
 #[cfg(test)]

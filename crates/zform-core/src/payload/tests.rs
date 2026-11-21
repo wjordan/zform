@@ -440,9 +440,7 @@ fn bench_programs() {
             Op::Select => b.select(y, x, y),
             Op::Const => b.konst(5),
             Op::NibbleLut => b.nibble_lut(x, b.add_lut16(*b"0123456789abcdef")),
-            Op::ByteLut32 => {
-                b.byte_lut32(x, b.add_lut32(b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"))
-            }
+            Op::ByteLut32 => b.byte_lut32(x, b.add_lut32(b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")),
             Op::Gather => b.gather(b.add_buf(), 2, b.ri(Op::AndI, x, 0xfff8), 0),
             Op::ShlI | Op::ShrI | Op::SarI => b.ri(op, x, 7),
             _ if op.has_imm() => b.ri(op, x, 0x4039_0000_0000_0003),
@@ -486,17 +484,43 @@ fn bench_programs() {
     let col = |f: &dyn Fn(usize) -> String| (0..ROWS).map(f).collect::<Vec<_>>();
     let cols: Vec<(&str, Vec<String>)> = vec![
         ("int <1e4", col(&|i| (i * 7919 % 10_000).to_string())),
-        ("int <1e8", col(&|i| (i * 7_919_333 % 100_000_000).to_string())),
+        (
+            "int <1e8",
+            col(&|i| (i * 7_919_333 % 100_000_000).to_string()),
+        ),
         ("int 19 digits", col(&|i| wide[i].to_string())),
-        ("iso time", col(&|i| {
-            format!("2026-11-{:02}T{:02}:24:{:02}Z", 1 + i % 28, i * 7 % 24, i * 13 % 60)
-        })),
-        ("uuid", col(&|i| {
-            format!("{:08x}-0000-4000-8000-{:012x}", wide[i] as u32, wide[i] as u64 >> 16)
-        })),
-        ("ip:port", col(&|i| {
-            format!("10.250.{}.{}:{}", i % 7, i * 37 % 256, 50_000 + i * 31 % 9_000)
-        })),
+        (
+            "iso time",
+            col(&|i| {
+                format!(
+                    "2026-11-{:02}T{:02}:24:{:02}Z",
+                    1 + i % 28,
+                    i * 7 % 24,
+                    i * 13 % 60
+                )
+            }),
+        ),
+        (
+            "uuid",
+            col(&|i| {
+                format!(
+                    "{:08x}-0000-4000-8000-{:012x}",
+                    wide[i] as u32,
+                    wide[i] as u64 >> 16
+                )
+            }),
+        ),
+        (
+            "ip:port",
+            col(&|i| {
+                format!(
+                    "10.250.{}.{}:{}",
+                    i % 7,
+                    i * 37 % 256,
+                    50_000 + i * 31 % 9_000
+                )
+            }),
+        ),
         ("hex16", col(&|i| format!("{:016x}", wide[i]))),
     ];
     let reg = PackRegistry::default();
@@ -550,7 +574,10 @@ fn random_recurrences_match_the_scalar_evaluator() {
         let taps: Vec<(u32, u32)> = (0..n_taps)
             .map(|_| {
                 let lane = (splitmix64(&mut rng) % u64::from(n_state)) as u32;
-                (lane, [1, 2, 3, 5, 31, 64, 300][(splitmix64(&mut rng) % 7) as usize])
+                (
+                    lane,
+                    [1, 2, 3, 5, 31, 64, 300][(splitmix64(&mut rng) % 7) as usize],
+                )
             })
             .collect();
         let n_vals = u64::from(prog.n_in) + prog.ops.len() as u64;
@@ -611,7 +638,11 @@ fn recur_xoroshiro128p() -> RecurrenceSpec {
     let (s0, s1) = (b.input(0), b.input(1));
     let out = b.rr(Op::Add, s0, s1);
     let t = b.rr(Op::Xor, s1, s0);
-    let n0 = b.rr(Op::Xor, b.rr(Op::Xor, rotl(&b, s0, 24), t), b.ri(Op::ShlI, t, 16));
+    let n0 = b.rr(
+        Op::Xor,
+        b.rr(Op::Xor, rotl(&b, s0, 24), t),
+        b.ri(Op::ShlI, t, 16),
+    );
     let n1 = rotl(&b, t, 37);
     RecurrenceSpec {
         n_state: 2,
@@ -636,7 +667,11 @@ fn recur_pcg64() -> RecurrenceSpec {
     let keep = b.rr(Op::And, b.ri(Op::OrI, p, i_lo), b.ri(Op::XorI, n_lo, -1));
     let carry = b.ri(Op::ShrI, b.rr(Op::Or, b.ri(Op::AndI, p, i_lo), keep), 63);
     let cross = b.rr(Op::Add, b.ri(Op::MulI, hi, m_lo), b.ri(Op::MulI, lo, m_hi));
-    let n_hi = b.rr(Op::Add, b.rr(Op::Add, cross, b.ri(Op::MulHiI, lo, m_lo)), carry);
+    let n_hi = b.rr(
+        Op::Add,
+        b.rr(Op::Add, cross, b.ri(Op::MulHiI, lo, m_lo)),
+        carry,
+    );
     let n_hi = b.ri(Op::AddI, n_hi, i_hi);
     let x = b.rr(Op::Xor, n_hi, n_lo);
     let r = b.ri(Op::ShrI, n_hi, 58);
@@ -1303,7 +1338,8 @@ fn compact_numeric_graphs_match_general_execution_and_reject_bad_frames() {
             let graph = builder.finish(root).fuse_numeric_programs();
             for wire in [graph.encode(), graph.encode_numeric()] {
                 let parsed = PayloadGraph::decode(&wire, &budget).unwrap();
-                let expected = CoreDecoder::decode_ints(&graph, &ExtInputs::empty(), &budget).unwrap();
+                let expected =
+                    CoreDecoder::decode_ints(&graph, &ExtInputs::empty(), &budget).unwrap();
                 assert_eq!(
                     CoreDecoder::decode_ints_bytes(&wire, &budget).unwrap(),
                     expected
@@ -1433,15 +1469,19 @@ fn templates_escape_literal_separators_and_pass_slot_bytes_through() {
 fn dictionary_columns_decode_to_lazy_dictionary_views() {
     use super::graph::ExtInputs;
     use crate::cells::Col;
-    let rows: Vec<&[u8]> = (0..200).map(|i| [&b"GET"[..], b"PUT", b"DELETE"][i % 3]).collect();
+    let rows: Vec<&[u8]> = (0..200)
+        .map(|i| [&b"GET"[..], b"PUT", b"DELETE"][i % 3])
+        .collect();
     for quoted in [false, true] {
         let mut gb = GraphBuilder::new(rows.len());
         let mut root = gb.add_dict_cells(&rows);
         if quoted {
             root = gb.add_quote_or_null(root, None);
         }
-        let graph = PayloadGraph::decode(&gb.finish(root).encode(), &DecodeBudget::default()).unwrap();
-        let col = CoreDecoder::decode_col(&graph, &ExtInputs::empty(), &DecodeBudget::default()).unwrap();
+        let graph =
+            PayloadGraph::decode(&gb.finish(root).encode(), &DecodeBudget::default()).unwrap();
+        let col =
+            CoreDecoder::decode_col(&graph, &ExtInputs::empty(), &DecodeBudget::default()).unwrap();
         let dict_col = match &col {
             Col::Quoted { inner, .. } if quoted => inner.as_ref(),
             other => other,
@@ -1528,12 +1568,20 @@ fn fixed_cells_keep_each_lanes_low_bytes() {
     }
     for w in 1..=8u8 {
         let mut gb = GraphBuilder::new(lanes.len());
-        let ints = if w == 8 { gb.add_planes(&planes, 8) } else { gb.add_ints(&lanes) };
+        let ints = if w == 8 {
+            gb.add_planes(&planes, 8)
+        } else {
+            gb.add_ints(&lanes)
+        };
         let root = gb.add_fixed_cells(ints, w);
         let cells =
             CoreDecoder::decode_bytes(&gb.finish(root).encode(), &DecodeBudget::default()).unwrap();
         for (r, v) in lanes.iter().enumerate() {
-            assert_eq!(cells.get(r).unwrap(), &v.to_le_bytes()[..w as usize], "w={w} r={r}");
+            assert_eq!(
+                cells.get(r).unwrap(),
+                &v.to_le_bytes()[..w as usize],
+                "w={w} r={r}"
+            );
         }
     }
 }
@@ -1560,7 +1608,10 @@ fn match_index_joins_by_key_rank_and_rejects_bad_codes() {
     // Second key-0 row, first key-1 row, a miss, second key-1 row.
     let got = decode(&match_graph(&[0, 1, 7, 1], &[2, 1, 0, 2])).unwrap();
     assert_eq!(got.iter().collect::<Vec<_>>(), [b"v2", b"v1", b"v0", b"v4"]);
-    assert!(decode(&match_graph(&[0], &[3])).is_err(), "rank past the key's rows");
+    assert!(
+        decode(&match_graph(&[0], &[3])).is_err(),
+        "rank past the key's rows"
+    );
     assert!(decode(&match_graph(&[0], &[-1])).is_err(), "negative code");
     assert!(decode(&match_graph(&[5], &[1])).is_err(), "key not in hay");
     assert!(decode(&match_graph(&[-1], &[1])).is_err(), "negative key");
@@ -1585,7 +1636,9 @@ fn ext_align_requires_declared_peers_and_supplied_alignment() {
     let g = gb.finish(root);
     let wire = g.encode();
     assert_eq!(PayloadGraph::decode(&wire, &budget).unwrap(), g);
-    let peers = [Arc::new(crate::cells::Cells::from_lens(b"k0k1".to_vec(), &[2, 2]).unwrap())];
+    let peers = [Arc::new(
+        crate::cells::Cells::from_lens(b"k0k1".to_vec(), &[2, 2]).unwrap(),
+    )];
     let aligned = [vec![1i64, 1]];
     let ext = super::graph::ExtInputs {
         peers: &peers,
@@ -1605,7 +1658,10 @@ fn ext_align_requires_declared_peers_and_supplied_alignment() {
         let pos = (0..bad.len()).rev().find(|&i| bad[i] == 22).unwrap();
         bad[pos + 1] = key;
         bad[pos + 2] = at;
-        assert!(PayloadGraph::decode(&bad, &budget).is_err(), "key={key} at={at}");
+        assert!(
+            PayloadGraph::decode(&bad, &budget).is_err(),
+            "key={key} at={at}"
+        );
     }
 }
 
@@ -1621,7 +1677,12 @@ fn keyed(
     let s = gb.add_ints(sel);
     let streams = streams.iter().map(|v| gb.add_ints(v)).collect();
     let d = gb.push(GraphNode::Interleave { sel: s, streams });
-    let root = gb.push(GraphNode::KeyedSum { keys: k, deltas: d, order: None, seed: SumSeed::Previous });
+    let root = gb.push(GraphNode::KeyedSum {
+        keys: k,
+        deltas: d,
+        order: None,
+        seed: SumSeed::Previous,
+    });
     let g = PayloadGraph::decode(&gb.finish(root).encode(), budget)?;
     CoreDecoder::decode_ints(&g, &Default::default(), budget)
 }
@@ -1631,23 +1692,51 @@ fn keyed_sums_run_a_state_per_key_over_interleaved_streams() {
     let budget = DecodeBudget::default();
     // Key 0 passes its value through; keys 1 and 2 each keep a running sum, key 2's first
     // stepping from key 1's.
-    let got = keyed(&[1, 2, 0, 1, 2, 1], &[0, 1, 1, 0, 1, 0], &[&[10, 1, -3], &[100, 7, 5]], &budget);
+    let got = keyed(
+        &[1, 2, 0, 1, 2, 1],
+        &[0, 1, 1, 0, 1, 0],
+        &[&[10, 1, -3], &[100, 7, 5]],
+        &budget,
+    );
     assert_eq!(got.unwrap(), [10, 110, 7, 11, 115, 8]);
-    assert!(keyed(&[1, 1], &[0, 2], &[&[1], &[2]], &budget).is_err(), "selector past the streams");
-    assert!(keyed(&[1, 1], &[0, 0], &[&[1], &[2]], &budget).is_err(), "stream underrun");
-    assert!(keyed(&[1], &[0], &[&[1, 2]], &budget).is_err(), "trailing stream values");
-    assert!(keyed(&[3, 1], &[0, 0], &[&[1, 2]], &budget).is_err(), "key past the row count");
-    assert!(keyed(&[-1, 1], &[0, 0], &[&[1, 2]], &budget).is_err(), "negative key");
+    assert!(
+        keyed(&[1, 1], &[0, 2], &[&[1], &[2]], &budget).is_err(),
+        "selector past the streams"
+    );
+    assert!(
+        keyed(&[1, 1], &[0, 0], &[&[1], &[2]], &budget).is_err(),
+        "stream underrun"
+    );
+    assert!(
+        keyed(&[1], &[0], &[&[1, 2]], &budget).is_err(),
+        "trailing stream values"
+    );
+    assert!(
+        keyed(&[3, 1], &[0, 0], &[&[1, 2]], &budget).is_err(),
+        "key past the row count"
+    );
+    assert!(
+        keyed(&[-1, 1], &[0, 0], &[&[1, 2]], &budget).is_err(),
+        "negative key"
+    );
     let tight = DecodeBudget {
         max_single_alloc_bytes: 64,
         ..DecodeBudget::default()
     };
     let ones = vec![1i64; 16];
-    assert!(keyed(&ones, &[0; 16], &[&ones], &tight).is_err(), "allocation budget");
+    assert!(
+        keyed(&ones, &[0; 16], &[&ones], &tight).is_err(),
+        "allocation budget"
+    );
     // References must point back.
     let mut gb = GraphBuilder::new(1);
     let k = gb.add_ints(&[0]);
-    let root = gb.push(GraphNode::KeyedSum { keys: k, deltas: k, order: None, seed: SumSeed::Previous });
+    let root = gb.push(GraphNode::KeyedSum {
+        keys: k,
+        deltas: k,
+        order: None,
+        seed: SumSeed::Previous,
+    });
     let mut wire = gb.finish(root).encode();
     let at = wire.len() - 2;
     assert_eq!(wire[at - 2], 25);
@@ -1671,17 +1760,31 @@ fn variants_and_cell_ids_number_cells() {
         aligned: &aligned,
         ..Default::default()
     };
-    assert_eq!(CoreDecoder::decode_ints(&g, &ext, &budget).unwrap(), [3, 14, 5, 26]);
+    assert_eq!(
+        CoreDecoder::decode_ints(&g, &ext, &budget).unwrap(),
+        [3, 14, 5, 26]
+    );
     // A variant node needs the block's layout.
     assert!(CoreDecoder::decode_ints(&g, &Default::default(), &budget).is_err());
 }
 
-fn sum_graph(keys: &[i64], deltas: &[i64], order: Option<&[i64]>, seed: SumSeed, cells: bool) -> PayloadGraph {
+fn sum_graph(
+    keys: &[i64],
+    deltas: &[i64],
+    order: Option<&[i64]>,
+    seed: SumSeed,
+    cells: bool,
+) -> PayloadGraph {
     let mut gb = GraphBuilder::new(keys.len());
     let keys = gb.add_ints(keys);
     let deltas = gb.add_ints(deltas);
     let order = order.map(|v| gb.add_ints(v));
-    let mut root = gb.push(GraphNode::KeyedSum { keys, deltas, order, seed });
+    let mut root = gb.push(GraphNode::KeyedSum {
+        keys,
+        deltas,
+        order,
+        seed,
+    });
     if cells {
         root = gb.add_prog_cells(prog_fmt_int(false, 0), vec![root], vec![]);
     }
@@ -1698,16 +1801,35 @@ fn keyed_sum_order_and_seed_are_independent() {
         (SumSeed::Zero, None, [10, 100, 999, 11, 105, 8]),
         (SumSeed::Previous, None, [10, 110, 999, 11, 115, 8]),
         (SumSeed::Zero, Some(&order[..]), [11, 100, 999, 1, 105, 8]),
-        (SumSeed::Previous, Some(&order[..]), [111, 100, 999, 101, 105, 108]),
+        (
+            SumSeed::Previous,
+            Some(&order[..]),
+            [111, 100, 999, 101, 105, 108],
+        ),
     ] {
         let g = sum_graph(&keys, &deltas, order, seed, false);
-        assert_eq!(CoreDecoder::decode_ints(&g, &Default::default(), &budget).unwrap(), want);
+        assert_eq!(
+            CoreDecoder::decode_ints(&g, &Default::default(), &budget).unwrap(),
+            want
+        );
     }
-    let g = sum_graph(&[1, 1, 1], &[i64::MAX, 1, -1], Some(&[0, 0, 0]), SumSeed::Zero, false);
-    assert_eq!(CoreDecoder::decode_ints(&g, &Default::default(), &budget).unwrap(), [i64::MAX, i64::MIN, i64::MAX]);
+    let g = sum_graph(
+        &[1, 1, 1],
+        &[i64::MAX, 1, -1],
+        Some(&[0, 0, 0]),
+        SumSeed::Zero,
+        false,
+    );
+    assert_eq!(
+        CoreDecoder::decode_ints(&g, &Default::default(), &budget).unwrap(),
+        [i64::MAX, i64::MIN, i64::MAX]
+    );
     // Passthrough rows do not initialize another key, even when keys seed from the last sum.
     let g = sum_graph(&[0, 1], &[99, 2], Some(&[0, 1]), SumSeed::Previous, false);
-    assert_eq!(CoreDecoder::decode_ints(&g, &Default::default(), &budget).unwrap(), [99, 2]);
+    assert_eq!(
+        CoreDecoder::decode_ints(&g, &Default::default(), &budget).unwrap(),
+        [99, 2]
+    );
 }
 
 #[test]
@@ -1716,15 +1838,27 @@ fn keyed_sum_wire_checks_its_options() {
     let plain = [3, 0, 3, 1, 0, 3, 2, 1, 0, 3, 20, 25, 0, 1, 2];
     let g = PayloadGraph::decode(&plain, &budget).unwrap();
     assert_eq!(g.encode(), plain);
-    assert_eq!(CoreDecoder::decode_ints(&g, &Default::default(), &budget).unwrap(), [10, 20, 30]);
-    let g = sum_graph(&[1, 1, 1], &[10, 10, 10], Some(&[0, 0, 0]), SumSeed::Zero, false);
+    assert_eq!(
+        CoreDecoder::decode_ints(&g, &Default::default(), &budget).unwrap(),
+        [10, 20, 30]
+    );
+    let g = sum_graph(
+        &[1, 1, 1],
+        &[10, 10, 10],
+        Some(&[0, 0, 0]),
+        SumSeed::Zero,
+        false,
+    );
     let wire = g.encode();
     let at = wire.len() - 6;
     assert_eq!(&wire[at..], &[153, 0, 1, 3, 2, 3]);
     for (pos, val) in [(at + 3, 4), (at + 3, 0), (at + 4, 3)] {
         let mut bad = wire.clone();
         bad[pos] = val;
-        assert!(PayloadGraph::decode(&bad, &budget).is_err(), "pos={pos} val={val}");
+        assert!(
+            PayloadGraph::decode(&bad, &budget).is_err(),
+            "pos={pos} val={val}"
+        );
     }
     for end in at + 1..wire.len() {
         assert!(PayloadGraph::decode(&wire[..end], &budget).is_err());
@@ -1738,7 +1872,10 @@ fn keyed_sum_wire_checks_its_options() {
         let g = sum_graph(keys, deltas, Some(order), SumSeed::Zero, false);
         assert!(CoreDecoder::decode_ints(&g, &Default::default(), &budget).is_err());
     }
-    let tight = DecodeBudget { max_single_alloc_bytes: 64, ..budget };
+    let tight = DecodeBudget {
+        max_single_alloc_bytes: 64,
+        ..budget
+    };
     let g = sum_graph(&[1; 16], &[1; 16], Some(&[0; 16]), SumSeed::Zero, false);
     assert!(CoreDecoder::decode_ints(&g, &Default::default(), &tight).is_err());
 }
@@ -1751,10 +1888,18 @@ fn keyed_sum_partial_reads_keep_logical_predecessors_and_full_key_bound() {
             let g = sum_graph(&[3, 3, 3], &[1, 10, 100], order, seed, true);
             let ext = Default::default();
             let whole = CoreDecoder::decode_col(&g, &ext, &budget).unwrap();
-            let first = CoreDecoder::decode_col_reading(&g, &ext, &budget, Some(&[(0, 1)])).unwrap();
+            let first =
+                CoreDecoder::decode_col_reading(&g, &ext, &budget, Some(&[(0, 1)])).unwrap();
             let (mut a, mut b) = (Vec::new(), Vec::new());
             assert_eq!(first.get(0, &mut a).unwrap(), whole.get(0, &mut b).unwrap());
-            assert_eq!(first.get(0, &mut a).unwrap(), if order.is_some() { &b"111"[..] } else { &b"1"[..] });
+            assert_eq!(
+                first.get(0, &mut a).unwrap(),
+                if order.is_some() {
+                    &b"111"[..]
+                } else {
+                    &b"1"[..]
+                }
+            );
         }
     }
 }

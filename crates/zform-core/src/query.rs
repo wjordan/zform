@@ -544,9 +544,15 @@ fn b64_digit(c: u8) -> Option<u8> {
 fn b64_cores(needle: &[u8]) -> Option<Vec<Vec<u8>>> {
     // Padding ends a value; such a needle is rare enough to keep without a test.
     if needle.is_empty() || needle.contains(&b'=') {
-        return needle.iter().all(|&c| c == b'=' || b64_digit(c).is_some()).then(Vec::new);
+        return needle
+            .iter()
+            .all(|&c| c == b'=' || b64_digit(c).is_some())
+            .then(Vec::new);
     }
-    let v: Vec<u8> = needle.iter().map(|&c| b64_digit(c)).collect::<Option<_>>()?;
+    let v: Vec<u8> = needle
+        .iter()
+        .map(|&c| b64_digit(c))
+        .collect::<Option<_>>()?;
     let (mut cores, mut screens) = (Vec::new(), true);
     for a in 0..4 {
         let (lo, hi) = (6 * a, 6 * (a + v.len()));
@@ -634,7 +640,12 @@ fn crossings(s: &Shape, needle: &[u8]) -> Option<Vec<Vec<CellTest>>> {
         /// The needle goes on from its byte `pos` at the start of the cell of slot `slot`.
         fn cell(&mut self, slot: usize, pos: usize) {
             let n = self.needle.len();
-            let test = |lie, to| CellTest { slot, lie, from: pos, to };
+            let test = |lie, to| CellTest {
+                slot,
+                lie,
+                from: pos,
+                to,
+            };
             self.tests.push(test(Lie::Start, n));
             self.out.push(self.tests.clone());
             for to in pos..n {
@@ -648,7 +659,12 @@ fn crossings(s: &Shape, needle: &[u8]) -> Option<Vec<Vec<CellTest>>> {
         }
     }
     let n = needle.len();
-    let mut w = Walk { s, needle, tests: Vec::new(), out: Vec::new() };
+    let mut w = Walk {
+        s,
+        needle,
+        tests: Vec::new(),
+        out: Vec::new(),
+    };
     for slot in 0..s.slots.len() {
         // It starts in the literal before the cell, or in the cell.
         let l = &s.literals[slot];
@@ -661,7 +677,12 @@ fn crossings(s: &Shape, needle: &[u8]) -> Option<Vec<Vec<CellTest>>> {
             if w.out.len() > MOST {
                 return None;
             }
-            w.tests.push(CellTest { slot, lie: Lie::End, from: 0, to });
+            w.tests.push(CellTest {
+                slot,
+                lie: Lie::End,
+                from: 0,
+                to,
+            });
             w.literal(slot + 1, to);
             w.tests.pop();
         }
@@ -745,9 +766,10 @@ impl DerivedWalk {
                 walk |= match c {
                     JsonCand::MultiConcat { b64: true, .. } => {
                         self.b64_cores.is_empty()
-                            || self.b64_cores.iter().any(|core| {
-                                may_lie_in(core.needle(), &lits, &gaps, false)
-                            })
+                            || self
+                                .b64_cores
+                                .iter()
+                                .any(|core| may_lie_in(core.needle(), &lits, &gaps, false))
                     }
                     _ => may_lie_in(needle, &lits, &gaps, true),
                 };
@@ -767,10 +789,14 @@ impl DerivedWalk {
 fn cand_parts(c: &JsonCand) -> (Vec<&[u8]>, &[u16]) {
     match c {
         JsonCand::Copy { ref_path } => (vec![&[], &[]], std::slice::from_ref(ref_path)),
-        JsonCand::Affix { prefix, ref_path, suffix } => {
-            (vec![prefix, suffix], std::slice::from_ref(ref_path))
+        JsonCand::Affix {
+            prefix,
+            ref_path,
+            suffix,
+        } => (vec![prefix, suffix], std::slice::from_ref(ref_path)),
+        JsonCand::MultiConcat { lits, refs, .. } => {
+            (lits.iter().map(Vec::as_slice).collect(), refs)
         }
-        JsonCand::MultiConcat { lits, refs, .. } => (lits.iter().map(Vec::as_slice).collect(), refs),
     }
 }
 
@@ -802,9 +828,9 @@ fn path_letters(
             _ => {
                 let (lits, refs) = cand_parts(c);
                 lits.iter().fold(0, |a, x| a | letters_of(x))
-                    | refs
-                        .iter()
-                        .fold(0, |a, &x| a | path_letters(jt, cols, memo, x as usize, r, depth + 1))
+                    | refs.iter().fold(0, |a, &x| {
+                        a | path_letters(jt, cols, memo, x as usize, r, depth + 1)
+                    })
             }
         };
     }
@@ -857,7 +883,11 @@ fn may_lie_in(n: &[u8], lits: &[&[u8]], gaps: &[u32], crossing: bool) -> bool {
                 settle((part, at + 1, MIXED), &mut next);
             } else if part % 2 == 1 && allowed(gaps[part / 2], b) {
                 let gap = (part / 2) as u32;
-                let from = if from == NONE || from == gap { gap } else { MIXED };
+                let from = if from == NONE || from == gap {
+                    gap
+                } else {
+                    MIXED
+                };
                 settle((part, 0, from), &mut next);
             }
         }
@@ -1023,12 +1053,13 @@ impl NeedlePlan {
                     // A free part's cell stands as a word only where the text beside it in the
                     // value is no word byte.
                     let free_joins = |c: &JsonCand, own: usize| match c {
-                        JsonCand::MultiConcat { lits: ls, refs, .. } => {
-                            refs.iter().position(|&r| r as usize == own).is_none_or(|j| {
+                        JsonCand::MultiConcat { lits: ls, refs, .. } => refs
+                            .iter()
+                            .position(|&r| r as usize == own)
+                            .is_none_or(|j| {
                                 let open = |b: Option<&u8>| b.is_some_and(|&b| !is_word(b));
                                 open(ls[j].last()) && open(ls[j + 1].first())
-                            })
-                        }
+                            }),
                         _ => true,
                     };
                     let mut hooks = vec![Vec::new(); jt.paths.len()];
@@ -1042,7 +1073,13 @@ impl NeedlePlan {
                             hooks[pi] = p
                                 .shapes
                                 .iter()
-                                .map(|sh| if sure_shape(sh) { vec![(0, 0)] } else { Vec::new() })
+                                .map(|sh| {
+                                    if sure_shape(sh) {
+                                        vec![(0, 0)]
+                                    } else {
+                                        Vec::new()
+                                    }
+                                })
                                 .collect();
                         }
                         for shape in p.shapes.iter().filter(|sh| !any_sure || !sure_shape(sh)) {
@@ -1068,12 +1105,17 @@ impl NeedlePlan {
                         word && !p.cands.iter().all(|c| free_joins(c, pi))
                     };
                     let rebuilds = || {
-                        jt.paths.iter().enumerate().any(|(pi, p)| {
-                            every((pi, p)) || p.cands.iter().any(rebuilt)
-                        })
+                        jt.paths
+                            .iter()
+                            .enumerate()
+                            .any(|(pi, p)| every((pi, p)) || p.cands.iter().any(rebuilt))
                     };
                     if exact && (hooks.iter().any(|h| !h.is_empty()) || rebuilds()) {
-                        let cands = jt.paths.iter().map(|p| p.cands.iter().map(rebuilt).collect()).collect();
+                        let cands = jt
+                            .paths
+                            .iter()
+                            .map(|p| p.cands.iter().map(rebuilt).collect())
+                            .collect();
                         let every = jt.paths.iter().enumerate().map(every).collect::<Vec<_>>();
                         unscanned.extend(
                             (0..jt.paths.len())
@@ -1109,8 +1151,9 @@ impl NeedlePlan {
         }
         // Shape rows read a column's cells in row order, so `cell_rows` places the cells of a
         // column that only shapes write; one that other variants share it cannot.
-        let mut scan_cols: Vec<bool> =
-            (0..n_cols).map(|c| verbatim[c] && (users[c] == 1 || shaped[c])).collect();
+        let mut scan_cols: Vec<bool> = (0..n_cols)
+            .map(|c| verbatim[c] && (users[c] == 1 || shaped[c]))
+            .collect();
         for c in unscanned.into_iter().filter(|&c| c != u16::MAX) {
             scan_cols[c as usize] = false;
         }
@@ -1353,7 +1396,11 @@ pub(crate) fn needs(pred: &Predicate, m: &BlockMeta<'_>, plans: &mut Plans, need
         Predicate::Contains(needle) | Predicate::Word(needle) => {
             let np = plans.needle(m, needle, matches!(pred, Predicate::Word(_)));
             need.whole |= m.kinds & np.unknown_kinds != 0;
-            if let Some(fp) = np.derived.as_ref().and_then(|d| d.for_block(m.plan, m.dir, np.finder.needle())) {
+            if let Some(fp) = np
+                .derived
+                .as_ref()
+                .and_then(|d| d.for_block(m.plan, m.dir, np.finder.needle()))
+            {
                 fp.needs(m.kinds, m.dir, need);
             }
             // A column with a cell for every row needs no structure to place its cells.
@@ -1365,13 +1412,19 @@ pub(crate) fn needs(pred: &Predicate, m: &BlockMeta<'_>, plans: &mut Plans, need
             }
             // A cell the needle lies across may hold none of its tokens.
             let mut across = false;
-            for &c in np.cross_cols.iter().filter(|_| m.kinds & np.cross_kinds != 0) {
+            for &c in np
+                .cross_cols
+                .iter()
+                .filter(|_| m.kinds & np.cross_kinds != 0)
+            {
                 let col = m.dir.col(c);
                 need.cols[c] |= !col.summary.all_null;
                 across |= !col.summary.all_null && col.deps.pool;
             }
             // The pages whose filters hold every token of the needle.
-            if (pooled || across) && let Some(pages) = &mut need.pages {
+            if (pooled || across)
+                && let Some(pages) = &mut need.pages
+            {
                 let word = matches!(pred, Predicate::Word(_));
                 match needle_tokens(needle, word).filter(|_| !across) {
                     Some(ts) => pages
@@ -1382,16 +1435,17 @@ pub(crate) fn needs(pred: &Predicate, m: &BlockMeta<'_>, plans: &mut Plans, need
                 }
             }
             if let Some(jt) = &m.plan.json_tree {
-                let streams = plans
-                    .streams
-                    .entry((m.model, want))
-                    .or_insert_with_key(|(_, want)| {
-                        let walk = JsonWalk {
-                            want_cols: want,
-                            ..JsonWalk::default()
-                        };
-                        WalkRoute::of(jt, &walk).streams(jt)
-                    });
+                let streams =
+                    plans
+                        .streams
+                        .entry((m.model, want))
+                        .or_insert_with_key(|(_, want)| {
+                            let walk = JsonWalk {
+                                want_cols: want,
+                                ..JsonWalk::default()
+                            };
+                            WalkRoute::of(jt, &walk).streams(jt)
+                        });
                 need.streams
                     .iter_mut()
                     .zip(streams.iter())
@@ -1716,7 +1770,9 @@ fn eval_contains(
     }
     // Only rows no cell has settled need the walk.
     let walked = match &np.derived {
-        Some(d) if tri.contains(&NO) => d.for_block(plan, m.dir, np.finder.needle()).map(|fp| (d, fp)),
+        Some(d) if tri.contains(&NO) => d
+            .for_block(plan, m.dir, np.finder.needle())
+            .map(|fp| (d, fp)),
         _ => None,
     };
     if let (Some((d, fp)), Some(jt), Some(jvi)) = (walked, &plan.json_tree, json_variant(plan)) {
@@ -1788,7 +1844,11 @@ fn cross_rows(
     // By row of a `Cross` variant: the crossings no cell has ruled out yet, as bits.
     let mut open = Vec::new();
     let mut scratch = Vec::new();
-    for &c in np.cross_cols.iter().filter(|&&c| !m.dir.col(c).summary.all_null) {
+    for &c in np
+        .cross_cols
+        .iter()
+        .filter(|&&c| !m.dir.col(c).summary.all_null)
+    {
         if open.is_empty() {
             open = variant_ids
                 .iter()
@@ -1809,7 +1869,8 @@ fn cross_rows(
                 let PlanVariant::Shape(s) = v else {
                     return (0, Vec::new());
                 };
-                let nth = |slot: usize| s.slots[..slot].iter().filter(|&&x| x as usize == c).count();
+                let nth =
+                    |slot: usize| s.slots[..slot].iter().filter(|&&x| x as usize == c).count();
                 let tests = np.cross[vi]
                     .iter()
                     .enumerate()
@@ -1994,7 +2055,9 @@ fn scan_col(
                 }
                 let run = &order[a..b];
                 let to = from as usize + *ends.last().unwrap() as usize;
-                scan_buf(&bytes[from as usize..to], &ends, &mut |k| hit(run[k] as usize));
+                scan_buf(&bytes[from as usize..to], &ends, &mut |k| {
+                    hit(run[k] as usize)
+                });
                 a = b;
             }
         }
@@ -2102,7 +2165,9 @@ fn materialize(
                     }
                     if *b64 {
                         if !crate::json_tree::b64_text_ok(&text) {
-                            return Err(Error::Format("Base64 candidate text not printable".into()));
+                            return Err(Error::Format(
+                                "Base64 candidate text not printable".into(),
+                            ));
                         }
                         out.push(b'"');
                         crate::lex::format_base64(&text, out);
@@ -2292,10 +2357,21 @@ mod tests {
             literals: lits.iter().map(|l| l.as_bytes().to_vec()).collect(),
             slots: slots.to_vec(),
         };
-        let t = |slot, lie, from, to| CellTest { slot, lie, from, to };
+        let t = |slot, lie, from, to| CellTest {
+            slot,
+            lie,
+            from,
+            to,
+        };
         let s = shape(&["block id_", " src: /", ""], &[0, 1]);
-        assert_eq!(crossings(&s, b"id_71"), Some(vec![vec![t(0, Lie::Start, 3, 5)]]));
-        assert_eq!(crossings(&s, b"71 src"), Some(vec![vec![t(0, Lie::End, 0, 2)]]));
+        assert_eq!(
+            crossings(&s, b"id_71"),
+            Some(vec![vec![t(0, Lie::Start, 3, 5)]])
+        );
+        assert_eq!(
+            crossings(&s, b"71 src"),
+            Some(vec![vec![t(0, Lie::End, 0, 2)]])
+        );
         // A cell may hold any text, the next literal's included.
         assert_eq!(
             crossings(&s, b"id_7 src: /10"),
@@ -2307,7 +2383,10 @@ mod tests {
         );
         assert_eq!(crossings(&s, b"zzz"), Some(Vec::new()));
         // Cells with no text between them split a needle anywhere.
-        assert_eq!(crossings(&shape(&["", "", ""], &[0, 1]), b"0123456789"), None);
+        assert_eq!(
+            crossings(&shape(&["", "", ""], &[0, 1]), b"0123456789"),
+            None
+        );
     }
 
     #[test]

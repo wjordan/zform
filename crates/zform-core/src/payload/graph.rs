@@ -1282,10 +1282,17 @@ impl GraphNode {
             | Self::ExtAlign { .. }
             | Self::ExtVariant => {}
             Self::ByteChunks { buf, .. } => f(*buf),
-            Self::KeyedSum { keys, deltas, order, .. } => {
+            Self::KeyedSum {
+                keys,
+                deltas,
+                order,
+                ..
+            } => {
                 f(*keys);
                 f(*deltas);
-                if let Some(order) = order { f(*order); }
+                if let Some(order) = order {
+                    f(*order);
+                }
             }
             Self::CellIds { cells } => f(*cells),
             Self::Interleave { sel, streams } => {
@@ -1459,7 +1466,12 @@ impl GraphNode {
                 map: map.map(&mut f),
             },
             Self::ParseAsciiInt { cells } => Self::ParseAsciiInt { cells: f(*cells) },
-            Self::KeyedSum { keys, deltas, order, seed } => Self::KeyedSum {
+            Self::KeyedSum {
+                keys,
+                deltas,
+                order,
+                seed,
+            } => Self::KeyedSum {
                 keys: f(*keys),
                 deltas: f(*deltas),
                 order: order.map(&mut f),
@@ -1517,8 +1529,7 @@ impl PayloadGraph {
             if stream.len() < 512
                 || matches!(
                     stream,
-                    IntStream::Const { .. }
-                        | IntStream::NibbleMix { .. }
+                    IntStream::Const { .. } | IntStream::NibbleMix { .. }
                 )
             {
                 continue;
@@ -2061,7 +2072,9 @@ pub(crate) fn mtf_split(vals: &[i64]) -> (Vec<i64>, Vec<i64>) {
     // use, counted over a bitmap of last-use times instead of searched for in the list.
     let mut uses = LastUses::new(vals.len());
     // Last uses by offset from the minimum when the values span little more than their count.
-    let (lo, hi) = vals.iter().fold((i64::MAX, i64::MIN), |(l, h), &v| (l.min(v), h.max(v)));
+    let (lo, hi) = vals
+        .iter()
+        .fold((i64::MAX, i64::MIN), |(l, h), &v| (l.min(v), h.max(v)));
     let span = (hi as i128 - lo as i128) as u128;
     let mut dense = if span < (vals.len() as u128) * 2 + 1024 {
         vec![u32::MAX; span as usize + 1]
@@ -3025,14 +3038,21 @@ fn encode_node_linked(n: &GraphNode, lib: Option<&Library>, out: &mut Vec<u8>) {
             put_uvarint(out, *hay as u64);
             put_uvarint(out, *codes as u64);
         }
-        GraphNode::KeyedSum { keys, deltas, order, seed } => {
+        GraphNode::KeyedSum {
+            keys,
+            deltas,
+            order,
+            seed,
+        } => {
             let extended = order.is_some() || *seed == SumSeed::Zero;
             out.push(25 | if extended { 0x80 } else { 0 });
             put_uvarint(out, *keys as u64);
             put_uvarint(out, *deltas as u64);
             if extended {
                 out.push(u8::from(*seed == SumSeed::Zero) | (u8::from(order.is_some()) << 1));
-                if let Some(order) = order { put_uvarint(out, *order as u64); }
+                if let Some(order) = order {
+                    put_uvarint(out, *order as u64);
+                }
             }
         }
         GraphNode::ExtVariant => out.push(26),
@@ -3269,9 +3289,22 @@ fn decode_node(
             if options & !3 != 0 || (flag && options == 0) {
                 return Err(Error::Format("invalid KeyedSum options".into()));
             }
-            let seed = if options & 1 != 0 { SumSeed::Zero } else { SumSeed::Previous };
-            let order = if options & 2 != 0 { Some(check_ref(cur.uvar()?)?) } else { None };
-            Ok(GraphNode::KeyedSum { keys, deltas, order, seed })
+            let seed = if options & 1 != 0 {
+                SumSeed::Zero
+            } else {
+                SumSeed::Previous
+            };
+            let order = if options & 2 != 0 {
+                Some(check_ref(cur.uvar()?)?)
+            } else {
+                None
+            };
+            Ok(GraphNode::KeyedSum {
+                keys,
+                deltas,
+                order,
+                seed,
+            })
         }
         26 => Ok(GraphNode::ExtVariant),
         27 => Ok(GraphNode::CellIds {
@@ -4182,14 +4215,23 @@ impl CoreDecoder {
                     n_aligned += 1;
                     Val::Ints(v.clone())
                 }
-                GraphNode::KeyedSum { keys, deltas, order, seed } => {
+                GraphNode::KeyedSum {
+                    keys,
+                    deltas,
+                    order,
+                    seed,
+                } => {
                     // A later input row can precede an early requested row in scan order.
                     let limit = if order.is_some() { usize::MAX } else { upto };
                     let keys = as_ints(&vals[*keys as usize])?;
                     let order = order.map(|o| as_ints(&vals[o as usize])).transpose()?;
                     Val::Ints(keyed_sum(
-                        head(keys, limit), head(as_ints(&vals[*deltas as usize])?, limit),
-                        order, *seed, keys.len(), budget,
+                        head(keys, limit),
+                        head(as_ints(&vals[*deltas as usize])?, limit),
+                        order,
+                        *seed,
+                        keys.len(),
+                        budget,
                     )?)
                 }
                 GraphNode::Interleave { sel, streams } => {
@@ -4206,7 +4248,9 @@ impl CoreDecoder {
                             *at += 1;
                             streams[s].get(*at - 1)
                         });
-                        out.push(*v.ok_or_else(|| Error::Format("Interleave stream underrun".into()))?);
+                        out.push(
+                            *v.ok_or_else(|| Error::Format("Interleave stream underrun".into()))?,
+                        );
                     }
                     if upto == usize::MAX && next.iter().zip(&streams).any(|(&n, s)| n != s.len()) {
                         return Err(Error::Format("Interleave trailing values".into()));
@@ -4264,19 +4308,28 @@ fn keyed_sum(
     if keys.iter().any(|&k| k < 0) || max as u64 > key_limit as u64 {
         return Err(Error::Format("KeyedSum key out of range".into()));
     }
-    budget.check_alloc((max as usize + 1 + keys.len()).saturating_mul(16), "KeyedSum")?;
+    budget.check_alloc(
+        (max as usize + 1 + keys.len()).saturating_mul(16),
+        "KeyedSum",
+    )?;
     let indices = order.map(|o| {
         let mut indices: Vec<usize> = (0..keys.len()).filter(|&i| keys[i] != 0).collect();
         indices.sort_unstable_by_key(|&i| (o[i], i));
         indices
     });
     let mut state = vec![0i64; max as usize + 1];
-    let mut seen = if seed == SumSeed::Previous { vec![false; state.len()] } else { Vec::new() };
+    let mut seen = if seed == SumSeed::Previous {
+        vec![false; state.len()]
+    } else {
+        Vec::new()
+    };
     let mut last = 0i64;
     let mut out = deltas.to_vec();
     let mut step = |i: usize| {
         let k = keys[i] as usize;
-        if k == 0 { return; }
+        if k == 0 {
+            return;
+        }
         if seed == SumSeed::Previous && !seen[k] {
             state[k] = last;
             seen[k] = true;
@@ -4635,7 +4688,12 @@ fn prefix_lens(nodes: &[GraphNode], root: usize, upto: usize) -> Vec<usize> {
                 need(*misses, usize::MAX);
             }
             GraphNode::QuoteOrNull { inner, map: None } => need(*inner, n),
-            GraphNode::KeyedSum { keys, deltas, order: None, .. } => {
+            GraphNode::KeyedSum {
+                keys,
+                deltas,
+                order: None,
+                ..
+            } => {
                 // Key ids are bounded by the complete stream, even for a short prefix read.
                 need(*keys, usize::MAX);
                 need(*deltas, n);
@@ -4951,7 +5009,10 @@ fn bitpack_roundtrips_every_width() {
             let packed = bitpack_u64(vals.iter().copied(), bits, len);
             assert_eq!(packed.len(), (len * bits as usize).div_ceil(8));
             let back = bitunpack_u64(packed, bits, len, 0);
-            assert!(back.iter().zip(&vals).all(|(&a, &b)| a as u64 == b), "{bits}");
+            assert!(
+                back.iter().zip(&vals).all(|(&a, &b)| a as u64 == b),
+                "{bits}"
+            );
         }
     }
 }

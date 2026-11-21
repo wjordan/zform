@@ -1073,7 +1073,11 @@ mod tests {
                 .collect();
             spellings.extend(longer);
         }
-        for edge in ["09223372036854775807", "-09223372036854775808", "+9223372036854775808"] {
+        for edge in [
+            "09223372036854775807",
+            "-09223372036854775808",
+            "+9223372036854775808",
+        ] {
             spellings.push(edge.into());
         }
         for s in spellings {
@@ -1106,7 +1110,9 @@ mod tests {
 
     #[test]
     fn numeric_timestamp_separators_preserve_time_and_bytes() {
-        let expected = parse_timestamp(b"2024-02-29T23:59:59.123456+05:30").unwrap().0;
+        let expected = parse_timestamp(b"2024-02-29T23:59:59.123456+05:30")
+            .unwrap()
+            .0;
         for sep in ['T', 't', ' ', '-'] {
             for clock_sep in [':', '.'] {
                 let text = format!("2024-02-29{sep}23{clock_sep}59{clock_sep}59.123456+05:30");

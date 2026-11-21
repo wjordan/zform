@@ -8,8 +8,8 @@
 
 use crate::container::DEFAULT_FILTER_BITS;
 use crate::dictionary::with_current;
-use crate::tables::{TABLE_PEER, Tables};
 use crate::index::{FilterBuilder, MAX_PAGES};
+use crate::tables::{TABLE_PEER, Tables};
 use std::cell::{OnceCell, RefCell};
 use std::fmt;
 use std::sync::Arc;
@@ -384,7 +384,8 @@ impl PackRegistry {
         let cells = columns
             .iter()
             .map(|c| {
-                let mut cells = crate::cells::Cells::with_capacity(c.len(), c.iter().map(Vec::len).sum());
+                let mut cells =
+                    crate::cells::Cells::with_capacity(c.len(), c.iter().map(Vec::len).sum());
                 c.iter().for_each(|v| cells.push(v));
                 cells
             })
@@ -1574,12 +1575,21 @@ pub(crate) fn two_digits(b: &Builder, val: V) -> V {
 pub(crate) fn eight_digits_raw_and_ascii(b: &Builder, val: V) -> (V, V) {
     // The fields of `x`, each as its quotient `q` by `d` and above it the remainder.
     let split = |x: V, q: V, d: i64, half: i64| {
-        b.rr(Op::Add, b.ri(Op::ShlI, x, half), b.ri(Op::MulI, q, 1 - (d << half)))
+        b.rr(
+            Op::Add,
+            b.ri(Op::ShlI, x, half),
+            b.ri(Op::MulI, q, 1 - (d << half)),
+        )
     };
     let quot = |x: V, mul: i64, shr: i64, mask: i64| {
         b.ri(Op::AndI, b.ri(Op::ShrI, b.ri(Op::MulI, x, mul), shr), mask)
     };
-    let fours = split(val, b.ri(Op::ShrI, b.ri(Op::MulI, val, 109_951_163), 40), 10_000, 32);
+    let fours = split(
+        val,
+        b.ri(Op::ShrI, b.ri(Op::MulI, val, 109_951_163), 40),
+        10_000,
+        32,
+    );
     let pairs = split(fours, quot(fours, 10_486, 20, 0x7f_0000_007f), 100, 16);
     let raw = split(pairs, quot(pairs, 103, 10, 0x000f_000f_000f_000f), 10, 8);
     let ascii = b.ri(Op::AddI, raw, 0x3030_3030_3030_3030u64 as i64);
@@ -1595,7 +1605,11 @@ pub fn prog_fmt_int(is_deltas: bool, seed: i64) -> Program {
 pub(crate) fn prog_fmt_ints(vals: &[i64], is_deltas: bool) -> Program {
     let max = vals.iter().map(|v| v.unsigned_abs()).max().unwrap_or(0);
     let blocks = 1 + usize::from(max >= 10u64.pow(8)) + usize::from(max >= 10u64.pow(16));
-    let seed = if is_deltas { vals.first().copied().unwrap_or(0) } else { 0 };
+    let seed = if is_deltas {
+        vals.first().copied().unwrap_or(0)
+    } else {
+        0
+    };
     fmt_int(is_deltas, seed, blocks)
 }
 
@@ -2341,7 +2355,10 @@ impl CodecPack for PythonMtPack {
         // Draws are random bytes, and the search gives up on a column whose first 32 rows miss
         // the stream 16 times: 32 rows of ASCII are text.
         let text = rows.iter().take(32).all(|r| r.is_ascii());
-        if !text && (4..=64).contains(&w) && w.is_multiple_of(4) && rows.iter().all(|r| r.len() == w)
+        if !text
+            && (4..=64).contains(&w)
+            && w.is_multiple_of(4)
+            && rows.iter().all(|r| r.len() == w)
         {
             let mut flat = Vec::with_capacity(n * w);
             for &r in rows {
@@ -5077,7 +5094,8 @@ impl PackRegistry {
                 let (mut want, mut near) = (pick.choice, false);
                 loop {
                     let all = want == Choice::Search;
-                    (best_blob, best_cost, is_raw_fb, choice) = (Vec::new(), usize::MAX, false, want);
+                    (best_blob, best_cost, is_raw_fb, choice) =
+                        (Vec::new(), usize::MAX, false, want);
                     tapes = Default::default();
                     used_ext[cid] = false;
                     if all || matches!(want, Choice::Single(..)) {
@@ -5323,7 +5341,8 @@ impl PackRegistry {
                         if let Some(fw) = fixed_id_widths[cid] {
                             let mut tried = 0usize;
                             for src_i in (0..cid).rev() {
-                                if fixed_id_widths[src_i] == Some(fw) && !occ_streams[src_i].is_empty()
+                                if fixed_id_widths[src_i] == Some(fw)
+                                    && !occ_streams[src_i].is_empty()
                                 {
                                     let src_vals = &occ_streams[src_i];
                                     let mut lut: FastMap<&[u8], i64> =
@@ -5382,7 +5401,10 @@ impl PackRegistry {
 
                     // A sample too small for the keyed search says nothing of it.
                     let unjudged = pick.cells < KEYED_ROWS && occ_len >= KEYED_ROWS;
-                    if !must_standalone && occ_len >= 8 && (all || unjudged || want == Choice::Keyed) {
+                    if !must_standalone
+                        && occ_len >= 8
+                        && (all || unjudged || want == Choice::Keyed)
+                    {
                         // 1d. Keyed lookup: a value an earlier column holds in a record with the
                         // same key.
                         let scope = scope(Choice::Keyed);

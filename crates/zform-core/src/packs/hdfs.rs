@@ -69,7 +69,9 @@ impl RelationPack for HdfsRelations {
         if let Some(src) = task {
             return task_partition(ctx, src);
         }
-        let key = ctx.plan.columns[..cid].iter().position(|c| c.dict_group == "blk_id");
+        let key = ctx.plan.columns[..cid]
+            .iter()
+            .position(|c| c.dict_group == "blk_id");
         if field(ctx.plan, cid) == Some(1) {
             return clocks(ctx, key);
         }
@@ -195,8 +197,10 @@ fn in_pipeline_order(recs: &[&[u8]], rows: &mut [u32]) {
         })
         .collect();
     // As the table finds it, from `PacketResponder` rows.
-    let named: Vec<_> =
-        (said.iter().flatten()).filter(|s| s.0 != Role::Receiving).copied().collect();
+    let named: Vec<_> = (said.iter().flatten())
+        .filter(|s| s.0 != Role::Receiving)
+        .copied()
+        .collect();
     let Some(chain) = pipeline(&reps, &named) else {
         return;
     };
@@ -246,7 +250,11 @@ fn records_with<'a>(
     // One search over the chunk; hits lie a few records apart.
     let mut next = 0;
     for at in hits {
-        let i = next + spans[next..].iter().take_while(|&&(_, e)| e as usize <= at).count();
+        let i = next
+            + spans[next..]
+                .iter()
+                .take_while(|&&(_, e)| e as usize <= at)
+                .count();
         let Some(&(s, e)) = spans.get(i) else {
             break;
         };
@@ -268,15 +276,26 @@ fn hash(v: &[u8]) -> u64 {
 
 impl TableBuilder for Replicas {
     fn push(&mut self, raw: &[u8], spans: &[(u32, u32)]) {
-        records_with(ADDED_AT.find_iter(raw), raw, spans, ADDED.len(), |rec, at| {
-            let ip = &rec[at + ADDED.len()..];
-            // The model holds the port in a template literal.
-            let ip = &ip[..memchr::memchr2(b':', b' ', ip).unwrap_or(ip.len())];
-            if let Some(blk) = block_token(rec) {
-                let row = (lcg_state(rec), thread_id(rec), blk[4..].to_vec(), ip.to_vec());
-                self.rows.push(row);
-            }
-        });
+        records_with(
+            ADDED_AT.find_iter(raw),
+            raw,
+            spans,
+            ADDED.len(),
+            |rec, at| {
+                let ip = &rec[at + ADDED.len()..];
+                // The model holds the port in a template literal.
+                let ip = &ip[..memchr::memchr2(b':', b' ', ip).unwrap_or(ip.len())];
+                if let Some(blk) = block_token(rec) {
+                    let row = (
+                        lcg_state(rec),
+                        thread_id(rec),
+                        blk[4..].to_vec(),
+                        ip.to_vec(),
+                    );
+                    self.rows.push(row);
+                }
+            },
+        );
         // `Received` rows name every upstream `Receiving` rows do. `$` is rarer than the
         // needle's letters.
         let hits = memchr::memchr_iter(b'$', raw)
@@ -318,8 +337,11 @@ impl TableBuilder for Replicas {
         writes.sort_unstable_by_key(|w| w.0);
         let mut rows = Vec::new();
         // Blocks in hash order meet their writes in one pass over them.
-        let mut order: Vec<(u64, usize)> =
-            keys.iter().enumerate().map(|(k, blk)| (hash(blk), k)).collect();
+        let mut order: Vec<(u64, usize)> = keys
+            .iter()
+            .enumerate()
+            .map(|(k, blk)| (hash(blk), k))
+            .collect();
         order.sort_unstable();
         let mut s = 0;
         for (b, k) in order {
@@ -332,8 +354,13 @@ impl TableBuilder for Replicas {
             rows.extend(writes[s..e].iter().map(|w| (w.1, w.2, w.3)));
             let reps = &mut ips[k * REPLICAS..(k + 1) * REPLICAS];
             // An empty replica is no node.
-            let ids: [u64; REPLICAS] =
-                std::array::from_fn(|i| if reps[i].is_empty() { i as u64 } else { hash(&reps[i]) });
+            let ids: [u64; REPLICAS] = std::array::from_fn(|i| {
+                if reps[i].is_empty() {
+                    i as u64
+                } else {
+                    hash(&reps[i])
+                }
+            });
             if let Some(c) = pipeline(&ids, &rows) {
                 let mut old: [Vec<u8>; REPLICAS] = std::array::from_fn(|i| take(&mut reps[i]));
                 for (r, &i) in reps.iter_mut().zip(&c) {
@@ -380,7 +407,11 @@ fn replica(ctx: &RelationContext<'_, '_>, key: usize) -> Option<PayloadGraph> {
     // Table row `REPLICAS * id + code - 1`; code 0, a patched value, reads row 0.
     let b = Builder::new(2);
     let (id, code) = (b.input(0), b.input(1));
-    let row = b.rr(Op::Add, b.ri(Op::MulI, id, REPLICAS as i64), b.ri(Op::AddI, code, -1));
+    let row = b.rr(
+        Op::Add,
+        b.ri(Op::MulI, id, REPLICAS as i64),
+        b.ri(Op::AddI, code, -1),
+    );
     let row = b.select(code, row, b.konst(0));
     let idx = gb.add_prog_i64(b.finish(&[(row, 8)]), vec![ids, codes], vec![]);
     let base = gb.add_index_cells(source, idx);
@@ -393,7 +424,11 @@ fn field(plan: &ModelPlan, cid: usize) -> Option<usize> {
     let mut at = None;
     for v in &plan.variants {
         let PlanVariant::Shape(s) = v else { continue };
-        let mut slots = s.slots.iter().enumerate().filter(|&(_, &c)| c as usize == cid);
+        let mut slots = s
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|&(_, &c)| c as usize == cid);
         let Some((i, _)) = slots.next() else { continue };
         let (before, after) = (&s.literals[i], &s.literals[i + 1]);
         let spaced = (before.is_empty() || before.ends_with(b" "))
@@ -402,7 +437,10 @@ fn field(plan: &ModelPlan, cid: usize) -> Option<usize> {
             return None;
         }
         // Earlier slots are this format's leading numbers, which hold no spaces.
-        let f = s.literals[..=i].iter().map(|l| memchr::memchr_iter(b' ', l).count()).sum();
+        let f = s.literals[..=i]
+            .iter()
+            .map(|l| memchr::memchr_iter(b' ', l).count())
+            .sum();
         if at.is_some_and(|a| a != f) {
             return None;
         }
@@ -466,7 +504,11 @@ fn clocks(ctx: &RelationContext<'_, '_>, key: Option<usize>) -> Option<PayloadGr
         let k = clock[vid as usize] as usize;
         match seconds(v) {
             Some(t) => {
-                let from = if k > 0 { state[k].unwrap_or(last) } else { base };
+                let from = if k > 0 {
+                    state[k].unwrap_or(last)
+                } else {
+                    base
+                };
                 deltas.push((t - from + DAY / 2).rem_euclid(DAY) - DAY / 2);
                 if k > 0 {
                     // The sum, not `t`: a wrapped step leaves it a day off.
@@ -490,7 +532,9 @@ fn clocks(ctx: &RelationContext<'_, '_>, key: Option<usize>) -> Option<PayloadGr
     let slots = key.and_then(|key| deletions(ctx, key, &marked, &mut deltas));
     if slots.is_some() {
         // Steps, not times.
-        (0..n_var).filter(|&v| deletes[v] > 0).for_each(|v| recency[stream[v] as usize] = false);
+        (0..n_var)
+            .filter(|&v| deletes[v] > 0)
+            .for_each(|v| recency[stream[v] as usize] = false);
     }
     let mut gb = GraphBuilder::new(vals.len());
     // Each variant's clock, then its stream.
@@ -502,14 +546,23 @@ fn clocks(ctx: &RelationContext<'_, '_>, key: Option<usize>) -> Option<PayloadGr
     let sel = gb.add_prog_i64(lut_prog(n_var as i64), vec![vid], vec![lut]);
     let sels: Vec<usize> = vids.iter().map(|&v| stream[v as usize] as usize).collect();
     let deltas = interleave(&mut gb, sel, &sels, &deltas, &recency);
-    let mut t = gb.push(GraphNode::KeyedSum { keys, deltas, order: None, seed: SumSeed::Previous });
+    let mut t = gb.push(GraphNode::KeyedSum {
+        keys,
+        deltas,
+        order: None,
+        seed: SumSeed::Previous,
+    });
     if let (Some(slots), Some(key)) = (slots, key) {
         t = deletion_sum(&mut gb, t, key, &slots, sel, &sels, recency.len());
     }
     let b = Builder::new(1);
     // Sums stay within a few days of the base.
     let t_in = b.ri(Op::AddI, b.input(0), base + 4 * DAY);
-    let t_in = b.rr(Op::Add, t_in, b.ri(Op::MulI, b.div(t_in, DAY as u64, 20), -DAY));
+    let t_in = b.rr(
+        Op::Add,
+        t_in,
+        b.ri(Op::MulI, b.div(t_in, DAY as u64, 20), -DAY),
+    );
     let q = b.div(t_in, 60, 17);
     let h = b.div(q, 60, 11);
     let sec = b.rr(Op::Add, t_in, b.ri(Op::MulI, q, -60));
@@ -558,22 +611,30 @@ fn deletions(
         let group = &rows[j..end];
         j = end;
         let from = row_of(group[0].1) * REPLICAS;
-        state.open((from..from + REPLICAS).filter_map(|c| ips.get(c)), &mut left);
+        state.open(
+            (from..from + REPLICAS).filter_map(|c| ips.get(c)),
+            &mut left,
+        );
         // One table row per order, with a replica for each of its deletions.
         if group.len() > left.len() || group.iter().any(|r| row_of(r.1) * REPLICAS != from) {
             continue;
         }
         all.clone_from(&left);
         let cost = |c: &&[usize]| -> u32 {
-            (c.iter().zip(group)).map(|(&p, r)| bits(deltas[r.1] - state.sum(all[p]))).sum()
+            (c.iter().zip(group))
+                .map(|(&p, r)| bits(deltas[r.1] - state.sum(all[p])))
+                .sum()
         };
         let chains = CHAINS.iter().map(|c| &c[..group.len()]);
-        let chain = chains.filter(|c| c.iter().all(|&p| p < all.len())).min_by_key(cost)?;
+        let chain = chains
+            .filter(|c| c.iter().all(|&p| p < all.len()))
+            .min_by_key(cost)?;
         for (&p, &(_, i)) in chain.iter().zip(group) {
             let at = left.iter().position(|&k| k == all[p])?;
             let k = left.remove(at);
             slots[i] = (from..from + REPLICAS)
-                .position(|c| ips.get(c).and_then(|v| state.ids.get(v).copied()) == Some(k))? as i64;
+                .position(|c| ips.get(c).and_then(|v| state.ids.get(v).copied()) == Some(k))?
+                as i64;
             let step = deltas[i] - state.sum(k);
             // Inference may compare clocks across nodes; decoding keeps each key independent.
             steps[i] = if emitted.insert(k) { deltas[i] } else { step };
@@ -639,14 +700,23 @@ impl<'a> DeletionClocks<'a> {
 
 /// Explicit replica choices feed ordinary table lookups and an ordered sum.
 fn deletion_sum(
-    gb: &mut GraphBuilder, deltas: u16, key: usize, slots: &[i64],
-    sel: u16, sels: &[usize], streams: usize,
+    gb: &mut GraphBuilder,
+    deltas: u16,
+    key: usize,
+    slots: &[i64],
+    sel: u16,
+    sels: &[usize],
+    streams: usize,
 ) -> u16 {
     let at = gb.add_ext_align(key as u32, Some(TABLE_PEER));
     let slots = interleave(gb, sel, sels, slots, &vec![false; streams]);
     let b = Builder::new(2);
     let present = b.ri(Op::AddI, b.input(1), 1);
-    let index = b.rr(Op::Add, b.ri(Op::MulI, b.input(0), REPLICAS as i64), b.input(1));
+    let index = b.rr(
+        Op::Add,
+        b.ri(Op::MulI, b.input(0), REPLICAS as i64),
+        b.input(1),
+    );
     let index = b.select(present, index, b.konst(0));
     let index = gb.add_prog_i64(b.finish(&[(index, 8)]), vec![at, slots], vec![]);
     let ips = gb.add_ext_peer(TABLE_PEER | 1);
@@ -663,7 +733,12 @@ fn deletion_sum(
     let blocks = gb.add_ext_peer(TABLE_PEER);
     let blocks = gb.add_index_cells(blocks, at);
     let order = gb.add_parse_ascii_int(blocks);
-    gb.push(GraphNode::KeyedSum { keys, deltas, order: Some(order), seed: SumSeed::Zero })
+    gb.push(GraphNode::KeyedSum {
+        keys,
+        deltas,
+        order: Some(order),
+        seed: SumSeed::Zero,
+    })
 }
 
 /// The byte at `offset + x` of the program's buffer.
@@ -751,7 +826,14 @@ fn bits(step: i64) -> u32 {
 }
 
 /// The orders of up to [`REPLICAS`] replicas; fewer take the orders of their first indices.
-const CHAINS: [[usize; 3]; 6] = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+const CHAINS: [[usize; 3]; 6] = [
+    [0, 1, 2],
+    [0, 2, 1],
+    [1, 0, 2],
+    [1, 2, 0],
+    [2, 0, 1],
+    [2, 1, 0],
+];
 
 /// What a write row says of its node: nothing, its place in the pipeline, or its upstream
 /// (by replica index; `None` for the client).
@@ -875,7 +957,9 @@ fn threads(ctx: &RelationContext<'_, '_>, key: usize) -> Option<PayloadGraph> {
     while i < vals.len() {
         // A block's write rows lie together, as `row_order` stores them.
         let row = row_of(i);
-        let write = |j: usize| roles[cells[j].0].0 != Role::None && row_of(j) == row && !exc_idx.contains(&j);
+        let write = |j: usize| {
+            roles[cells[j].0].0 != Role::None && row_of(j) == row && !exc_idx.contains(&j)
+        };
         if row >= n_rows || !write(i) {
             i += 1;
             continue;
@@ -899,7 +983,10 @@ fn threads(ctx: &RelationContext<'_, '_>, key: usize) -> Option<PayloadGraph> {
         };
         let rows: Vec<_> = (i..end).map(|j| (hint(j), thread[j])).collect();
         let start: Vec<Option<i64>> = reps.iter().map(|r| last.get(r).copied()).collect();
-        let chains = CHAINS.iter().map(|c| &c[..n]).filter(|c| c.iter().all(|&p| p < n));
+        let chains = CHAINS
+            .iter()
+            .map(|c| &c[..n])
+            .filter(|c| c.iter().all(|&p| p < n));
         let (_, picks) = chains
             .map(|c| place(c, &rows, &mut start.clone(), prev))
             .min_by_key(|p| p.0)
@@ -918,7 +1005,13 @@ fn threads(ctx: &RelationContext<'_, '_>, key: usize) -> Option<PayloadGraph> {
     let vids: Vec<usize> = cells.iter().map(|c| c.0).collect();
     let code_sel = gb.add_prog_i64(lut_prog(0), vec![vid], vec![lut_node]);
     let code_sels: Vec<usize> = vids.iter().map(|&v| lut[v] as usize).collect();
-    let codes_node = interleave(&mut gb, code_sel, &code_sels, &codes, &vec![false; recency.len()]);
+    let codes_node = interleave(
+        &mut gb,
+        code_sel,
+        &code_sels,
+        &codes,
+        &vec![false; recency.len()],
+    );
     // A row with a replica reads the second table.
     let b = Builder::new(2);
     let (v, code) = (b.input(0), b.input(1));
@@ -935,7 +1028,11 @@ fn threads(ctx: &RelationContext<'_, '_>, key: usize) -> Option<PayloadGraph> {
     let ids = gb.add_ext_align(key as u32, Some(KEY));
     let b = Builder::new(2);
     let (id, code) = (b.input(0), b.input(1));
-    let row = b.rr(Op::Add, b.ri(Op::MulI, id, REPLICAS as i64), b.ri(Op::AddI, code, -1));
+    let row = b.rr(
+        Op::Add,
+        b.ri(Op::MulI, id, REPLICAS as i64),
+        b.ri(Op::AddI, code, -1),
+    );
     let row = b.select(code, row, b.konst(0));
     let idx = gb.add_prog_i64(b.finish(&[(row, 8)]), vec![ids, codes_node], vec![]);
     let nodes = gb.add_index_cells(source, idx);
@@ -944,7 +1041,12 @@ fn threads(ctx: &RelationContext<'_, '_>, key: usize) -> Option<PayloadGraph> {
     let (node, code) = (b.input(0), b.input(1));
     let k = b.select(code, b.ri(Op::AddI, node, 1), b.konst(0));
     let keys = gb.add_prog_i64(b.finish(&[(k, 8)]), vec![nodes, codes_node], vec![]);
-    let t = gb.push(GraphNode::KeyedSum { keys, deltas: steps, order: None, seed: SumSeed::Previous });
+    let t = gb.push(GraphNode::KeyedSum {
+        keys,
+        deltas: steps,
+        order: None,
+        seed: SumSeed::Previous,
+    });
     let base = gb.add_prog_cells(prog_fmt_int(false, 0), vec![t], vec![]);
     let root = gb.add_patch(base, &exc_idx, &exc_vals);
     Some(gb.finish(root))
@@ -958,7 +1060,10 @@ const RESPONDER: &[u8] = b"PacketResponder: ";
 fn said_at(r: &[u8], receiving: bool, at: usize) -> Option<(Role, &[u8])> {
     // The token from `s` to a `:` or space.
     let token = |s: usize| {
-        let n = r[s..].iter().take_while(|&&b| b != b':' && b != b' ').count();
+        let n = r[s..]
+            .iter()
+            .take_while(|&&b| b != b':' && b != b' ')
+            .count();
         (n > 0).then(|| &r[s..s + n])
     };
     // The token after the first `/` past `at`: block ids hold none.
@@ -1040,7 +1145,9 @@ fn is_write(r: &[u8]) -> bool {
 /// The first of [`WRITES`] a record says, and its offset.
 fn write_at(r: &[u8]) -> Option<(usize, usize)> {
     memchr::memchr2_iter(b'R', b'B', r).find_map(|p| {
-        let k = WRITES.iter().position(|&(w, at)| p >= at && r[p - at..].starts_with(w))?;
+        let k = WRITES
+            .iter()
+            .position(|&(w, at)| p >= at && r[p - at..].starts_with(w))?;
         Some((k, p - WRITES[k].1))
     })
 }
@@ -1066,7 +1173,11 @@ fn token_state(blk: &[u8]) -> Option<u64> {
         None => (false, t),
     };
     let v = std::str::from_utf8(d).ok()?.parse::<u64>().ok()?;
-    let v = if neg { 0i64.checked_sub_unsigned(v)? } else { i64::try_from(v).ok()? };
+    let v = if neg {
+        0i64.checked_sub_unsigned(v)?
+    } else {
+        i64::try_from(v).ok()?
+    };
     JavaLcgPack::state_of(v)
 }
 
@@ -1230,7 +1341,9 @@ mod tests {
             b"Deleting block blk_4 file /BlockReceiving block",
         ];
         for r in lines {
-            let any = WRITES.iter().any(|(w, _)| memchr::memmem::find(r, w).is_some());
+            let any = WRITES
+                .iter()
+                .any(|(w, _)| memchr::memmem::find(r, w).is_some());
             assert_eq!(is_write(r), any, "{}", String::from_utf8_lossy(r));
         }
         for (w, at) in WRITES {
@@ -1264,7 +1377,10 @@ mod tests {
         }
         b.push(&raw, &spans);
         let ips = Box::new(b).finish().remove(1);
-        assert_eq!(ips, [&b"10.250.10.6"[..], b"10.250.14.224", b"10.251.111.209"]);
+        assert_eq!(
+            ips,
+            [&b"10.250.10.6"[..], b"10.250.14.224", b"10.251.111.209"]
+        );
         let mut rows: Vec<u32> = (0..recs.len() as u32).collect();
         rows.sort_by_key(|&i| thread_id(recs[i as usize]));
         in_pipeline_order(&recs, &mut rows);
@@ -1373,24 +1489,62 @@ mod tests {
             plan: &plan,
             variant_ids: &vids,
         };
-        let graph = HdfsRelations.try_encode(&ctx, &PackRegistry::default()).unwrap();
-        assert!(graph.nodes.iter().any(|n| matches!(n, GraphNode::KeyedSum { .. })));
+        let graph = HdfsRelations
+            .try_encode(&ctx, &PackRegistry::default())
+            .unwrap();
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|n| matches!(n, GraphNode::KeyedSum { .. }))
+        );
         assert_eq!(decode_with(&plan, &vids, &cols, 2, &graph), time);
     }
 
     #[test]
     fn write_threads_step_from_their_datanodes_counters() {
-        use crate::{cells::Cells, dictionary::{Dictionary, Scope}, tables::Tables};
+        use crate::{
+            cells::Cells,
+            dictionary::{Dictionary, Scope},
+            tables::Tables,
+        };
         let mut plan = ModelPlan::residual_only();
         plan.add_or_get_col_with_group("blk", "blk_id");
         plan.add_or_get_col("thread");
         plan.add_or_get_col("ip");
         plan.add_or_get_col("n");
         let lines: [(&[&[u8]], &[u16]); 4] = [
-            (&[b"0 0 ", b" INFO dfs.FSNamesystem: allocateBlock: blk_", b""], &[2, 1]),
-            (&[b"0 0 ", b" INFO dfs.DataNode$DataXceiver: Receiving block blk_", b" src: /", b""], &[2, 1, 3]),
-            (&[b"0 0 ", b" INFO dfs.DataNode$PacketResponder: PacketResponder ", b" for block blk_", b" terminating"], &[2, 4, 1]),
-            (&[b"0 0 ", b" INFO dfs.DataNode$PacketResponder: Received block blk_", b" from /", b""], &[2, 1, 3]),
+            (
+                &[b"0 0 ", b" INFO dfs.FSNamesystem: allocateBlock: blk_", b""],
+                &[2, 1],
+            ),
+            (
+                &[
+                    b"0 0 ",
+                    b" INFO dfs.DataNode$DataXceiver: Receiving block blk_",
+                    b" src: /",
+                    b"",
+                ],
+                &[2, 1, 3],
+            ),
+            (
+                &[
+                    b"0 0 ",
+                    b" INFO dfs.DataNode$PacketResponder: PacketResponder ",
+                    b" for block blk_",
+                    b" terminating",
+                ],
+                &[2, 4, 1],
+            ),
+            (
+                &[
+                    b"0 0 ",
+                    b" INFO dfs.DataNode$PacketResponder: Received block blk_",
+                    b" from /",
+                    b"",
+                ],
+                &[2, 1, 3],
+            ),
         ];
         for (l, s) in lines {
             shape(&mut plan, l, s);
@@ -1417,7 +1571,11 @@ mod tests {
             for p in 0..3 {
                 counter[pipe[p]] += 1 + (b % 2) as i64;
                 held[p] = counter[pipe[p]];
-                let up = if p == 0 { b"10.9.9.9".to_vec() } else { node(pipe[p - 1]) };
+                let up = if p == 0 {
+                    b"10.9.9.9".to_vec()
+                } else {
+                    node(pipe[p - 1])
+                };
                 let t = format!("{}", held[p]).into_bytes();
                 row(&mut cols, 2, &[(2, t), (1, blk.clone()), (3, up)]);
             }
@@ -1427,8 +1585,20 @@ mod tests {
                     11 => b"0123".to_vec(),
                     _ => format!("{}", counter[pipe[p]]).into_bytes(),
                 };
-                row(&mut cols, 3, &[(2, t), (4, format!("{}", 2 - p).into_bytes()), (1, blk.clone())]);
-                let up = if p == 0 { b"10.9.9.9".to_vec() } else { node(pipe[p - 1]) };
+                row(
+                    &mut cols,
+                    3,
+                    &[
+                        (2, t),
+                        (4, format!("{}", 2 - p).into_bytes()),
+                        (1, blk.clone()),
+                    ],
+                );
+                let up = if p == 0 {
+                    b"10.9.9.9".to_vec()
+                } else {
+                    node(pipe[p - 1])
+                };
                 let t = format!("{}", counter[pipe[p]]).into_bytes();
                 row(&mut cols, 4, &[(2, t), (1, blk.clone()), (3, up)]);
             }
@@ -1438,7 +1608,10 @@ mod tests {
             Cells::from_lens(v.concat(), &lens).unwrap()
         };
         let table = || Tables::from_cells(vec![cells(&keys), cells(&ips)], Vec::new);
-        let cols: Vec<Vec<&[u8]>> = cols.iter().map(|c| c.iter().map(|v| &v[..]).collect()).collect();
+        let cols: Vec<Vec<&[u8]>> = cols
+            .iter()
+            .map(|c| c.iter().map(|v| &v[..]).collect())
+            .collect();
         assert_eq!(field(&plan, 2), Some(2));
         let tables = table();
         let ctx = RelationContext {
@@ -1448,26 +1621,68 @@ mod tests {
             plan: &plan,
             variant_ids: &vids,
         };
-        let graph = HdfsRelations.try_encode(&ctx, &PackRegistry::default()).unwrap();
-        assert!(graph.nodes.iter().any(|n| matches!(n, GraphNode::KeyedSum { .. })));
+        let graph = HdfsRelations
+            .try_encode(&ctx, &PackRegistry::default())
+            .unwrap();
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|n| matches!(n, GraphNode::KeyedSum { .. }))
+        );
         // Each pipeline's nodes are found: the client, then each row's upstream.
-        let rows = [(Hint::After(None), 5), (Hint::After(Some(2)), 9), (Hint::At(0), 6)];
-        assert_eq!(place(&[2, 0, 1], &rows, &mut [Some(8), None, Some(4)], 0).1, [2, 0, 2]);
+        let rows = [
+            (Hint::After(None), 5),
+            (Hint::After(Some(2)), 9),
+            (Hint::At(0), 6),
+        ];
+        assert_eq!(
+            place(&[2, 0, 1], &rows, &mut [Some(8), None, Some(4)], 0).1,
+            [2, 0, 2]
+        );
         let dict = Dictionary::new(b"content".to_vec()).with_tables(table());
         let _scope = Scope::enter(Some(Arc::new(dict)));
         let got = decode_with(&plan, &vids, &cols, 2, &graph);
-        assert!(got.iter().eq(cols[2].iter().map(|v| v.to_vec()).collect::<Vec<_>>().iter()));
+        assert!(
+            got.iter().eq(cols[2]
+                .iter()
+                .map(|v| v.to_vec())
+                .collect::<Vec<_>>()
+                .iter())
+        );
     }
 
     #[test]
     fn deletions_step_on_their_datanodes_clocks() {
-        use crate::{cells::Cells, dictionary::{Dictionary, Scope}, tables::Tables};
+        use crate::{
+            cells::Cells,
+            dictionary::{Dictionary, Scope},
+            tables::Tables,
+        };
         let mut plan = ModelPlan::residual_only();
         plan.add_or_get_col_with_group("blk", "blk_id");
         plan.add_or_get_col("date");
         plan.add_or_get_col("time");
-        shape(&mut plan, &[b"", b" ", b" 19 INFO dfs.FSDataset: Deleting block blk_", b""], &[2, 3, 1]);
-        shape(&mut plan, &[b"", b" ", b" 9 INFO dfs.DataBlockScanner: Verification succeeded for blk_", b""], &[2, 3, 1]);
+        shape(
+            &mut plan,
+            &[
+                b"",
+                b" ",
+                b" 19 INFO dfs.FSDataset: Deleting block blk_",
+                b"",
+            ],
+            &[2, 3, 1],
+        );
+        shape(
+            &mut plan,
+            &[
+                b"",
+                b" ",
+                b" 9 INFO dfs.DataBlockScanner: Verification succeeded for blk_",
+                b"",
+            ],
+            &[2, 3, 1],
+        );
         // Each node deletes its blocks in id order, a second on every other one.
         let id = |b: usize| (b * 37 % 60) as i64 - 30;
         let reps = |b: usize| [b % 5, (b + 1) % 5, (b + 3) % 5];
@@ -1517,7 +1732,10 @@ mod tests {
             Cells::from_lens(v.concat(), &lens).unwrap()
         };
         let table = || Tables::from_cells(vec![cells(&keys), cells(&ips)], Vec::new);
-        let cols: Vec<Vec<&[u8]>> = cols.iter().map(|c| c.iter().map(|v| &v[..]).collect()).collect();
+        let cols: Vec<Vec<&[u8]>> = cols
+            .iter()
+            .map(|c| c.iter().map(|v| &v[..]).collect())
+            .collect();
         assert_eq!(field(&plan, 3), Some(1));
         let tables = table();
         let ctx = RelationContext {
@@ -1527,14 +1745,27 @@ mod tests {
             plan: &plan,
             variant_ids: &vids,
         };
-        let graph = HdfsRelations.try_encode(&ctx, &PackRegistry::default()).unwrap();
-        assert!(graph.nodes.iter().any(|n| matches!(n, GraphNode::KeyedSum {
-            order: Some(_), seed: SumSeed::Zero, ..
-        })));
+        let graph = HdfsRelations
+            .try_encode(&ctx, &PackRegistry::default())
+            .unwrap();
+        assert!(graph.nodes.iter().any(|n| matches!(
+            n,
+            GraphNode::KeyedSum {
+                order: Some(_),
+                seed: SumSeed::Zero,
+                ..
+            }
+        )));
         let dict = Dictionary::new(b"content".to_vec()).with_tables(table());
         let _scope = Scope::enter(Some(Arc::new(dict)));
         let got = decode_with(&plan, &vids, &cols, 3, &graph);
-        assert!(got.iter().eq(cols[3].iter().map(|v| v.to_vec()).collect::<Vec<_>>().iter()));
+        assert!(
+            got.iter().eq(cols[3]
+                .iter()
+                .map(|v| v.to_vec())
+                .collect::<Vec<_>>()
+                .iter())
+        );
     }
 
     #[test]

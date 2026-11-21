@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use crate::cells::{Cells, Col, Pool};
+use crate::dictionary::with_current;
 use crate::grammar::{ModelPlan, PlanVariant};
 use crate::lex::parse_timestamp;
 pub use crate::packs::EncodedDenseBlock;
@@ -17,7 +18,6 @@ use crate::payload::graph::{
     NESTED_COLUMN_TAG, PayloadGraph, unpack_leaf, value_ids, with_encode_opts,
 };
 use crate::payload::library::Library;
-use crate::dictionary::with_current;
 use crate::tables::TABLE_PEER;
 use crate::wire::{Cursor, DecodeBudget, EntropyBackend, Error, Result, expand_page, put_bytes};
 
@@ -293,7 +293,12 @@ pub struct BlockDecodeCtx<'a> {
 /// For each cell of column `at`, the index of the first cell of column `key` in the same record.
 /// Only shape variants place cells by the variant alone, so any other variant is an error, as is
 /// a record holding an `at` cell and no `key` cell.
-pub fn align_cells(plan: &ModelPlan, variant_ids: &[u32], key: usize, at: usize) -> Result<Vec<i64>> {
+pub fn align_cells(
+    plan: &ModelPlan,
+    variant_ids: &[u32],
+    key: usize,
+    at: usize,
+) -> Result<Vec<i64>> {
     // Per variant, key and `at` cells per record, `at` cells `u32::MAX` for a variant whose
     // record is an error.
     let counts: Vec<(i64, u32)> = plan
@@ -316,7 +321,9 @@ pub fn align_cells(plan: &ModelPlan, variant_ids: &[u32], key: usize, at: usize)
             .ok_or_else(|| Error::Format("variant id out of range".into()))?;
         if na != 0 {
             if na == u32::MAX {
-                return Err(Error::Format("ExtAlign record has no placed key cell".into()));
+                return Err(Error::Format(
+                    "ExtAlign record has no placed key cell".into(),
+                ));
             }
             out.extend(std::iter::repeat_n(k, na as usize));
         }
@@ -345,10 +352,7 @@ pub fn cell_variants(plan: &ModelPlan, variant_ids: &[u32], at: usize) -> Result
 
 /// The pages held laid out at their places in the pool, the rest left missing. Every page but
 /// the first expands against the first, so without it none does.
-fn assemble_pages(
-    pages: &[(Option<&[u8]>, u32)],
-    budget: &DecodeBudget,
-) -> Result<Pool> {
+fn assemble_pages(pages: &[(Option<&[u8]>, u32)], budget: &DecodeBudget) -> Result<Pool> {
     let total: u64 = pages.iter().map(|p| p.1 as u64).sum();
     let Some(&(first, first_len)) = pages.first() else {
         return Err(Error::Format("text pool without pages".into()));
@@ -516,7 +520,11 @@ fn ensure_col_inner(
     for (&peer_id, &as_cells) in graph.ext_peers.iter().zip(&as_cells) {
         if let Some(t) = table_col(peer_id)? {
             let tables = tables.as_ref().unwrap();
-            peers.push(if as_cells { Arc::clone(tables.col(t)?) } else { Arc::default() });
+            peers.push(if as_cells {
+                Arc::clone(tables.col(t)?)
+            } else {
+                Arc::default()
+            });
             continue;
         }
         let pid = peer_id as usize;
@@ -617,9 +625,26 @@ mod tests {
     #[test]
     fn int_bounds_parse_as_exact_ints_do() {
         let spellings = [
-            "", "+", "-", "0", "-0", "+0", "007", "-007", "42", "4a", " 1", "1 ",
-            "9223372036854775807", "9223372036854775808", "-9223372036854775808", "-9223372036854775809",
-            "9999999999999999999", "-9999999999999999999", "+9999999999999999999", "10000000000000000000",
+            "",
+            "+",
+            "-",
+            "0",
+            "-0",
+            "+0",
+            "007",
+            "-007",
+            "42",
+            "4a",
+            " 1",
+            "1 ",
+            "9223372036854775807",
+            "9223372036854775808",
+            "-9223372036854775808",
+            "-9223372036854775809",
+            "9999999999999999999",
+            "-9999999999999999999",
+            "+9999999999999999999",
+            "10000000000000000000",
         ];
         for s in spellings {
             let want = crate::lex::parse_exact_int(s.as_bytes()).map(|(v, _)| (v, v));
@@ -862,7 +887,9 @@ mod tests {
         let mut vids = Vec::new();
         let mut x = 7u64;
         let mut ip = || {
-            x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             format!("10.0.{}.{}", (x >> 40) % 8, (x >> 50) % 200).into_bytes()
         };
         let mut pending: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -888,7 +915,10 @@ mod tests {
     #[test]
     fn keyed_lookup_round_trips_through_block_layer() {
         let (plan, vids, cols) = keyed_block();
-        let occ: Vec<Vec<&[u8]>> = cols.iter().map(|c| c.iter().map(|v| &v[..]).collect()).collect();
+        let occ: Vec<Vec<&[u8]>> = cols
+            .iter()
+            .map(|c| c.iter().map(|v| &v[..]).collect())
+            .collect();
         let n = occ.len();
         let enc = PackRegistry::default().encode_dense_block(
             &occ,
@@ -903,12 +933,19 @@ mod tests {
         );
         let budget = DecodeBudget::default();
         let g = PayloadGraph::decode(&enc.col_blobs[3], &budget).unwrap();
-        assert!(g.nodes.iter().any(|n| matches!(n, GraphNode::MatchIndex { .. })));
+        assert!(
+            g.nodes
+                .iter()
+                .any(|n| matches!(n, GraphNode::MatchIndex { .. }))
+        );
         let blobs = enc.col_blobs.iter().map(|b| Some(&b[..])).collect();
         let dicts = enc.shared_dict_blobs.iter().map(|b| Some(&b[..])).collect();
         let mut ctx = BlockDecodeCtx::new(blobs, dicts, None, Arc::default())
             .with_layout(&plan, vids.clone().into());
-        let got = ensure_dense_block_column(3, &mut ctx, &budget).unwrap().to_cells().unwrap();
+        let got = ensure_dense_block_column(3, &mut ctx, &budget)
+            .unwrap()
+            .to_cells()
+            .unwrap();
         assert!(got.iter().eq(occ[3].iter().copied()));
         // Without the layout the column cannot be aligned.
         let blobs = enc.col_blobs.iter().map(|b| Some(&b[..])).collect();

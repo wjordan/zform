@@ -138,7 +138,8 @@ impl FilterBuilder {
     /// Adds the tokens of `text`.
     pub fn add_text(&mut self, text: &[u8]) {
         spellings(text, |w, _| {
-            let slot = (w.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - RECENT.trailing_zeros())) as usize;
+            let slot =
+                (w.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - RECENT.trailing_zeros())) as usize;
             if self.recent[slot] != w {
                 self.recent[slot] = w;
                 self.add(mix(w));
@@ -200,7 +201,10 @@ const PAGE_FILL: usize = 780;
 /// with no text in the pool, in `row_map_width` bits from bit `r * width`, least significant
 /// first.
 pub fn page_filter_page(filters: &[Vec<u8>], row_pages: &[u32]) -> Vec<u8> {
-    let mut out: Vec<u8> = filters.iter().map(|f| f.len().trailing_zeros() as u8).collect();
+    let mut out: Vec<u8> = filters
+        .iter()
+        .map(|f| f.len().trailing_zeros() as u8)
+        .collect();
     let w = row_map_width(filters.len());
     let mut map = vec![0u8; row_pages.len() * w / 8 + 1];
     for (r, &v) in row_pages.iter().enumerate() {
@@ -221,7 +225,11 @@ pub fn row_map_width(n_pages: usize) -> usize {
 
 /// Where a block's row page map lies in its page filter page, as `(offset, length)`.
 pub fn row_map_span(n_pages: usize, rows: u64) -> (u64, u64) {
-    (n_pages as u64, rows.saturating_mul(row_map_width(n_pages) as u64).div_ceil(8))
+    (
+        n_pages as u64,
+        rows.saturating_mul(row_map_width(n_pages) as u64)
+            .div_ceil(8),
+    )
 }
 
 /// The pool page row `r` of a row page map reads, if any.
@@ -230,7 +238,9 @@ pub fn row_page(map: &[u8], n_pages: usize, r: usize) -> Result<Option<usize>> {
     let mut v = 0usize;
     for k in 0..w {
         let bit = r * w + k;
-        let byte = map.get(bit / 8).ok_or_else(|| Error::Format("row page map".into()))?;
+        let byte = map
+            .get(bit / 8)
+            .ok_or_else(|| Error::Format("row page map".into()))?;
         v |= ((byte >> (bit % 8)) as usize & 1) << k;
     }
     match v {
@@ -248,7 +258,10 @@ pub fn page_filters(page: &[u8], n: usize, rows: u64) -> Result<Vec<Filter<'_>>>
     let (_, mut rest) = rest.split_at_checked(map_len).ok_or_else(bad)?;
     let mut out = Vec::with_capacity(n);
     for &log in sizes {
-        let len = 1usize.checked_shl(log as u32).filter(|&l| l >= 8).ok_or_else(bad)?;
+        let len = 1usize
+            .checked_shl(log as u32)
+            .filter(|&l| l >= 8)
+            .ok_or_else(bad)?;
         let (f, more) = rest.split_at_checked(len).ok_or_else(bad)?;
         out.push(Filter(f));
         rest = more;
@@ -495,7 +508,11 @@ impl BlockDir {
         } else {
             None
         };
-        let n_pages = if pool.is_some() { cur.uvar()? as usize } else { 0 };
+        let n_pages = if pool.is_some() {
+            cur.uvar()? as usize
+        } else {
+            0
+        };
         if n_pages == 1 || n_pages > cur.remaining().min(MAX_PAGES) {
             return Err(Error::Format("block directory page count".into()));
         }
@@ -508,7 +525,9 @@ impl BlockDir {
         }
         let over = raw_len > budget.max_single_alloc_bytes as u64;
         if n_pages > 0 && (comp != pool_len as u64 || over) {
-            return Err(Error::Format("block directory pages do not cover the pool".into()));
+            return Err(Error::Format(
+                "block directory pages do not cover the pool".into(),
+            ));
         }
         // A model numbers its columns in 16 bits.
         let n_cols = cur.uvar()? as usize;
@@ -862,7 +881,11 @@ impl Root {
                 if off.checked_add(len).is_none_or(|end| end > data_len) {
                     return Err(Error::Format("index root dictionary range".into()));
                 }
-                Some(DictEntry { off, len, id: cur.u64_le()? })
+                Some(DictEntry {
+                    off,
+                    len,
+                    id: cur.u64_le()?,
+                })
             }
         };
         Ok(Self {
@@ -924,7 +947,8 @@ mod tests {
     #[test]
     fn text_adds_its_tokens_once_seen_or_not() {
         let text = b"the parser parses; the Parser parsed the parse, then the parser again";
-        let (mut by_token, mut by_text) = (FilterBuilder::new(1 << 12), FilterBuilder::new(1 << 12));
+        let (mut by_token, mut by_text) =
+            (FilterBuilder::new(1 << 12), FilterBuilder::new(1 << 12));
         tokens(text, |t, _| by_token.add(t));
         by_text.add_text(text);
         by_text.add_text(text);
@@ -1048,10 +1072,19 @@ mod tests {
             d.encode(EntropyBackend::Zstd, 3, &mut page);
             BlockDir::decode(&page, &budget).map(|d| d.pages)
         };
-        assert_eq!(paged(vec![(60, 900), (40, 70)]).unwrap(), [(60, 900), (40, 70)]);
-        assert!(paged(vec![(60, 900), (41, 70)]).is_err(), "pages past the pool");
+        assert_eq!(
+            paged(vec![(60, 900), (40, 70)]).unwrap(),
+            [(60, 900), (40, 70)]
+        );
+        assert!(
+            paged(vec![(60, 900), (41, 70)]).is_err(),
+            "pages past the pool"
+        );
         assert!(paged(vec![(100, 900)]).is_err(), "one page is a leaf");
-        assert!(paged(vec![(60, u32::MAX), (40, u32::MAX)]).is_err(), "over budget");
+        assert!(
+            paged(vec![(60, u32::MAX), (40, u32::MAX)]).is_err(),
+            "over budget"
+        );
 
         // A wide model whose block uses few columns: the empty ones cost the page almost nothing.
         let mut wide_cols = cols;
@@ -1138,7 +1171,14 @@ mod tests {
             (30, 200, 7, 12, 5, 17, 41, page.len())
         );
         assert_eq!(
-            (b.off, b.rows, b.pages_len, b.filter_off, b.filter_len, b.dir_len),
+            (
+                b.off,
+                b.rows,
+                b.pages_len,
+                b.filter_off,
+                b.filter_len,
+                b.dir_len
+            ),
             (260, 3, 0, 25, 16, 0)
         );
         assert_eq!(&region[a.pages_off as usize..][..5], &[2u8; 5]);

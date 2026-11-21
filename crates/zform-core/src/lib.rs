@@ -23,8 +23,8 @@ pub mod tables;
 pub mod wire;
 
 pub use container::{
-    FrameFit, InspectReport, PackOptions, StreamEncoder, build_dictionary, build_tables,
-    first_run, inspect_stream, pack_stream, unpack_stream, unpack_stream_threads,
+    FrameFit, InspectReport, PackOptions, StreamEncoder, build_dictionary, build_tables, first_run,
+    inspect_stream, pack_stream, unpack_stream, unpack_stream_threads,
 };
 pub use dictionary::{Dictionary, DictionaryBuilder};
 pub use framing::{FramingSpec, ResolvedFraming};

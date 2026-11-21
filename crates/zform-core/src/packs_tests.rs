@@ -1367,8 +1367,8 @@ fn numeric_timestamps_preserve_clock_separators_and_exceptions() {
         for clock_sep in [b':', b'.'] {
             let mut rows: Vec<Vec<u8>> = (0..16)
                 .map(|i| {
-                    let mut row = iso(t0 + i, sep, Some(('.', 6, i as u64 * 13_727)), "")
-                        .into_bytes();
+                    let mut row =
+                        iso(t0 + i, sep, Some(('.', 6, i as u64 * 13_727)), "").into_bytes();
                     row[13] = clock_sep;
                     row[16] = clock_sep;
                     row
@@ -1378,10 +1378,7 @@ fn numeric_timestamps_preserve_clock_separators_and_exceptions() {
             roundtrip(&TimestampIsoPack, &refs(&rows));
         }
     }
-    refuses_strs(
-        &TimestampIsoPack,
-        &["2024-02-29-00.00:00.000000"; 4],
-    );
+    refuses_strs(&TimestampIsoPack, &["2024-02-29-00.00:00.000000"; 4]);
 }
 
 #[test]
@@ -2573,12 +2570,19 @@ fn recency_codes_survive_eviction_and_deep_ranks() {
         })
         .collect();
     let (codes, misses) = mtf_split(&vals);
-    assert!(codes.iter().all(|&c| (0..=crate::payload::graph::MTF_WINDOW as i64).contains(&c)));
+    assert!(
+        codes
+            .iter()
+            .all(|&c| (0..=crate::payload::graph::MTF_WINDOW as i64).contains(&c))
+    );
     assert!(codes.iter().any(|&c| c > 2048));
     let evicted = misses.len() - vals.iter().collect::<std::collections::HashSet<_>>().len();
     assert!(evicted > 1000);
     assert_eq!(mtf_roundtrip(&codes, &misses).unwrap(), vals);
-    assert_eq!((codes, misses), crate::payload::graph::mtf_split_searched(&vals));
+    assert_eq!(
+        (codes, misses),
+        crate::payload::graph::mtf_split_searched(&vals)
+    );
 }
 
 #[test]
@@ -2591,13 +2595,23 @@ fn recency_ranks_match_a_searched_list() {
                 x ^= x << 13;
                 x ^= x >> 7;
                 x ^= x << 17;
-                if i % 4 == 0 { (x % distinct) as i64 } else { (x % 3) as i64 - 10 }
+                if i % 4 == 0 {
+                    (x % distinct) as i64
+                } else {
+                    (x % 3) as i64 - 10
+                }
             })
             .collect();
-        assert_eq!(mtf_split(&vals), crate::payload::graph::mtf_split_searched(&vals));
+        assert_eq!(
+            mtf_split(&vals),
+            crate::payload::graph::mtf_split_searched(&vals)
+        );
         // Spread out, the same values take the hashed rather than the offset table.
         let wide: Vec<i64> = vals.iter().map(|v| v * 1_000_003).collect();
-        assert_eq!(mtf_split(&wide), crate::payload::graph::mtf_split_searched(&wide));
+        assert_eq!(
+            mtf_split(&wide),
+            crate::payload::graph::mtf_split_searched(&wide)
+        );
     }
 }
 
@@ -2628,11 +2642,17 @@ fn text_pool_leaves_out_cells_of_one_length() {
     let mut r = Rng::new(7);
     let letters = b"aenrstol";
     let words: Vec<String> = (0..300)
-        .map(|_| (0..r.range(3, 9)).map(|_| r.pick(letters) as char).collect())
+        .map(|_| {
+            (0..r.range(3, 9))
+                .map(|_| r.pick(letters) as char)
+                .collect()
+        })
         .collect();
     let prose = |r: &mut Rng| {
         let n = r.range(20, 40);
-        let s: Vec<&str> = (0..n).map(|_| words[r.below(300) as usize].as_str()).collect();
+        let s: Vec<&str> = (0..n)
+            .map(|_| words[r.below(300) as usize].as_str())
+            .collect();
         format!("\"{}\"", s.join(" "))
     };
     let hex = |r: &mut Rng| {
@@ -2644,8 +2664,10 @@ fn text_pool_leaves_out_cells_of_one_length() {
         (0..1000).map(|_| prose(&mut r)).collect(),
         (0..1000).map(|_| hex(&mut r)).collect(),
     ];
-    let occ: Vec<Vec<&[u8]>> =
-        cols.iter().map(|c| c.iter().map(|v| v.as_bytes()).collect()).collect();
+    let occ: Vec<Vec<&[u8]>> = cols
+        .iter()
+        .map(|c| c.iter().map(|v| v.as_bytes()).collect())
+        .collect();
     let enc = PackRegistry::default().encode_dense_block(
         &occ,
         &["text"; 3],
@@ -2671,13 +2693,17 @@ fn a_sample_pick_is_tried_alone_unless_it_does_not_apply() {
     // A counter, a category and addresses: an integer pack, the dictionary and the IPv4 pack.
     let cols: Vec<Vec<String>> = vec![
         (0..2000).map(|i| (3 * i).to_string()).collect(),
-        (0..2000).map(|_| ["GET", "PUT", "HEAD"][r.below(3) as usize].to_string()).collect(),
+        (0..2000)
+            .map(|_| ["GET", "PUT", "HEAD"][r.below(3) as usize].to_string())
+            .collect(),
         (0..2000)
             .map(|_| format!("10.{}.{}.{}", r.below(250), r.below(250), r.below(250)))
             .collect(),
     ];
-    let occ: Vec<Vec<&[u8]>> =
-        cols.iter().map(|c| c.iter().map(|v| v.as_bytes()).collect()).collect();
+    let occ: Vec<Vec<&[u8]>> = cols
+        .iter()
+        .map(|c| c.iter().map(|v| v.as_bytes()).collect())
+        .collect();
     let encode = |occ: &[Vec<&[u8]>], picks: Option<&[Pick]>| {
         PackRegistry::default().encode_dense_block_picked(
             occ,
@@ -2783,15 +2809,21 @@ fn integers_format_with_only_the_digit_blocks_their_magnitude_needs() {
     let mut ops = 0;
     for blocks in 1..=3 {
         let limit = 10u128.pow(8 * blocks as u32);
-        let fit: Vec<i64> =
-            vals.iter().copied().filter(|v| u128::from(v.unsigned_abs()) < limit).collect();
+        let fit: Vec<i64> = vals
+            .iter()
+            .copied()
+            .filter(|v| u128::from(v.unsigned_abs()) < limit)
+            .collect();
         let prog = prog_fmt_ints(&fit, false);
         assert_eq!(prog, fmt_int(false, 0, blocks));
         assert!(prog.ops.len() > ops);
         ops = prog.ops.len();
         let want: Vec<Vec<u8>> = fit.iter().map(|v| v.to_string().into_bytes()).collect();
         assert_eq!(eval_reference(&prog, &[&fit], &[]), want, "{blocks} blocks");
-        let (mut ends, mut text) = (vec![0; fit.len()], vec![0; fit.len() * prog.row_bytes() + 8]);
+        let (mut ends, mut text) = (
+            vec![0; fit.len()],
+            vec![0; fit.len() * prog.row_bytes() + 8],
+        );
         let cp = CompiledProgram::compile(&prog);
         let n = cp.eval_cells(&[&fit], &[], fit.len(), &mut ends, &mut text);
         assert_eq!(text[..n], want.concat());

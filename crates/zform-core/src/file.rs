@@ -4,11 +4,12 @@
 //! operation returns the ranges it found missing and is run again once the host has them. Rows
 //! are numbered from 0 across the file.
 
-use crate::dictionary::{Dictionary, Scope};
+use crate::codecs::PoolParts;
 use crate::container::{
     BlockParts, BlockRows, FrameFit, FrameQueue, PackOptions, StreamEncoder, Structure,
     decode_single_block_records, sort_records,
 };
+use crate::dictionary::{Dictionary, Scope};
 use crate::framing::{FramingSpec, split_passthrough};
 use crate::grammar::{ModelPlan, PlanVariant};
 use crate::index::{
@@ -19,7 +20,6 @@ use crate::query::{
     BlockMeta, FieldEv, Need, Plans, Predicate, RawTest, UNKNOWN, YES, eval, field_events,
     filter_use, json_variant, may_match, needs, plain_may_contain, raw_field_values,
 };
-use crate::codecs::PoolParts;
 use crate::wire::{Cursor, DecodeBudget, Error, Result, decompress_leaf};
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
@@ -468,7 +468,9 @@ impl File {
             let Some(leaf) = src.get(range) else {
                 return Ok(Err(range));
             };
-            let _ = self.dict.set(Arc::new(Dictionary::read(leaf, e.id, &self.budget)?));
+            let _ = self
+                .dict
+                .set(Arc::new(Dictionary::read(leaf, e.id, &self.budget)?));
         }
         Ok(Ok(Scope::enter(self.dict.get().cloned())))
     }
@@ -728,7 +730,9 @@ fn pool_pieces(dir: &BlockDir) -> Vec<(u32, u32)> {
     }
     dir.pages
         .iter()
-        .scan(off, |at, &(comp, _)| Some((std::mem::replace(at, *at + comp), comp)))
+        .scan(off, |at, &(comp, _)| {
+            Some((std::mem::replace(at, *at + comp), comp))
+        })
         .collect()
 }
 
@@ -783,7 +787,10 @@ fn load_parts<'s>(
                 None => None,
                 Some(_) if dir.pages.is_empty() => parts.next().unwrap().map(PoolParts::Leaf),
                 Some(_) => Some(PoolParts::Pages(
-                    dir.pages.iter().map(|p| (parts.next().unwrap(), p.1)).collect(),
+                    dir.pages
+                        .iter()
+                        .map(|p| (parts.next().unwrap(), p.1))
+                        .collect(),
                 )),
             },
             cols: parts.collect(),
@@ -1208,7 +1215,12 @@ impl<'f> Session<'f> {
                 None => vec![row_map_range(e, &dir)],
             };
             let held = |r: &ByteRange| src.get(*r).is_some();
-            missing.extend(around_pool(e, &dir).into_iter().chain(need).filter(|r| !held(r)));
+            missing.extend(
+                around_pool(e, &dir)
+                    .into_iter()
+                    .chain(need)
+                    .filter(|r| !held(r)),
+            );
             paged.push(pages.map(|p| (dir, p)));
         }
         let _dict = match blocks.is_empty() {
@@ -1393,7 +1405,9 @@ impl<'f> Session<'f> {
         let plan = &self.file.plans[model as usize];
         let mut want = self.value_parts(paths, model, kinds, dir);
         if !dir.pages.is_empty() && e.pages_len > 0 && want.pool.contains(&true) {
-            let sel = (0..sel.len() as u32).filter(|&r| sel[r as usize]).map(|r| (r, r + 1));
+            let sel = (0..sel.len() as u32)
+                .filter(|&r| sel[r as usize])
+                .map(|r| (r, r + 1));
             let Some(pages) = row_pages(src, e, dir, sel)? else {
                 return Ok(None);
             };

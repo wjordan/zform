@@ -234,7 +234,8 @@ pub fn train_from_records(
     for &line in samples {
         let first = line.iter().copied().find(|b| !b.is_ascii_whitespace());
         if first == Some(b'{') && jdoc.parse_root_object(line) {
-            tree.get_or_insert_with(TreeTrainer::with_root).observe_root(&jdoc, line);
+            tree.get_or_insert_with(TreeTrainer::with_root)
+                .observe_root(&jdoc, line);
             json_rows.push(line);
         } else if opts.depth == 0
             && let Some((_, _, _, inner)) = parse_k8s_cri(line)
@@ -670,8 +671,7 @@ fn train_templates_arm<'a>(rows: &[&'a [u8]], opts: &TrainOptions, plan: &mut Mo
 
             let (base_key, group) = if cls == SlotClass::Int && prev_lit.ends_with(b"blk_") {
                 ("$blk_id".to_string(), "blk_id")
-            } else if cls == SlotClass::Timestamp
-                && !classes[..si].contains(&SlotClass::Timestamp)
+            } else if cls == SlotClass::Timestamp && !classes[..si].contains(&SlotClass::Timestamp)
             {
                 ("$ts.0".to_string(), "")
             } else if cls == SlotClass::IpPort {

@@ -324,7 +324,9 @@ pub(crate) fn compress_leaf_with(
                             let Some(ctx) = cctx_opt.as_mut() else {
                                 return false;
                             };
-                            use zstd_safe::CParameter::{ChecksumFlag, CompressionLevel, WindowLog};
+                            use zstd_safe::CParameter::{
+                                ChecksumFlag, CompressionLevel, WindowLog,
+                            };
                             let _ = ctx.reset(zstd_safe::ResetDirective::SessionOnly);
                             let _ = ctx.set_parameter(CompressionLevel(zstd_level));
                             let _ = ctx.set_parameter(ChecksumFlag(false));
@@ -446,18 +448,22 @@ pub(crate) fn compress_pages(pages: &[Vec<u8>], level: i32) -> Vec<Vec<u8>> {
     let ready = ctx.as_mut().is_some_and(|c| {
         c.set_parameter(CompressionLevel(level)).is_ok()
             && c.set_parameter(ChecksumFlag(false)).is_ok()
-            && c.set_parameter(ForceAttachDict(zstd_safe::DictAttachPref::ForceAttach)).is_ok()
+            && c.set_parameter(ForceAttachDict(zstd_safe::DictAttachPref::ForceAttach))
+                .is_ok()
             && c.load_dictionary(first).is_ok()
     });
     for page in &pages[1..] {
         let mut leaf = Vec::new();
         let mut tmp = vec![0u8; zstd_safe::compress_bound(page.len())];
-        let n = ctx.as_mut().filter(|_| ready && page.len() >= 32).and_then(|c| {
-            c.reset(zstd_safe::ResetDirective::SessionOnly).ok()?;
-            // The first page stays in reach only within a frame's first window.
-            c.set_parameter(WindowLog(window_log(page.len()))).ok()?;
-            c.compress2(&mut tmp[..], page).ok()
-        });
+        let n = ctx
+            .as_mut()
+            .filter(|_| ready && page.len() >= 32)
+            .and_then(|c| {
+                c.reset(zstd_safe::ResetDirective::SessionOnly).ok()?;
+                // The first page stays in reach only within a frame's first window.
+                c.set_parameter(WindowLog(window_log(page.len()))).ok()?;
+                c.compress2(&mut tmp[..], page).ok()
+            });
         match n {
             Some(n) if n + 2 < page.len() => {
                 put_leaf(&mut leaf, EntropyBackend::Zstd, page.len(), &tmp[..n])
@@ -488,7 +494,9 @@ pub(crate) fn expand_page(leaf: &[u8], first: Option<&[u8]>, dst: &mut [u8]) -> 
         return Err(Error::Format("text pool page length mismatch".into()));
     }
     if first.is_some_and(|f| f.starts_with(&ZSTD_DICT_MAGIC)) {
-        return Err(Error::Format("text pool page 0 reads as a dictionary".into()));
+        return Err(Error::Format(
+            "text pool page 0 reads as a dictionary".into(),
+        ));
     }
     match tag {
         EntropyBackend::Raw if comp_len == raw_len => dst.copy_from_slice(payload),
@@ -741,10 +749,16 @@ mod tests {
         let mut leaf = Vec::new();
         compress_leaf(&mut leaf, &raw, EntropyBackend::Zstd, 6);
         assert!(leaf.len() < raw.len() - (64 << 10));
-        assert_eq!(decompress_leaf(&mut Cursor::new(&leaf), &budget).unwrap(), raw);
+        assert_eq!(
+            decompress_leaf(&mut Cursor::new(&leaf), &budget).unwrap(),
+            raw
+        );
         // The reused compressor returns to a small window for the next leaf.
         leaf.clear();
         compress_leaf(&mut leaf, &[b'x'; 256], EntropyBackend::Zstd, 3);
-        assert_eq!(decompress_leaf(&mut Cursor::new(&leaf), &budget).unwrap(), [b'x'; 256]);
+        assert_eq!(
+            decompress_leaf(&mut Cursor::new(&leaf), &budget).unwrap(),
+            [b'x'; 256]
+        );
     }
 }

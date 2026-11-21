@@ -639,8 +639,12 @@ impl<'p> CompiledProgram<'p> {
             Len::Fixed(w) => w,
             Len::Lane(_) => 0,
         };
-        let mut lens: Vec<u8> =
-            (self.p.sinks.iter().flat_map(|sink| std::iter::repeat_n(fixed(sink), nc))).collect();
+        let mut lens: Vec<u8> = (self
+            .p
+            .sinks
+            .iter()
+            .flat_map(|sink| std::iter::repeat_n(fixed(sink), nc)))
+        .collect();
         let whole = sinks.len() == 1 && lens[0] as usize == T::BYTES && ends.is_none();
         self.run::<T>(rows, bufs, load, |row, nc, s| {
             let n = nc.min(rows - row);
