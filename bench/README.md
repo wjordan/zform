@@ -1,80 +1,51 @@
-# `zform` Benchmarks
+# `zform` benchmarks
 
-`run.py` builds `zform` in release mode and compares it with `gzip`, `zstd` and `xz` on ratio, throughput and peak RSS, checking a SHA-256 roundtrip for every codec. It runs on whichever of these local corpora it is given: Loghub `HDFS.log` and a GitHub Archive hour, each cut to `--slice-mb` (default 8) at a line, and the Silesia corpus's `sao`, taken whole:
+`run.py` compares `zform` with `gzip`, `zstd` and `xz` on complete inputs. It checks each roundtrip with SHA-256 and prints the input sizes and hashes. The README comparison uses the full Loghub `HDFS.log`, the GitHub Archive hour `2020-06-17-16`, and Silesia's `sao`.
 
 ```bash
 python3 bench/run.py \
   --hdfs /path/to/HDFS.log \
   --gharchive /path/to/2020-06-17-16.json.gz \
-  --sao /path/to/silesia/sao
+  --sao /path/to/silesia/sao \
+  --repeats 1 --markdown
 ```
 
-Every codec runs on one thread. Timings are the best of `--repeats` runs (default 3) and include process startup and file I/O. Peak RSS comes from GNU `time` and prints as `n/a` without it. `--markdown` appends the tables used in the top-level README.
+Every codec runs on one thread. Timings include process startup and file I/O. The runner reports the fastest time and highest RSS across repeats. It measures RSS with GNU `time` and prints `n/a` when it is unavailable. `--slice-mb` limits the log inputs for quick runs.
+
+## automated results
+
+The [full-corpus benchmark workflow](https://github.com/wjordan/zform/actions/workflows/bench.yml) runs on changes to the compressor, weekly, and on demand. Each run publishes a summary and a report artifact with per-corpus timings, memory, archive sizes, input hashes and tool versions.
+
+The first successful run records the README size baseline. Subsequent runs update the tables when an archive size moves at least 1% from the published baseline. Timing and memory measurements stay in the workflow reports.
+
+```bash
+bash bench/fetch_corpora.sh bench/corpus
+```
 
 ## context mixing
 
-`context_mixing.py` compares the normal record compressor with and without the optional payload
-density pass. It checks deterministic encoding and a SHA-256 roundtrip for both variants:
+`context_mixing.py` compares the ordinary and high-density presets with and without context mixing. It checks deterministic encoding and SHA-256 roundtrips for both variants.
 
 ```bash
 cargo build --release -p zform-cli
-python3 bench/context_mixing.py --repeats 3 --output results.json HDFS.log HPC.log Zookeeper.log
-python3 bench/context_mixing.py --best --repeats 3 --output best.json HPC.log
+python3 bench/context_mixing.py --timeout 120 --output results.json /path/to/HDFS.log
+python3 bench/context_mixing.py --best --timeout 120 --output best.json /path/to/events.ndjson
 ```
 
-The [recorded results](context-mixing-results.json) use 8 MiB samples, including the query index,
-on a Ryzen 9 7900X. Encode times are medians of two process runs; decode times are single runs.
-These are ordinary block-based `.zfm` files, separate from the whole-file BGL experiment.
-
-| Corpus | Default bytes | With mixing | Smaller | Encode time factor | Decode time factor |
-|---|---:|---:|---:|---:|---:|
-| HDFS | 156,157 | 146,714 | 6.05% | 1.18× | 2.63× |
-| HPC | 213,732 | 202,602 | 5.21% | 1.13× | 2.26× |
-| ZooKeeper | 89,471 | 84,173 | 5.92% | 1.15× | 2.24× |
-| HealthApp | 202,490 | 188,864 | 6.73% | 1.18× | 2.91× |
-| CloudTrail | 637,596 | 628,883 | 1.37% | 1.08× | 1.38× |
-| GitHub Archive | 578,430 | 576,167 | 0.39% | 1.02× | 1.17× |
-
-Three BGL windows save 0.05–2.78%. With `--best`, measured additional savings are 2.48% on HPC,
-0.66% on ZooKeeper, and 0.90% on CloudTrail. Those high-density comparisons use one run each.
-The option remains off by default because selected context-coded streams decode more slowly.
+The [earlier context-mixing measurements](context-mixing-results.json) cover sample windows and use an earlier writer. Context mixing is opt-in because it can slow down decoding.
 
 ## hdfs predictors
 
-`hdfs_predictors.py` compares the optional relation pack with and without context mixing.
-It checks deterministic encoding, SHA-256 roundtrips, and `grep` results. An optional earlier
-binary verifies reader compatibility and that disabling the feature leaves archive bytes unchanged.
+`hdfs_predictors.py` measures all four combinations of HDFS predictors and context mixing. It checks deterministic encoding, SHA-256 roundtrips and `grep` results. `--baseline-bin` also checks reader compatibility and archive equality with a binary from a wire-compatible revision.
 
 ```bash
-python3 bench/hdfs_predictors.py --repeats 3 --output results.json HDFS.log
-cargo run --release -p zform-core --example hdfs_predict_probe -- HDFS.log
+python3 bench/hdfs_predictors.py --timeout 120 --output results.json /path/to/HDFS.log
+cargo run --release -p zform-core --example hdfs_predict_probe -- /path/to/HDFS.log
 ```
 
-The [recorded results](hdfs-predictors-results.json) include three 8 MiB HDFS windows and BGL,
-HPC, and ZooKeeper controls. Times are medians of three process runs on a Ryzen 9 7900X.
-File sizes include the index. The head is the existing reference sample. Middle and tail
-start at newline boundaries near offsets 128 MiB and 248 MiB in the local 256 MiB HDFS prefix.
+The [earlier HDFS predictor measurements](hdfs-predictors-results.json) cover sample windows and a 256 MiB prefix. The current whole-file result is in the [main README](../README.md#benchmarks).
 
-| HDFS window | Default | HDFS predictors | Context mixing | Both | Extra saving over mixing |
-|---|---:|---:|---:|---:|---:|
-| Head | 156,157 | 150,092 | 146,714 | 141,242 | 3.73% |
-| Middle | 160,013 | 154,407 | 150,797 | 145,381 | 3.59% |
-| Tail | 301,574 | 301,574 | 289,181 | 289,181 | 0% |
-
-With mixing enabled, the predictor added 5–7% encode time on the first two windows; decode
-time was unchanged within measurement noise. Tail and non-HDFS control archives were byte-identical
-with the predictor enabled or disabled. The partition field shrank from 5,673 to 198 bytes
-in the head sample. The middle sample also selected the per-block size table.
-
-On the entire 256 MiB prefix, the combined options reduced 5,770,436 bytes to 5,663,072 bytes
-relative to context mixing alone: another 1.86%. This full-prefix validation used one run per
-variant and checked exact roundtrips, existing-reader compatibility, and queries across blocks.
-
-`hdfs_predict_probe` screens grouping, recent-block caches, and keyed deltas. Cache and delta
-numbers omit the proposed stateful node and context wiring, so they are optimistic size estimates,
-not complete codecs. Grouping models execute and verify their existing-payload graphs. None of
-these block-reuse models gave a consistent improvement over the current codec across the three
-windows; no new mutable-state decoder operation was added.
+`hdfs_predict_probe` screens grouping, recent-block caches, and keyed deltas. Its cache and delta estimates omit the proposed stateful node and context wiring. Grouping models execute and verify their existing-payload graphs.
 
 ## RankedSum ablation
 
@@ -100,7 +71,7 @@ one encoding thread, and the query index included:
 
 | Mode | Decoder construction for deletion clocks | Archive bytes | Change from RankedSum |
 |---|---|---:|---:|
-| `ranked` | Current `RankedSum` | 17,599,245 | — |
+| `ranked` | Original `RankedSum` | 17,599,245 | — |
 | `off` | No deletion prediction | 18,235,313 | +3.61% |
 | `keyed-row` | Explicit node IDs, `KeyedSum`, stored row order | 18,390,759 | +4.50% |
 | `keyed-sorted` | Explicit node IDs, `KeyedSum`, explicit inverse permutation | 18,441,470 | +4.79% |
@@ -372,15 +343,13 @@ curl -fL https://raw.githubusercontent.com/ArielCyber/cloud_log_sampling/18d3f24
 curl -fL --range 1024-19211796 https://summitroute.com/downloads/flaws_cloudtrail_logs.tar -o bench/corpus/cloudtrail/flaws_cloudtrail00.json.gz
 echo '62dadeb453cefd0ac3a863003fa340b09375380daac3009855907234fa42845e  bench/corpus/cloudtrail/flaws_cloudtrail00.json.gz' | sha256sum -c -
 cargo build --release --workspace
-python3 bench/cloudtrail.py bench/corpus/cloudtrail/base_a.zip bench/corpus/cloudtrail/labeled_cloudtrail_a.zip bench/corpus/cloudtrail/flaws_cloudtrail00.json.gz
+python3 bench/cloudtrail.py --layout native bench/corpus/cloudtrail/base_a.zip bench/corpus/cloudtrail/labeled_cloudtrail_a.zip bench/corpus/cloudtrail/flaws_cloudtrail00.json.gz
 ```
 
-The default selects up to 8 MiB of events per source using seed 42, retains
-source order, removes research labels (`should_sample`, `attack_name`), and
-serializes compact NDJSON. All codecs receive identical bytes. Byte-exactness
-applies to this NDJSON, not the source JSON formatting. Use `--layout native`
-to measure the complete original JSON bytes, including formatting and labels,
-or `--layout both` to measure both representations.
+`--layout native` measures the complete JSON bytes, including formatting and labels.
+`--layout ndjson` samples events with seed 42 up to `--sample-mib`, preserves their order,
+and removes the research labels `should_sample` and `attack_name`. All codecs receive the
+same bytes and must restore them exactly. `--layout both` measures both representations.
 Each command has a 30-second timeout, configurable with `--timeout`.
 
 Timings are single runs with process startup and file I/O included; use them

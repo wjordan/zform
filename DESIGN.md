@@ -50,7 +50,7 @@ building the alternatives. A choice more values could turn is made again: recenc
 only to its misses, a stream too short to judge. A column gets the whole search when the
 sample held under 512 of its cells, or when its winner costs a cell a quarter more on the
 block than on the sample; keyed lookups need 1,024 cells, so a smaller sample does not rule
-them out. On HDFS this removes 30% of the encoding work for 0.001% more bytes.
+them out.
 
 Each model carries a library of shared programs, recurrences, and byte tables. Column graphs
 can name library entries and override a program's constants for the block, so code does not
@@ -133,9 +133,8 @@ block's replica table. Ordinary table lookups and `CellIds` produce keys; ordere
 `KeyedSum` reconstructs the clocks. The reader does no candidate ranking.
 
 A keyed relation that loses a sample by under a half is tried again on the block, where its
-keys' first steps weigh less. On a 256 MB HDFS slice the write clocks and counters cut threads
-25% and times 20%, the file 12%. The deletion-clock ablation and production validation are
-recorded in [the benchmark notes](bench/README.md#rankedsum-ablation).
+keys' first steps weigh less. The [benchmark notes](bench/README.md#rankedsum-ablation)
+record the deletion-clock ablation on the full HDFS log.
 
 The registry accepts only graphs with earlier peer dependencies and at least 32 bytes of savings
 over the current choice, including graph and shared-code costs. Standalone columns skip relation
@@ -222,9 +221,8 @@ default) on them and stores the lines in that order. Blocks, the index and queri
 stored order, so row numbers and query results follow it. An order frame ahead of each run
 restores the original on unpack, which holds one run in memory; it codes the original order as
 ranks counted over the stored lines sorted on a field that nearly ascends in the input, such as
-an event id, and so costs about a bit a line. One hour of GitHub Archive sorted on
-`type,repo.id` packs 14% smaller with `--best` and 22% smaller without a dictionary, and the
-gain grows with the run: 6%, 8% and 10% for runs of 32, 64 and 128 MiB.
+an event id. The [full-hour benchmark](README.md#benchmarks) measures sorting on `type,repo.id`
+with and without `--best`.
 
 **The index region is derived data.** Scanning the data region rebuilds it.
 

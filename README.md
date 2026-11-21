@@ -1,12 +1,9 @@
 # `zform` — Lossless Structure-Aware Compression
 
-`zform` is a lossless compressor for logs, telemetry and event streams, available as a CLI and a Rust library. It learns the structure of its input and writes files **1.3–3.1x smaller than `zstd -19`** that can be searched without unpacking them.
+`zform` is a lossless compressor for logs, telemetry and event streams, available as a CLI and a Rust library. It learns the structure of its input, compresses it and lets you search the archive directly.
 
-| Corpus | Raw | `zstd -3` | `zstd -19` | `xz -6` | `zform` |
-|---|---:|---:|---:|---:|---:|
-| HDFS DataNode logs | 8.00 MiB | 0.72 MiB (11.1x) | 0.47 MiB (17.0x) | 0.49 MiB (16.2x) | **0.15 MiB (53.1x)** |
-| GitHub Archive NDJSON | 8.00 MiB | 0.89 MiB (8.9x) | 0.69 MiB (11.6x) | 0.69 MiB (11.6x) | **0.55 MiB (14.5x)** |
-| Silesia `sao` star catalog (binary) | 6.92 MiB | 5.29 MiB (1.31x) | 4.77 MiB (1.45x) | 4.21 MiB (1.64x) | **3.57 MiB (1.94x)** |
+<!-- bench:comparison -->
+<!-- /bench:comparison -->
 
 ```bash
 zform pack app.log -o app.zfm      # any bytes in; no schema, no format flag
@@ -20,11 +17,10 @@ Machine-written data is full of structure: the same line layouts and keys over a
 
 `zform` keeps a stream compressor's contract and adds a columnar format's model. It learns how records split into fields, what each field's values look like, and how fields relate (`end = start + dur`, a URL built from other fields), then stores the model and only what the model cannot predict:
 
-- **Smaller files.** 1.5–4.8x smaller than `zstd -3` and 1.3–3.1x smaller than `zstd -19` on the corpora above, query index included.
 - **Byte-exact output.** Formatting survives (`12.300`, `007`, `-0`, key order, whitespace). Mixed formats can share a file, and lines the model does not recognise are stored verbatim.
 - **Queries on the compressed file.** `zform grep` and `zform select` filter and project records without unpacking, skipping blocks by index and decoding only the columns a query touches.
 
-The price is CPU. On one core `zform` compresses logs at 25–92 MB/s, between `zstd -19` (4–6 MB/s) and `zstd -3` (580–680 MB/s), and decompresses at 360–430 MB/s, a quarter to a third of `zstd`'s speed. It suits archives of logs, events and telemetry, above all ones worth filtering in place. It does not suit hot paths where `lz4` or `zstd -1` speed matters more than size, and it gains nothing on opaque data (media, archives, encrypted payloads), which passes through at plain `zstd` ratios.
+`zform` suits archives of logs, events and telemetry that you want to filter in place. For opaque data such as media or encrypted payloads, it falls back to byte-stream compression.
 
 ## Usage
 
@@ -137,7 +133,7 @@ end_us     derived   start_us + dur_us
 
 ## Architecture
 
-The writer holds all knowledge of formats. A file carries its own decoding instructions, and the reader runs a small fixed set of generic operations. Supporting a new log syntax or value type means new writer code; existing readers decode the result.
+The writer holds all knowledge of formats. A file carries its own decoding instructions, and the reader runs a small fixed set of generic operations. A new log syntax or value type can use the existing decoder operations.
 
 The instructions describe two layers:
 
@@ -158,22 +154,15 @@ The wire format is experimental and changes without notice; keep original copies
 
 ## Benchmarks
 
-The size table at the top uses 8 MiB slices of each log corpus and the whole of `sao`. `zform` sizes include its query index: 9% of the single-block, 830-column GitHub Archive file (`0.50 MiB` / `16.0x` with `--no-index`) and about 6% of multi-block files.
+The comparison uses the full Loghub HDFS log, the complete GitHub Archive hour `2020-06-17-16`, and the whole Silesia `sao` star catalog. `zform` sizes include the query index.
 
-Single-core throughput and peak memory on the two log corpora:
+<!-- bench:presets -->
+<!-- /bench:presets -->
 
-| Codec | Compress MB/s | Decompress MB/s | Compress RSS MiB | Decompress RSS MiB |
-|---|---:|---:|---:|---:|
-| `zstd -3` | 570–640 | 1,500 | 6.7 | 5.7–5.9 |
-| `zstd -19` | 3.8–6.7 | 1,200 | 92–93 | 11–12 |
-| `xz -6` | 9.3–10 | 350–450 | 79–90 | 10 |
-| `zform` | 26–97 | 580–610 | 38–240 | 17 |
+`--best` builds a shared dictionary from recurring values. `--order-by type,repo.id` groups events in stored order, which `grep` and `select` use. Unpack buffers one run, up to 512 MiB by default, to restore input order. The HDFS predictor preset models block IDs, write pipelines and per-node clocks.
 
-Larger inputs give every compressor more context. On a full hour of GitHub Archive (499 MB), `zform pack --best` writes 21.4 MB (23.3x), against 37.8 MB for `zstd -19` and 26.6 MB for `zstd --ultra -22 --long=31`; the default setting writes 30.4 MB. `--best` adds a file dictionary of values that recur across blocks, so blocks stay small and independently readable. `--order-by type,repo.id` stores the events sorted by type and repository, which brings `--best` to 18.3 MB (27.2x) and the default to 23.7 MB; unpacking restores the original order and holds a run of up to 512 MiB in memory, and `grep` and `select` answer in the stored order.
+The [benchmark workflow](https://github.com/wjordan/zform/actions/workflows/bench.yml) reports per-corpus throughput and peak memory. [Benchmark commands](bench/README.md) cover the same inputs, queries and CloudTrail.
 
-On the whole Loghub HDFS log (1.58 GB), `zform pack` writes 35.0 MB (45x) in 12.2 s on one core and unpacks it in 1.4 s. `gzip -6` takes 13.1 s for 155.7 MB; `zstd -19` and `xz -9` write 98.3 MB and 96.3 MB. Adding `-l 6 --hdfs-predictors --context-mixing`, which models how HDFS hands out block ids, builds write pipelines, numbers threads and deletes blocks, brings the file to 17.7 MB (89x) in 18.4 s, unpacked in 3.7 s. `pack` and `unpack` work on every core by default, and pack writes the same bytes: on 24 cores, 2.3 s and 5.1 s to pack, 0.3 s and 0.9 s to unpack.
-
-[`bench/README.md`](bench/README.md) has the commands for these tables, cold-query measurements and a CloudTrail comparison.
 
 ## Repository layout
 

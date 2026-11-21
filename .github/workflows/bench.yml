@@ -1,0 +1,98 @@
+name: full-corpus benchmarks
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'bench/fetch_corpora.sh'
+      - 'bench/run.py'
+      - 'bench/update_readme.py'
+      - '.github/workflows/bench.yml'
+  schedule:
+    - cron: '17 9 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: full-corpus-benchmarks
+  cancel-in-progress: true
+
+jobs:
+  measure:
+    if: github.ref == 'refs/heads/main'
+    runs-on: kedge
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install benchmark tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl gzip time unzip xz-utils zstd
+      - uses: actions/cache@v4
+        with:
+          path: |
+            /tmp/zform-corpora/HDFS_v1.zip
+            /tmp/zform-corpora/2020-06-17-16.json.gz
+            /tmp/zform-corpora/silesia.zip
+          key: zform-corpora-${{ hashFiles('bench/fetch_corpora.sh') }}
+      - name: Fetch and verify corpora
+        run: bash bench/fetch_corpora.sh /tmp/zform-corpora
+      - name: Measure archives and verify roundtrips
+        run: |
+          set -o pipefail
+          mkdir -p benchmark-report
+          {
+            rustc --version
+            zstd --version
+            xz --version
+            gzip --version | sed -n '1p'
+            lscpu
+          } > benchmark-report/environment.txt
+          TMPDIR=/tmp python3 -u bench/run.py \
+            --hdfs /tmp/zform-corpora/HDFS.log \
+            --gharchive /tmp/zform-corpora/2020-06-17-16.json.gz \
+            --sao /tmp/zform-corpora/sao \
+            --repeats 1 --timeout 900 --markdown --json benchmark-report/results.json \
+            | tee benchmark-report/results.txt
+          sed -n '/^| Corpus |/,$p' benchmark-report/results.txt >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-report
+          path: benchmark-report/
+          if-no-files-found: error
+          retention-days: 90
+
+  publish:
+    needs: measure
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: benchmark-report
+          path: benchmark-report
+      - name: Publish significant archive size changes
+        run: |
+          set -o pipefail
+          python3 bench/update_readme.py benchmark-report/results.json | tee -a "$GITHUB_STEP_SUMMARY"
+          git add README.md bench/readme-sizes.json
+          if git diff --cached --quiet; then exit 0; fi
+          git fetch origin main
+          if [ "$(git rev-parse FETCH_HEAD)" != "$GITHUB_SHA" ]; then
+            echo 'main advanced during the benchmark. A later run will refresh the tables.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -m 'Refresh full-corpus archive sizes'
+          git push origin HEAD:main
