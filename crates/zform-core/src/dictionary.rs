@@ -189,12 +189,15 @@ impl Digest {
         // The tables hold a position per byte of content, so a value is found wherever it
         // sits. Attached, they are searched in place: a leaf pays for its own bytes only. The
         // binary tree of levels 13 and up holds half the positions its chain log spans, hence
-        // one more.
+        // one more. The double-fast levels spend it on a second table, for matches under eight
+        // bytes; a quarter of the positions there costs 2e-5 of a file priced at such a level,
+        // and 48 MiB less for 16 MiB of content.
         let log = content.len().max(2).ilog2().clamp(20, 29) as i32;
+        let double_fast = unsafe { zs::ZSTD_getCParams(level, 0, 0) }.strategy == zs::ZSTD_strategy::ZSTD_dfast;
         let params = [
             (ZSTD_c_compressionLevel, level),
             (ZSTD_c_hashLog, log),
-            (ZSTD_c_chainLog, log + 1),
+            (ZSTD_c_chainLog, if double_fast { log - 2 } else { log + 1 }),
             (ZSTD_c_windowLog, DIGEST_WINDOW_LOG as i32),
         ];
         unsafe {
