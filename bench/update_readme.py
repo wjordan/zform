@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Publish README size results when a measured archive changes by at least 1%."""
+"""Publish README size tables when a measured archive changes by at least 1%."""
 
 import argparse
 import json
@@ -51,29 +51,19 @@ def changes(before, after):
     return deltas
 
 
-def replace_section(markdown, name, content):
+def replace_table(markdown, name, table):
     start = f"<!-- bench:{name} -->\n"
     end = f"<!-- /bench:{name} -->"
     head, _, tail = markdown.partition(start)
     _, marker, rest = tail.partition(end)
     if not marker:
-        raise ValueError(f"missing README benchmark markers for {name}")
-    return head + start + content + "\n" + marker + rest
+        raise ValueError(f"missing README table markers for {name}")
+    return head + start + table + "\n" + marker + rest
 
 
 def render_readme(markdown, results):
-    hdfs, github, _ = results
-    hdfs_ratio = hdfs["raw_bytes"] / hdfs["codecs"]["zform HDFS predictors"]["size"]
-    github_ratio = github["raw_bytes"] / github["codecs"]["zform --best ordered"]["size"]
-    headline = (
-        f"**{hdfs_ratio:.3g}× compression** on the full Loghub HDFS log with "
-        "`zform pack -l 6 --hdfs-predictors --context-mixing`. "
-        f"A full hour of GitHub Archive reaches {github_ratio:.3g}× with "
-        "`--best --order-by type,repo.id`. Both archives include the query index."
-    )
-    comparison = headline + "\n\n" + size_table(results, COMPARISON)
-    markdown = replace_section(markdown, "comparison", comparison)
-    return replace_section(markdown, "presets", preset_table(results))
+    markdown = replace_table(markdown, "comparison", size_table(results, COMPARISON))
+    return replace_table(markdown, "presets", preset_table(results))
 
 
 def main():

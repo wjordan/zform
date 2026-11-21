@@ -83,7 +83,7 @@ def fmt_rss(kib):
     return "n/a" if kib is None else f"{kib / 1024:.1f}"
 
 
-COMPARISON = ("zstd -3", "zstd -19", "xz -6", "zform")
+COMPARISON = ("zform", "zstd -3", "zstd -19", "xz -6")
 PRESETS = ("zform --best", "zform HDFS predictors", "zform ordered", "zform --best ordered")
 
 
@@ -94,13 +94,16 @@ def size_cell(raw_len, size):
 def size_table(report, codecs):
     labels = ["`zform` (default)" if codec == "zform" else f"`{codec}`" for codec in codecs]
     rows = [
-        "| Corpus | Raw | " + " | ".join(labels) + " |",
-        "|---|---:|" + "---:|" * len(codecs),
+        "| Corpus | Raw | `zform` (tuned) | " + " | ".join(labels) + " |",
+        "|---|---:|---:|" + "---:|" * len(codecs),
     ]
     for dataset in report:
         raw_len = dataset["raw_bytes"]
-        cells = " | ".join(size_cell(raw_len, dataset["codecs"][c]["size"]) for c in codecs)
-        rows.append(f"| {dataset['name']} | {raw_len / 2**20:,.2f} MiB | {cells} |")
+        results = dataset["codecs"]
+        tuned = min(results[c]["size"] for c in PRESETS if c in results)
+        cells = [size_cell(raw_len, tuned)]
+        cells.extend(size_cell(raw_len, results[c]["size"]) for c in codecs)
+        rows.append(f"| {dataset['name']} | {raw_len / 2**20:,.2f} MiB | " + " | ".join(cells) + " |")
     return "\n".join(rows)
 
 
