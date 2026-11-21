@@ -762,6 +762,34 @@ mod tests {
     }
 
     #[test]
+    fn an_object_in_a_key_layout_the_model_lacks_counts_as_residual() {
+        use crate::block::{BlockOptions, encode_block, train};
+        let rows = |license: &str| -> Vec<String> {
+            (0..500)
+                .map(|i| {
+                    format!(
+                        r#"{{"id":{i},"repo":{{"name":"r{}","stars":{}{license}}}}}"#,
+                        i % 7,
+                        i % 13
+                    )
+                })
+                .collect()
+        };
+        let (seen, drifted) = (rows(r#","license":"mit""#), rows(""));
+        fn recs(v: &[String]) -> Vec<&[u8]> {
+            v.iter().map(|r| r.as_bytes()).collect()
+        }
+        let model = train(&recs(&seen), &TrainOptions::default(), None);
+        let opts = BlockOptions::default();
+        let (_, fit) = encode_block(&recs(&seen), &model, &opts);
+        assert_eq!((fit.residual_rows, fit.residual_bytes), (0, 0));
+        // Every row still splits, but its `repo` is stored whole: the caller should retrain.
+        let (_, fit) = encode_block(&recs(&drifted), &model, &opts);
+        assert_eq!(fit.residual_rows, 0);
+        assert!(fit.residual_rate() > 0.3, "{fit:?}");
+    }
+
+    #[test]
     fn null_objects_and_empty_arrays_do_not_multiply_shapes() {
         use crate::block::{BlockOptions, decode_block, encode_block, train};
         let rows: Vec<String> = (0..1500)

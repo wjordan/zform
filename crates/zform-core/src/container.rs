@@ -275,7 +275,8 @@ pub struct InspectReport {
 pub struct FrameFit {
     pub rows: usize,
     pub bytes: usize,
-    /// Rows and bytes the model could not place. A frame stored verbatim counts in full.
+    /// Rows the model could not place, and their bytes plus those of JSON objects in a key
+    /// layout it lacks. A frame stored verbatim counts in full.
     pub residual_rows: usize,
     pub residual_bytes: usize,
 }
@@ -1327,7 +1328,8 @@ fn encode_block_columns(
         enc,
         per_row: split.per_row.clone(),
         residual_rows: split.residual_rows,
-        residual_bytes: split.residual_bytes,
+        // A JSON object in a key layout the plan lacks is stored whole: not placed either.
+        residual_bytes: split.residual_bytes + split.unshaped_bytes,
         index,
     }
 }
