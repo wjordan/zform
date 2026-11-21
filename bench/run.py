@@ -83,8 +83,13 @@ def fmt_rss(kib):
     return "n/a" if kib is None else f"{kib / 1024:.1f}"
 
 
-COMPARISON = ("zform", "zstd -3", "zstd -19", "xz -6")
-PRESETS = ("zform --best", "zform HDFS predictors", "zform ordered", "zform --best ordered")
+COMPARISON = ("zstd -3", "zstd -19", "xz -6")
+PRESETS = {
+    "zform --best": "--best",
+    "zform HDFS predictors": "-l 6 --hdfs-predictors --context-mixing",
+    "zform ordered": "--order-by type,repo.id",
+    "zform --best ordered": "--best --order-by type,repo.id",
+}
 
 
 def size_cell(raw_len, size):
@@ -92,34 +97,28 @@ def size_cell(raw_len, size):
 
 
 def size_table(report, codecs):
-    labels = ["`zform` (default)" if codec == "zform" else f"`{codec}`" for codec in codecs]
+    labels = [f"`{codec}`" for codec in codecs]
     rows = [
-        "| Corpus | Raw | `zform` (tuned) | " + " | ".join(labels) + " |",
+        "| Corpus | Raw | `zform` | " + " | ".join(labels) + " |",
         "|---|---:|---:|" + "---:|" * len(codecs),
     ]
     for dataset in report:
         raw_len = dataset["raw_bytes"]
         results = dataset["codecs"]
-        tuned = min(results[c]["size"] for c in PRESETS if c in results)
-        cells = [size_cell(raw_len, tuned)]
+        preset = min((c for c in PRESETS if c in results), key=lambda c: results[c]["size"])
+        cells = [f"{size_cell(raw_len, results[preset]['size'])}<br>`{PRESETS[preset]}`"]
         cells.extend(size_cell(raw_len, results[c]["size"]) for c in codecs)
         rows.append(f"| {dataset['name']} | {raw_len / 2**20:,.2f} MiB | " + " | ".join(cells) + " |")
     return "\n".join(rows)
 
 
 def preset_table(report):
-    flags = {
-        "zform --best": "--best",
-        "zform HDFS predictors": "-l 6 --hdfs-predictors --context-mixing",
-        "zform ordered": "--order-by type,repo.id",
-        "zform --best ordered": "--best --order-by type,repo.id",
-    }
     rows = ["| Corpus | Pack flags | Archive |", "|---|---|---:|"]
     for dataset in report:
-        for c in PRESETS:
+        for c, flags in PRESETS.items():
             if c in dataset["codecs"]:
                 size = size_cell(dataset["raw_bytes"], dataset["codecs"][c]["size"])
-                rows.append(f"| {dataset['name']} | `{flags[c]}` | {size} |")
+                rows.append(f"| {dataset['name']} | `{flags}` | {size} |")
     return "\n".join(rows)
 
 
