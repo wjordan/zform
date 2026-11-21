@@ -3296,7 +3296,7 @@ fn propose_cands(list: &[ScopeOcc<'_>], own: usize, tmp: &mut Vec<u8>) -> Vec<Js
 fn free_template(a: &[Vec<u8>], b: &[Vec<u8>], refs: &[u16], own: usize) -> Option<JsonCand> {
     let mut diff = (0..a.len()).filter(|&j| a[j] != b[j]);
     let j = diff.next()?;
-    if diff.next().is_some() || refs.len() >= DERIV_MAX_REFS + 1 {
+    if diff.next().is_some() || refs.len() > DERIV_MAX_REFS {
         return None;
     }
     let (x, y) = (&a[j], &b[j]);

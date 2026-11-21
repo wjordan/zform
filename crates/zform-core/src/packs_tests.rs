@@ -1364,7 +1364,7 @@ fn iso_timestamps_patch_other_layouts_and_impossible_dates() {
 fn numeric_timestamps_preserve_clock_separators_and_exceptions() {
     let t0 = secs_of(2024, 2, 28, 23, 59, 57);
     for sep in ['T', 't', ' ', '-'] {
-        for clock_sep in [b':', b'.'] {
+        for clock_sep in *b":." {
             let mut rows: Vec<Vec<u8>> = (0..16)
                 .map(|i| {
                     let mut row =
@@ -1590,7 +1590,7 @@ fn uuids_drawn_from_mt_streams() {
 fn uuid7_tails_drawn_from_seeded_python_random() {
     let words = mt_words(3, 600);
     let mut ts = 1_700_000_000_000u64;
-    let mut rows = owned(words.chunks_exact(3).take(40).map(|w| {
+    let mut rows = owned(words.as_chunks::<3>().0.iter().take(40).map(|w| {
         let mut tail = [0u8; 10];
         MtLayout::Uuid7.render(w, &[], &mut tail);
         ts += 1;
@@ -2140,7 +2140,7 @@ fn python_uniform_walk(x0: f64) -> Vec<Vec<u8>> {
     let words = mt_words(7, 800);
     let mut x = x0;
     let mut vals = vec![x];
-    for w in words.chunks_exact(2) {
+    for w in words.as_chunks::<2>().0 {
         let r = u64::from(w[0] >> 5) << 26 | u64::from(w[1] >> 6);
         x += -1.0 + 2.0 * (r as f64 / (1u64 << 53) as f64);
         vals.push(x);

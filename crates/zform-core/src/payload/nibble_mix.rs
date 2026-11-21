@@ -629,7 +629,11 @@ mod tests {
         (0..n)
             .map(|_| {
                 let r = next(&mut rng);
-                let x = if r % 4 == 0 { r >> 8 } else { r >> 8 & 7 };
+                let x = if r.is_multiple_of(4) {
+                    r >> 8
+                } else {
+                    r >> 8 & 7
+                };
                 min.wrapping_add((x & ((1 << bits) - 1)) as i64)
             })
             .collect()
@@ -755,7 +759,7 @@ mod tests {
         let (mut rng, mut value) = (17, 0);
         let values: Vec<i64> = (0..8192)
             .map(|_| {
-                if next(&mut rng) % 10 == 0 {
+                if next(&mut rng).is_multiple_of(10) {
                     value ^= 1;
                 }
                 value

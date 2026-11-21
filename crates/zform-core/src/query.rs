@@ -213,6 +213,10 @@ pub fn eval_raw_record(rec: &[u8], pred: &Predicate) -> bool {
 }
 
 /// A predicate made ready to test many raw records: its searchers and field paths built once.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Keep substring searchers inline to avoid an allocation per predicate"
+)]
 pub(crate) enum RawTest<'p> {
     All,
     Text(Finder<'p>, bool),

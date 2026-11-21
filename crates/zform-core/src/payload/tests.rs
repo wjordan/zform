@@ -555,7 +555,7 @@ fn bench_programs() {
 
 #[test]
 fn random_recurrences_match_the_scalar_evaluator() {
-    let mut rng = 0x5eed_0f_7ec0_u64;
+    let mut rng = 0x005e_ed0f_7ec0_u64;
     for trial in 0..160 {
         let width = if trial % 2 == 0 {
             Width::W32
@@ -1356,7 +1356,7 @@ fn compact_numeric_graphs_match_general_execution_and_reject_bad_frames() {
                 assert!(CoreDecoder::decode_ints_bytes(&trailing, &budget).is_err());
                 let tight = DecodeBudget {
                     max_single_alloc_bytes: 1,
-                    ..budget.clone()
+                    ..budget
                 };
                 assert!(CoreDecoder::decode_ints_bytes(&wire, &tight).is_err());
             }

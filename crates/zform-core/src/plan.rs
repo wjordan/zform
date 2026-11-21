@@ -468,7 +468,7 @@ fn frequent_layouts<K: Ord>(seen: HashMap<K, usize>) -> Vec<K> {
 }
 
 fn train_csv_if_tabular(rows: &[&[u8]], plan: &mut ModelPlan) -> bool {
-    for delim in [b',', b'\t'] {
+    for delim in *b",\t" {
         let mut counts: BTreeMap<usize, usize> = BTreeMap::new();
         let probe = rows.len().min(128);
         for &r in rows.iter().take(probe) {
@@ -638,7 +638,7 @@ fn train_templates_arm<'a>(rows: &[&'a [u8]], opts: &TrainOptions, plan: &mut Mo
         }
     }
 
-    accepted.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    accepted.sort_by_key(|a| std::cmp::Reverse(a.1.len()));
     for ((raw_lits, raw_classes), member_lines) in accepted.into_iter().take(opts.max_templates) {
         let (literals, classes) = pin_constant_slots(raw_lits, raw_classes, &member_lines);
 
@@ -888,7 +888,7 @@ fn discover_horizontal_candidates(samples: &[&[u8]], plan: &mut ModelPlan) {
                 cands.push((src as u16, score));
             }
         }
-        cands.sort_by(|a, b| b.1.cmp(&a.1));
+        cands.sort_by_key(|a| std::cmp::Reverse(a.1));
         cands.truncate(6);
         plan.columns[target].horiz_candidates = cands.into_iter().map(|x| x.0).collect();
     }

@@ -147,10 +147,9 @@ fn prefetch(p: *const u8) {
 
 /// Length of the common prefix of `a` and `b`, compared a word at a time.
 fn lcp(a: &[u8], b: &[u8]) -> usize {
-    let word = |w: &[u8]| u64::from_le_bytes(w.try_into().unwrap());
     let same = 8
-        * (a.chunks_exact(8).zip(b.chunks_exact(8)))
-            .take_while(|&(x, y)| word(x) == word(y))
+        * (a.as_chunks::<8>().0.iter().zip(b.as_chunks::<8>().0))
+            .take_while(|(x, y)| x == y)
             .count();
     same + a[same..]
         .iter()
@@ -2060,7 +2059,7 @@ fn fill<const W: usize>(rows: &mut [u8], (stride, off): (usize, usize), col: &Co
         }
         _ => match col.laid() {
             Some((bytes, ends)) if bytes.len() >= n * W && even(ends, n) => {
-                rows.zip(bytes.chunks_exact(W))
+                rows.zip(bytes.as_chunks::<W>().0)
                     .for_each(|(row, cell)| copy(row, cell));
                 return true;
             }
@@ -2156,7 +2155,8 @@ fn decode_frame(
             for i in sort_records(&recs) {
                 let rec = recs.get(i as usize).unwrap();
                 put(&mut frame_out, &mut emitted, &mut |o| {
-                    Ok(o.extend_from_slice(rec))
+                    o.extend_from_slice(rec);
+                    Ok(())
                 })?;
             }
         } else {
@@ -3030,7 +3030,7 @@ mod unpack_threads_tests {
             rep.frames > rep.sync_frames && rep.passthrough_frames > 0,
             "{rep:?}"
         );
-        let cat = [&packed[..], &packed].concat();
+        let cat = [&packed[..], packed].concat();
         for threads in [2, 5] {
             assert!(unpack(&cat, threads) == (raw.repeat(2), Ok(())));
         }

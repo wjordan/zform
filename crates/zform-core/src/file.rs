@@ -420,7 +420,7 @@ impl File {
             plans: self.plans.clone(),
             starts: self.starts.clone(),
             root_len: self.root_len,
-            budget: self.budget.clone(),
+            budget: self.budget,
             query_plans: Arc::default(),
             dict: OnceLock::new(),
         }

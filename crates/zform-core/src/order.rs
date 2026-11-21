@@ -162,6 +162,11 @@ fn key_cmp(a: &[u8], b: &[u8]) -> Ordering {
 /// The positions `0..n` not yet taken, as a Fenwick tree of counts.
 struct Remaining(Vec<u32>);
 
+#[allow(
+    unknown_lints,
+    clippy::manual_isolate_lowest_one,
+    reason = "Keep building on Rust versions before isolate_lowest_one"
+)]
 impl Remaining {
     fn new(n: usize) -> Self {
         Self((0..=n as u32).map(|i| i & i.wrapping_neg()).collect())

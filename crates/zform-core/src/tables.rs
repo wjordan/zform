@@ -98,7 +98,7 @@ impl Tables {
             wire: OnceLock::from(wire.to_vec()),
             encode: Mutex::new(None),
             graphs,
-            budget: budget.clone(),
+            budget: *budget,
             cols: (0..n).map(|_| OnceLock::new()).collect(),
             ids: (0..n).map(|_| OnceLock::new()).collect(),
         })

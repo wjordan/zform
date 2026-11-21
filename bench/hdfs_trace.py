@@ -437,9 +437,9 @@ for w0, rows in enumerate(WINDOWS):
     for (ts, X) in sorted(grp):
         while ii < len(invs) and invs[ii][0] <= ts:
             bisect.insort(pend2[invs[ii][2]], invs[ii][1]); ii += 1
-        dadd('del_time', dT.cost('d', ts - pts if pts is not None else 0)); 
+        dadd('del_time', dT.cost('d', ts - pts if pts is not None else 0));
         sym = mtf.index(X) if X in mtf else 'new'
-        dadd('del_node', dN.cost(ts == pts, sym, 8)); 
+        dadd('del_node', dN.cost(ts == pts, sym, 8));
         if X in mtf: mtf.remove(X)
         mtf.insert(0, X); del mtf[64:]
         pts = ts

@@ -279,8 +279,8 @@ fn lut_avx2(bytes: &mut [u8], table: &[u8; 32], mask: u8) {
     unsafe {
         let lo = _mm256_broadcastsi128_si256(_mm_loadu_si128(table.as_ptr().cast()));
         let hi = _mm256_broadcastsi128_si256(_mm_loadu_si128(table[16..].as_ptr().cast()));
-        let mut blocks = bytes.chunks_exact_mut(32);
-        for b in &mut blocks {
+        let (blocks, tail) = bytes.as_chunks_mut::<32>();
+        for b in blocks {
             let x = _mm256_loadu_si256(b.as_ptr().cast());
             let i = _mm256_and_si256(x, _mm256_set1_epi8(15));
             let (y, upper) = (_mm256_shuffle_epi8(lo, i), _mm256_shuffle_epi8(hi, i));
@@ -289,7 +289,7 @@ fn lut_avx2(bytes: &mut [u8], table: &[u8; 32], mask: u8) {
             let y = _mm256_blendv_epi8(y, upper, pick);
             _mm256_storeu_si256(b.as_mut_ptr().cast(), y);
         }
-        for b in blocks.into_remainder() {
+        for b in tail {
             *b = table[(*b & mask) as usize];
         }
     }
@@ -543,7 +543,7 @@ impl<'p> CompiledProgram<'p> {
         load: impl Fn(I) -> T,
         store: impl Fn(T) -> O,
     ) {
-        let fixed = self.p.sinks.get(0).map(|s| s.1) == Some(Len::Fixed(T::BYTES as u8));
+        let fixed = self.p.sinks.first().map(|s| s.1) == Some(Len::Fixed(T::BYTES as u8));
         assert!(self.p.sinks.len() == 1 && fixed);
         let rows = out.len();
         inputs.iter().for_each(|c| assert!(c.len() >= rows));

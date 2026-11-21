@@ -61,8 +61,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("expected a nonempty i64 lane".into());
     }
     let ticks: Vec<_> = raw
-        .chunks_exact(8)
-        .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .copied()
+        .map(i64::from_le_bytes)
         .collect();
     if packing {
         fs::write(&args[3], encode(&ticks, 3, 10))?;

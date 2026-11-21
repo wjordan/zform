@@ -809,7 +809,7 @@ mod tests {
             raw_b.extend_from_slice(&word.to_le_bytes());
         }
         let mut text = Vec::new();
-        for line in raw_b.chunks_exact(48) {
+        for line in raw_b.as_chunks::<48>().0 {
             crate::lex::format_base64(line, &mut text);
             text.push(b'\n');
         }
@@ -958,12 +958,10 @@ mod tests {
         let (mut plan, vids, cols) = keyed_block();
         // Each `got` record's own key cell, in record order.
         let mut want = Vec::new();
-        let mut k = 0i64;
-        for &v in &vids {
+        for (k, &v) in vids.iter().enumerate() {
             if v == 2 {
-                want.push(k);
+                want.push(k as i64);
             }
-            k += 1;
         }
         assert_eq!(align_cells(&plan, &vids, 2, 3).unwrap(), want);
         assert_eq!(want.len(), cols[3].len());

@@ -1115,10 +1115,10 @@ impl IntStream {
                 let mut out: Vec<i64> = h_raw.iter().map(|&b| min.wrapping_add(b as i64)).collect();
                 // Exceptions are rare: find them a word at a time and add their tail values.
                 let mut tail = over.iter();
-                let chunks = h_raw.chunks_exact(8);
+                let (chunks, remainder) = h_raw.as_chunks::<8>();
                 let mut rest = [0u8; 8];
-                rest[..chunks.remainder().len()].copy_from_slice(chunks.remainder());
-                let words = chunks.map(|c| u64::from_le_bytes(c.try_into().unwrap()));
+                rest[..remainder.len()].copy_from_slice(remainder);
+                let words = chunks.iter().copied().map(u64::from_le_bytes);
                 for (k, x) in words.chain([u64::from_le_bytes(rest)]).enumerate() {
                     // The high bit of each 0xff byte: only 0x7f carries into bit 7.
                     let mut m = x & ((x & 0x7f7f_7f7f_7f7f_7f7f) + 0x0101_0101_0101_0101);
@@ -3741,12 +3741,12 @@ impl CoreDecoder {
                     budget.check_alloc(n.saturating_mul(8), "ByteChunks")?;
                     let mut col = Vec::with_capacity(n);
                     if cb == 8 {
-                        for ch in bytes.chunks_exact(8) {
-                            col.push(i64::from_le_bytes(ch.try_into().unwrap()));
+                        for ch in bytes.as_chunks::<8>().0 {
+                            col.push(i64::from_le_bytes(*ch));
                         }
                     } else if cb == 4 {
-                        for ch in bytes.chunks_exact(4) {
-                            col.push(u32::from_le_bytes(ch.try_into().unwrap()) as i64);
+                        for ch in bytes.as_chunks::<4>().0 {
+                            col.push(u32::from_le_bytes(*ch) as i64);
                         }
                     } else {
                         for ch in bytes.chunks_exact(cb) {
@@ -3818,8 +3818,10 @@ impl CoreDecoder {
                                 return Err(Error::Format("unaligned W32 seed".into()));
                             }
                             let seed: Vec<u32> = raw_seed
-                                .chunks_exact(4)
-                                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                                .as_chunks::<4>()
+                                .0
+                                .iter()
+                                .map(|c| u32::from_le_bytes(*c))
                                 .collect();
                             if seed.len() != spec.max_lag() * spec.n_state as usize {
                                 return Err(Error::Format("recurrence seed size mismatch".into()));
@@ -3857,8 +3859,10 @@ impl CoreDecoder {
                                 return Err(Error::Format("unaligned W64 seed".into()));
                             }
                             let seed: Vec<i64> = raw_seed
-                                .chunks_exact(8)
-                                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                                .as_chunks::<8>()
+                                .0
+                                .iter()
+                                .map(|c| i64::from_le_bytes(*c))
                                 .collect();
                             if seed.len() != spec.max_lag() * spec.n_state as usize {
                                 return Err(Error::Format("recurrence seed size mismatch".into()));
@@ -4448,7 +4452,7 @@ fn match_index(
 }
 
 fn fill_low_bytes<const W: usize>(lanes: &[i64], out: &mut [u8]) {
-    for (d, v) in out.chunks_exact_mut(W).zip(lanes) {
+    for (d, v) in out.as_chunks_mut::<W>().0.iter_mut().zip(lanes) {
         d.copy_from_slice(&v.to_le_bytes()[..W]);
     }
 }

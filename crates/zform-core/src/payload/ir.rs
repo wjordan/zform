@@ -321,14 +321,14 @@ impl Program {
         while let Some(ins) = ops.next() {
             let cast = compact && ops.next_if(|next| next.op == Op::I64ToF64).is_some();
             let flag = u8::from(cast) << 6;
-            if compact && matches!(ins.op, Op::F64MulI | Op::F64DivI) {
-                if let Some(i) = DECIMAL_IMMEDIATES
+            if compact
+                && matches!(ins.op, Op::F64MulI | Op::F64DivI)
+                && let Some(i) = DECIMAL_IMMEDIATES
                     .iter()
                     .position(|v| v.to_bits() == ins.imm as u64)
-                {
-                    out.push(0x80 | flag | (u8::from(ins.op == Op::F64DivI) << 5) | i as u8);
-                    continue;
-                }
+            {
+                out.push(0x80 | flag | (u8::from(ins.op == Op::F64DivI) << 5) | i as u8);
+                continue;
             }
             out.push(ins.op as u8 | flag);
             if ins.op.is_shift_imm() {

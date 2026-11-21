@@ -31,16 +31,16 @@ fn main() {
                 .collect::<Vec<_>>()
         );
         for (j, v) in plan.variants.iter().enumerate() {
-            if let PlanVariant::Shape(s) = v {
-                if s.slots.contains(&(i as u16)) {
-                    let mut text = String::new();
-                    for (k, &slot) in s.slots.iter().enumerate() {
-                        text += &String::from_utf8_lossy(&s.literals[k]);
-                        text += &format!("<{}>", plan.columns[slot as usize].name);
-                    }
-                    text += &String::from_utf8_lossy(s.literals.last().unwrap());
-                    println!("  {j}: {text}");
+            if let PlanVariant::Shape(s) = v
+                && s.slots.contains(&(i as u16))
+            {
+                let mut text = String::new();
+                for (k, &slot) in s.slots.iter().enumerate() {
+                    text += &String::from_utf8_lossy(&s.literals[k]);
+                    text += &format!("<{}>", plan.columns[slot as usize].name);
                 }
+                text += &String::from_utf8_lossy(s.literals.last().unwrap());
+                println!("  {j}: {text}");
             }
         }
     }

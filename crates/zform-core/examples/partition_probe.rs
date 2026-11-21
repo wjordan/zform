@@ -145,10 +145,10 @@ fn adaptive(plan: &mut ModelPlan, raw: &[u8], fast: bool) {
         for (vi, v) in plan.variants.iter_mut().enumerate() {
             if let PlanVariant::Shape(s) = v {
                 for col in &mut s.slots {
-                    if *col as usize == cid {
-                        if let Some(group) = mapped.get(&(vi as u32)) {
-                            *col = newcols[group];
-                        }
+                    if *col as usize == cid
+                        && let Some(group) = mapped.get(&(vi as u32))
+                    {
+                        *col = newcols[group];
                     }
                 }
             }

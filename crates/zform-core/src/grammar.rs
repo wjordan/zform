@@ -593,10 +593,9 @@ pub fn parse_k8s_cri(line: &[u8]) -> Option<(&[u8], &[u8], &[u8], &[u8])> {
     let rest1 = &line[sp1 + 1..];
     let (stream, rest2) = if let Some(r) = rest1.strip_prefix(b"stdout ") {
         (&b"stdout"[..], r)
-    } else if let Some(r) = rest1.strip_prefix(b"stderr ") {
-        (&b"stderr"[..], r)
     } else {
-        return None;
+        let r = rest1.strip_prefix(b"stderr ")?;
+        (&b"stderr"[..], r)
     };
     if rest2.len() < 2 || rest2[1] != b' ' || !matches!(rest2[0], b'F' | b'P') {
         return None;

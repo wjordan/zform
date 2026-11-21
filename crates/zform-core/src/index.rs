@@ -88,10 +88,9 @@ fn spellings(text: &[u8], mut f: impl FnMut(u64, bool)) {
             }
         }
     };
-    let chunks = text.chunks_exact(8);
-    let tail = chunks.remainder();
-    for (at, c) in (0..).step_by(8).zip(chunks) {
-        scan(at, u64::from_le_bytes(c.try_into().unwrap()));
+    let (chunks, tail) = text.as_chunks::<8>();
+    for (at, &c) in (0..).step_by(8).zip(chunks) {
+        scan(at, u64::from_le_bytes(c));
     }
     let mut b = [0u8; 8];
     b[..tail.len()].copy_from_slice(tail);

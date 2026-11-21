@@ -372,7 +372,7 @@ impl SizeNode {
         let _ = write!(out, ",\"bytes\":{}", self.bytes);
         if !self.sigs.is_empty() {
             let mut sigs: Vec<&Signature> = self.sigs.iter().collect();
-            sigs.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+            sigs.sort_by_key(|s| std::cmp::Reverse(s.bytes));
             out.push_str(",\"signatures\":[");
             for (i, s) in sigs.into_iter().enumerate() {
                 if i > 0 {

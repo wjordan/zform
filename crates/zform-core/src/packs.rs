@@ -889,9 +889,12 @@ fn mt_walk_step(a: f64, b: f64, w: &[u32], prev: &[u8]) -> [u8; 8] {
 
 impl MtLayout {
     pub(crate) fn detect_walk(recs: &[u8]) -> Option<Self> {
-        let rows = recs.chunks_exact(8);
-        let v: Vec<f64> = rows
-            .map(|r| f64::from_le_bytes(r.try_into().unwrap()))
+        let v: Vec<f64> = recs
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .copied()
+            .map(f64::from_le_bytes)
             .collect();
         let mut steps: Vec<f64> = v.windows(2).map(|w| w[1] - w[0]).collect();
         let n = steps.len();
@@ -952,12 +955,12 @@ impl MtLayout {
     fn render(self, w: &[u32], prev: &[u8], out: &mut [u8]) {
         match self {
             Self::Le => {
-                for (o, x) in out.chunks_exact_mut(4).zip(w) {
+                for (o, x) in out.as_chunks_mut::<4>().0.iter_mut().zip(w) {
                     o.copy_from_slice(&x.to_le_bytes());
                 }
             }
             Self::Be => {
-                for (o, x) in out.chunks_exact_mut(4).zip(w.iter().rev()) {
+                for (o, x) in out.as_chunks_mut::<4>().0.iter_mut().zip(w.iter().rev()) {
                     o.copy_from_slice(&x.to_be_bytes());
                 }
             }
@@ -3627,7 +3630,7 @@ impl HexFixedPack {
         let mut has_lo = false;
         let mut has_up = false;
         let mut out = Vec::with_capacity(expected_chars / 2);
-        for pair in s.chunks_exact(2) {
+        for pair in s.as_chunks::<2>().0 {
             let c0 = pair[0];
             let c1 = pair[1];
             if c0.is_ascii_lowercase() || c1.is_ascii_lowercase() {
@@ -4296,7 +4299,7 @@ impl Base64Pack {
         let n_quads = s.len() / 4;
         let orig_t = triplets.len();
         let orig_p = pads.len();
-        for (qi, q) in s.chunks_exact(4).enumerate() {
+        for (qi, q) in s.as_chunks::<4>().0.iter().enumerate() {
             let is_last = qi + 1 == n_quads;
             let s0 = inv[q[0] as usize];
             let s1 = inv[q[1] as usize];
@@ -5647,7 +5650,9 @@ impl PackRegistry {
             if paging.is_some() {
                 for blob in &col_blobs {
                     for c in crate::codecs::column_deps(blob).cols {
-                        read_by_peer.get_mut(c as usize).map(|r| *r = true);
+                        if let Some(read) = read_by_peer.get_mut(c as usize) {
+                            *read = true;
+                        }
                     }
                 }
             }
