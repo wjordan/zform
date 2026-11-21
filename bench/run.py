@@ -92,8 +92,9 @@ def size_cell(raw_len, size):
 
 
 def size_table(report, codecs):
+    labels = ["`zform` (default)" if codec == "zform" else f"`{codec}`" for codec in codecs]
     rows = [
-        "| Corpus | Raw | " + " | ".join(f"`{codec}`" for codec in codecs) + " |",
+        "| Corpus | Raw | " + " | ".join(labels) + " |",
         "|---|---:|" + "---:|" * len(codecs),
     ]
     for dataset in report:
