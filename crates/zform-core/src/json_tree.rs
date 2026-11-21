@@ -3044,12 +3044,9 @@ impl<'a> DerivationSample<'a> {
         };
         let mut doc = JsonDoc::default();
         let mut active = vec![false; jt.paths.len()];
-        let strided: Vec<_> = input
-            .iter()
-            .step_by(input.len().div_ceil(2048).max(1))
-            .copied()
-            .collect();
-        for bytes in spread_order(strided.len()).map(|i| strided[i]) {
+        // Every row: a path in one row of a thousand needs the whole sample to show
+        // `DERIV_MIN_OCC` values, and a path in most rows stops collecting at `DERIV_MAX_OCC`.
+        for bytes in spread_order(input.len()).map(|i| input[i]) {
             if !doc.parse_root_object(bytes) {
                 continue;
             }
@@ -3721,6 +3718,22 @@ mod tests {
         let b = jt.paths.iter().find(|p| p.name == "$.b").unwrap();
         assert!(b.cands.is_empty(), "{:?}", b.cands);
         assert_eq!(spread_order(10).collect::<Vec<_>>(), [0, 7, 4, 1, 8, 5, 2, 9, 6, 3]);
+    }
+
+    #[test]
+    fn a_path_in_few_rows_is_judged_on_every_row_that_has_it() {
+        // `url` is in one row of 300, always built from `login`: 20 values in 6000 rows.
+        let rows: Vec<String> = (0..6000u64)
+            .map(|i| match i % 300 {
+                1 => format!("{{\"login\":\"dev{i}\",\"url\":\"https://api.test/users/dev{i}/repos\"}}"),
+                _ => format!("{{\"login\":\"dev{i}\"}}"),
+            })
+            .collect();
+        let refs: Vec<&[u8]> = rows.iter().map(|r| r.as_bytes()).collect();
+        let mut model = crate::grammar::ModelPlan::residual_only();
+        let jt = train_json_tree(&refs, &crate::plan::TrainOptions::default(), &mut model).unwrap();
+        let url = jt.paths.iter().find(|p| p.name == "$.url").unwrap();
+        assert!(!url.cands.is_empty());
     }
 
     #[test]
