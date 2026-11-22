@@ -73,6 +73,9 @@ pub fn letters_of(text: &[u8]) -> u32 {
             let l = (c[idx] | 0x20).wrapping_sub(b'a');
             mask |= 1u32 << l;
         }
+        if mask == ANY_LETTERS {
+            return mask;
+        }
     }
     for &b in tail {
         let l = (b | 0x20).wrapping_sub(b'a');
@@ -99,7 +102,7 @@ pub(crate) fn time_bounds(vals: &[&[u8]]) -> Option<(i64, i64)> {
     let (mut lo, mut hi) = (first, first);
     let mut prev = first_slice;
     for &s in rest {
-        if s == prev {
+        if crate::wire::fast_eq(s, prev) {
             continue;
         }
         prev = s;
@@ -140,7 +143,7 @@ pub(crate) fn int_bounds(vals: &[&[u8]]) -> Option<(i64, i64)> {
     let (mut lo, mut hi) = (first, first);
     let mut prev = first_slice;
     for &s in rest {
-        if s == prev {
+        if crate::wire::fast_eq(s, prev) {
             continue;
         }
         prev = s;
@@ -156,7 +159,7 @@ impl ColSummary {
         let mut mask = 0u32;
         let mut prev: Option<&[u8]> = None;
         for &v in vals {
-            if prev == Some(v) {
+            if prev.is_some_and(|p| crate::wire::fast_eq(p, v)) {
                 continue;
             }
             prev = Some(v);

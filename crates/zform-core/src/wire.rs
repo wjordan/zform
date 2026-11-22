@@ -308,6 +308,42 @@ impl EntropyBackend {
     }
 }
 
+/// Fast byte-slice equality that handles lengths <= 16 inline in registers without calling
+/// `libc::memcmp` through the PLT (major win for short literals and column values).
+#[inline(always)]
+pub(crate) fn fast_eq(a: &[u8], b: &[u8]) -> bool {
+    let len = a.len();
+    if len != b.len() {
+        return false;
+    }
+    let pa = a.as_ptr();
+    let pb = b.as_ptr();
+    // SAFETY: `a` and `b` both have length `len`; every unaligned load stays within `0..len`.
+    unsafe {
+        if len >= 8 {
+            if len <= 16 {
+                let lo = pa.cast::<u64>().read_unaligned() == pb.cast::<u64>().read_unaligned();
+                let hi = pa.add(len - 8).cast::<u64>().read_unaligned()
+                    == pb.add(len - 8).cast::<u64>().read_unaligned();
+                return lo && hi;
+            }
+            return a == b;
+        }
+        if len >= 4 {
+            let lo = pa.cast::<u32>().read_unaligned() == pb.cast::<u32>().read_unaligned();
+            let hi = pa.add(len - 4).cast::<u32>().read_unaligned()
+                == pb.add(len - 4).cast::<u32>().read_unaligned();
+            return lo && hi;
+        }
+        if len >= 2 {
+            let lo = pa.cast::<u16>().read_unaligned() == pb.cast::<u16>().read_unaligned();
+            let hi = *pa.add(len - 1) == *pb.add(len - 1);
+            return lo && hi;
+        }
+        len == 0 || *pa == *pb
+    }
+}
+
 /// Writes a leaf: `[tag: u8][raw_len: varint][payload_len: varint][payload]`.
 pub(crate) fn put_leaf(out: &mut Vec<u8>, tag: EntropyBackend, raw_len: usize, payload: &[u8]) {
     out.reserve(payload.len() + 12);

@@ -77,28 +77,37 @@ impl FloatEncoder {
                 },
             );
         }
-        let fits = |e: u8, mode: Scale| {
-            let scale = 10f64.powi(e as i32);
-            let probe = values.len().min(32);
-            let exact = values
-                .iter()
-                .take(probe)
-                .filter(|&&v| {
-                    let i = (v * scale).round();
-                    i.is_finite()
-                        && i >= i64::MIN as f64
-                        && i < -(i64::MIN as f64)
-                        && reconstruct(i as i64, scale, mode).to_bits() == v.to_bits()
-                })
-                .count();
-            (exact, probe)
+        const POW10: [f64; 10] = [1., 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9];
+        let probe = values.len().min(32);
+        let max_fb_misses = probe - (probe * 7).div_ceil(8);
+        let fits = |e: u8, mode: Scale, max_misses: usize| -> Option<usize> {
+            let scale = POW10[e as usize];
+            let inv = 1.0 / scale;
+            let mut misses = 0usize;
+            for &v in &values[..probe] {
+                let i = (v * scale).round();
+                let ok = i.is_finite()
+                    && i >= i64::MIN as f64
+                    && i < -(i64::MIN as f64)
+                    && match mode {
+                        Scale::Divide => (i as i64 as f64 / scale).to_bits() == v.to_bits(),
+                        Scale::Multiply => (i as i64 as f64 * inv).to_bits() == v.to_bits(),
+                        Scale::MilliTwice => {
+                            (i as i64 as f64 / 1000. / 1000.).to_bits() == v.to_bits()
+                        }
+                    };
+                if !ok {
+                    misses += 1;
+                    if misses > max_misses {
+                        return None;
+                    }
+                }
+            }
+            Some(probe - misses)
         };
         let scale = hint
             .scale
-            .filter(|&(e, m)| {
-                let (exact, n) = fits(e, m);
-                exact == n
-            })
+            .filter(|&(e, m)| fits(e, m, 0).is_some())
             .or_else(|| {
                 if hint.skip > 0 {
                     hint.skip -= 1;
@@ -110,11 +119,14 @@ impl FloatEncoder {
                         if matches!(mode, Scale::MilliTwice) && e != 6 {
                             continue;
                         }
-                        let (exact, n) = fits(e, mode);
-                        if exact == n {
+                        let cap = if fallback.is_none() { max_fb_misses } else { 0 };
+                        let Some(exact) = fits(e, mode, cap) else {
+                            continue;
+                        };
+                        if exact == probe {
                             return Some((e, mode));
                         }
-                        if fallback.is_none() && exact * 8 >= n * 7 {
+                        if fallback.is_none() && exact * 8 >= probe * 7 {
                             fallback = Some((e, mode));
                         }
                     }
@@ -133,7 +145,7 @@ impl FloatEncoder {
         hint.scale = scale;
         hint.failures = 0;
         hint.skip = 0;
-        let factor = 10f64.powi(exponent as i32);
+        let factor = POW10[exponent as usize];
         self.integers.clear();
         self.residuals.clear();
         for &v in values {
@@ -179,11 +191,31 @@ impl FloatEncoder {
     fn raw_bits(&self) -> Vec<u8> {
         zform_core::payload::graph::with_encode_opts(crate::EntropyBackend::Zstd, 1, || {
             let n = self.bits.len();
-            let mut bytes = vec![0; n * 8];
-            for (i, value) in self.bits.iter().enumerate() {
-                for (k, byte) in value.to_le_bytes().iter().enumerate() {
-                    bytes[k * n + i] = *byte;
+            let total = n * 8;
+            let mut bytes = Vec::with_capacity(total);
+            let ptr: *mut u8 = bytes.as_mut_ptr();
+            // SAFETY: `bytes` has capacity `n * 8`; every write targets `k * n + i < n * 8`.
+            unsafe {
+                let p0 = ptr;
+                let p1 = ptr.add(n);
+                let p2 = ptr.add(n * 2);
+                let p3 = ptr.add(n * 3);
+                let p4 = ptr.add(n * 4);
+                let p5 = ptr.add(n * 5);
+                let p6 = ptr.add(n * 6);
+                let p7 = ptr.add(n * 7);
+                for (i, &value) in self.bits.iter().enumerate() {
+                    let b = value.to_le_bytes();
+                    *p0.add(i) = b[0];
+                    *p1.add(i) = b[1];
+                    *p2.add(i) = b[2];
+                    *p3.add(i) = b[3];
+                    *p4.add(i) = b[4];
+                    *p5.add(i) = b[5];
+                    *p6.add(i) = b[6];
+                    *p7.add(i) = b[7];
                 }
+                bytes.set_len(total);
             }
             let mut graph = GraphBuilder::new(n);
             let root = graph.add_planes(&bytes, 8);

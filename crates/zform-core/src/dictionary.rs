@@ -595,12 +595,18 @@ impl DictionaryBuilder {
             .map(|&end| &self.buf[std::mem::replace(&mut start, end)..end])
             .collect();
         let split = split_records_with_plan(&recs, &self.plan);
-        for occ in split.col_occs.iter().flatten() {
-            let v = occ.as_slice(&split.scratch);
-            // A number is coded as one, not as text the dictionary could match.
-            let number = v.iter().all(|b| b.is_ascii_digit() || b"+-.".contains(b));
-            if v.len() >= MIN_VALUE && !number {
-                self.tally.note(v);
+        for col in &split.col_occs {
+            let mut prev: Option<&[u8]> = None;
+            for occ in col {
+                let v = occ.as_slice(&split.scratch);
+                if v.len() < MIN_VALUE || prev.is_some_and(|p| crate::wire::fast_eq(p, v)) {
+                    continue;
+                }
+                prev = Some(v);
+                // A number is coded as one, not as text the dictionary could match.
+                if !v.iter().all(|b| b.is_ascii_digit() || b"+-.".contains(b)) {
+                    self.tally.note(v);
+                }
             }
         }
         self.tally.end_block();

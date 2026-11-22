@@ -205,6 +205,8 @@ pub struct Pick {
     /// Whether a relation keeping a sum per key lost by under a half: its keys' first steps
     /// weigh on a sample far more than on the block.
     pub near: bool,
+    /// Phase-3 prose pool outcome from the reference block (`0` = unpooled, `1` = whole, `2` = paged).
+    pub pooled: u8,
 }
 
 /// A column's best single-column graph.
@@ -230,7 +232,7 @@ impl Single {
 }
 
 /// Cells a sample needs of a column for its choice to stand for the block's.
-const PICK_CELLS: usize = 512;
+pub(crate) const PICK_CELLS: usize = 512;
 
 /// Rows below which [`keyed_lookup`] does not search, so that a sample cannot rule it out.
 const KEYED_ROWS: usize = 1024;
@@ -426,6 +428,7 @@ impl PackRegistry {
                 cells: SAMPLE,
                 cost: sample.graph.cost(),
                 near: false,
+                pooled: 0,
             };
             let graph = self.encode_single(rows, 0, Some(&pick)).graph;
             let per = |cost: usize, cells: usize| cost as u128 * cells as u128;
@@ -696,12 +699,37 @@ impl PackRegistry {
 
 #[inline]
 pub(crate) fn is_clean_json_quoted(r: &[u8]) -> bool {
-    r.len() >= 2
-        && r[0] == b'"'
-        && r[r.len() - 1] == b'"'
-        && !r[1..r.len() - 1]
-            .iter()
-            .any(|&b| b == b'"' || b == b'\\' || b < 0x20)
+    if r.len() < 2 || r[0] != b'"' || r[r.len() - 1] != b'"' {
+        return false;
+    }
+    let inner = &r[1..r.len() - 1];
+    let mut i = 0usize;
+    let len = inner.len();
+    #[cfg(target_arch = "x86_64")]
+    if len >= 16 {
+        use std::arch::x86_64::*;
+        let ptr = inner.as_ptr();
+        // SAFETY: SSE2 is baseline on x86_64; `i + 16 <= len` bounds every load.
+        unsafe {
+            let v_quote = _mm_set1_epi8(b'"' as i8);
+            let v_slash = _mm_set1_epi8(b'\\' as i8);
+            let v_ctrl = _mm_set1_epi8(31);
+            while i + 16 <= len {
+                let v = _mm_loadu_si128(ptr.add(i).cast());
+                let bad = _mm_or_si128(
+                    _mm_cmpeq_epi8(_mm_min_epu8(v, v_ctrl), v),
+                    _mm_or_si128(_mm_cmpeq_epi8(v, v_quote), _mm_cmpeq_epi8(v, v_slash)),
+                );
+                if _mm_movemask_epi8(bad) != 0 {
+                    return false;
+                }
+                i += 16;
+            }
+        }
+    }
+    !inner[i..]
+        .iter()
+        .any(|&b| b == b'"' || b == b'\\' || b < 0x20)
 }
 
 #[inline]
@@ -3698,28 +3726,52 @@ impl CodecPack for Ipv4Pack {
 pub struct HexFixedPack;
 
 impl HexFixedPack {
+    /// Parses `expected_chars` (even, `<= 64`) single-case hex chars directly into `out` without
+    /// heap allocation. Returns `Some(is_upper)` on success.
+    #[inline]
+    pub(crate) fn parse_hex_into(s: &[u8], out: &mut [u8]) -> Option<bool> {
+        const HEX_LUT: [u8; 256] = {
+            let mut t = [0xffu8; 256];
+            let mut i = 0usize;
+            while i < 10 {
+                t[b'0' as usize + i] = i as u8;
+                i += 1;
+            }
+            let mut i = 0usize;
+            while i < 6 {
+                t[b'a' as usize + i] = (10 + i) as u8 | 0x20; // bit 5 = lowercase
+                t[b'A' as usize + i] = (10 + i) as u8 | 0x40; // bit 6 = uppercase
+                i += 1;
+            }
+            t
+        };
+        if s.len() != out.len() * 2 {
+            return None;
+        }
+        let mut flags = 0u8;
+        for (dst, pair) in out.iter_mut().zip(s.as_chunks::<2>().0) {
+            let a = HEX_LUT[pair[0] as usize];
+            let b = HEX_LUT[pair[1] as usize];
+            let or = a | b;
+            if (or & 0x80) != 0 {
+                return None;
+            }
+            flags |= or;
+            *dst = ((a & 0x0f) << 4) | (b & 0x0f);
+        }
+        if (flags & 0x60) == 0x60 {
+            return None;
+        }
+        Some((flags & 0x40) != 0)
+    }
+
     pub(crate) fn parse_hex_row(s: &[u8], expected_chars: usize) -> Option<(Vec<u8>, bool)> {
         if s.len() != expected_chars || !expected_chars.is_multiple_of(2) {
             return None;
         }
-        let mut has_lo = false;
-        let mut has_up = false;
-        let mut out = Vec::with_capacity(expected_chars / 2);
-        for pair in s.as_chunks::<2>().0 {
-            let c0 = pair[0];
-            let c1 = pair[1];
-            if c0.is_ascii_lowercase() || c1.is_ascii_lowercase() {
-                has_lo = true;
-            }
-            if c0.is_ascii_uppercase() || c1.is_ascii_uppercase() {
-                has_up = true;
-            }
-            if has_lo && has_up {
-                return None;
-            }
-            out.push((hex_val(c0)? << 4) | hex_val(c1)?);
-        }
-        Some((out, has_up))
+        let mut out = vec![0u8; expected_chars / 2];
+        let up = Self::parse_hex_into(s, &mut out)?;
+        Some((out, up))
     }
 
     fn prog_hex_from_buf(raw_bytes: usize, upper: bool) -> Program {
@@ -3777,20 +3829,25 @@ impl CodecPack for HexFixedPack {
         let mut exc_idx = Vec::new();
         let mut exc_vals = Vec::new();
         let mut target_up: Option<bool> = None;
-        let mut last = vec![0u8; raw_w];
+        let mut last = [0u8; 32];
+        let mut cur = [0u8; 32];
+        let last_sl = &mut last[..raw_w];
+        let cur_sl = &mut cur[..raw_w];
 
         for (i, &r) in rows.iter().enumerate() {
-            if let Some((bytes, up)) = Self::parse_hex_row(r, target_chars) {
+            if r.len() == target_chars
+                && let Some(up) = Self::parse_hex_into(r, cur_sl)
+            {
                 let u_ref = *target_up.get_or_insert(up);
                 if up == u_ref {
-                    flat.extend_from_slice(&bytes);
-                    last = bytes;
+                    flat.extend_from_slice(cur_sl);
+                    last_sl.copy_from_slice(cur_sl);
                     continue;
                 }
             }
             exc_idx.push(i);
             exc_vals.push(r);
-            flat.extend_from_slice(&last);
+            flat.extend_from_slice(last_sl);
             if exc_idx.len() * 8 > rows.len() {
                 return None;
             }
@@ -3822,13 +3879,16 @@ impl TraceparentPack {
         if s.len() != 55 || &s[0..3] != b"00-" || s[35] != b'-' || s[52] != b'-' {
             return None;
         }
-        let (tr, up1) = HexFixedPack::parse_hex_row(&s[3..35], 32)?;
-        let (sp, up2) = HexFixedPack::parse_hex_row(&s[36..52], 16)?;
-        let (fl, up3) = HexFixedPack::parse_hex_row(&s[53..55], 2)?;
+        let mut tr = [0u8; 16];
+        let mut sp = [0u8; 8];
+        let mut fl = [0u8; 1];
+        let up1 = HexFixedPack::parse_hex_into(&s[3..35], &mut tr)?;
+        let up2 = HexFixedPack::parse_hex_into(&s[36..52], &mut sp)?;
+        let up3 = HexFixedPack::parse_hex_into(&s[53..55], &mut fl)?;
         if up1 || up2 || up3 {
             return None;
         }
-        Some((tr.try_into().unwrap(), sp.try_into().unwrap(), fl[0]))
+        Some((tr, sp, fl[0]))
     }
 
     fn prog_traceparent() -> Program {
@@ -4174,12 +4234,95 @@ impl CodecPack for NumericTemplatePack {
 
         let mut exc_idx = Vec::new();
         let mut exc_vals = Vec::new();
+        // Fast literal-guided slot matcher: matches `literals[k]` + canonical Int/Hex directly
+        // without re-tokenizing every literal byte via `extract_skeleton`. Only when a literal or
+        // slot fails (or contains an unexpected token boundary) does it fall back to `extract_skeleton`.
+        let slot_kinds: Vec<TokenKind> = first_slots.iter().map(|s| s.2).collect();
+        let direct_match = |r: &[u8], out: &mut Vec<(usize, usize, TokenKind)>| -> bool {
+            if r.is_empty() || r.len() > 256 {
+                return false;
+            }
+            out.clear();
+            let mut pos = 0usize;
+            for k in 0..n_slots {
+                let lit = literals[k].as_slice();
+                if pos + lit.len() > r.len() || !crate::wire::fast_eq(&r[pos..pos + lit.len()], lit)
+                {
+                    return false;
+                }
+                pos += lit.len();
+                let start = pos;
+                match slot_kinds[k] {
+                    TokenKind::Int(_) => {
+                        if pos >= r.len() {
+                            return false;
+                        }
+                        if r[pos] == b'-' {
+                            if pos + 1 >= r.len() || !(b'1'..=b'9').contains(&r[pos + 1]) {
+                                return false;
+                            }
+                            pos += 2;
+                            while pos < r.len() && r[pos].is_ascii_digit() {
+                                pos += 1;
+                            }
+                        } else if r[pos] == b'0' {
+                            pos += 1;
+                        } else if (b'1'..=b'9').contains(&r[pos]) {
+                            pos += 1;
+                            while pos < r.len() && r[pos].is_ascii_digit() {
+                                pos += 1;
+                            }
+                        } else {
+                            return false;
+                        }
+                        if pos < r.len() && r[pos].is_ascii_alphanumeric() {
+                            return false;
+                        }
+                        let Some(val) = ExactIntPack::parse_canonical_i64(&r[start..pos]) else {
+                            return false;
+                        };
+                        out.push((start, pos, TokenKind::Int(val)));
+                    }
+                    TokenKind::Hex(hlen) => {
+                        if pos + hlen > r.len() {
+                            return false;
+                        }
+                        let slice = &r[pos..pos + hlen];
+                        let (mut all_dec, mut has_lo, mut has_up) = (true, false, false);
+                        for &b in slice {
+                            if !b.is_ascii_hexdigit() {
+                                return false;
+                            }
+                            if !b.is_ascii_digit() {
+                                all_dec = false;
+                            }
+                            if b.is_ascii_lowercase() {
+                                has_lo = true;
+                            }
+                            if b.is_ascii_uppercase() {
+                                has_up = true;
+                            }
+                        }
+                        if all_dec || (has_lo && has_up) {
+                            return false;
+                        }
+                        pos += hlen;
+                        if pos < r.len() && r[pos].is_ascii_alphanumeric() {
+                            return false;
+                        }
+                        out.push((start, pos, TokenKind::Hex(hlen)));
+                    }
+                }
+            }
+            pos <= r.len() && crate::wire::fast_eq(&r[pos..], literals[n_slots].as_slice())
+        };
 
         for (i, &r) in rows.iter().enumerate() {
-            if Self::extract_skeleton(r, &mut tmp_skel, &mut tmp_slots)
-                && tmp_skel == dom_skel
-                && tmp_slots.len() == n_slots
-            {
+            let matched = direct_match(r, &mut tmp_slots)
+                || (Self::extract_skeleton(r, &mut tmp_skel, &mut tmp_slots)
+                    && tmp_skel == dom_skel
+                    && tmp_slots.len() == n_slots);
+            if matched {
                 for k in 0..n_slots {
                     let (st, en, tk) = tmp_slots[k];
                     let sl = &r[st..en];
@@ -5170,7 +5313,6 @@ impl PackRegistry {
         mut filter: Option<(&mut FilterBuilder, &[bool])>,
     ) -> EncodedDenseBlock {
         let _mixing = crate::payload::graph::ContextMixScope::new(false);
-        let _memo = crate::payload::graph::EncodeMemoScope::new();
         let search = crate::payload::graph::search_level(level);
         with_encode_opts(backend, search, || {
             let n_cols = occ_streams.len();
@@ -5185,10 +5327,12 @@ impl PackRegistry {
                 cells: 0,
                 cost: 0,
                 near: false,
+                pooled: 0,
             };
             let mut chosen = vec![unpicked.clone(); n_cols];
             let mut used_ext = vec![false; n_cols];
             let mut raw_backed = vec![false; n_cols];
+            let mut deferred_prose = vec![false; n_cols];
             let mut fixed_id_widths = vec![None::<usize>; n_cols];
 
             for cid in 0..n_cols {
@@ -5263,6 +5407,26 @@ impl PackRegistry {
                     .and_then(|p| p.get(cid))
                     .filter(|p| p.cells >= PICK_CELLS.min(occ_len))
                     .unwrap_or(&whole);
+
+                // If the reference block placed this prose column in the Phase-3 pool and it still
+                // qualifies, defer Phase-1 encoding to avoid throwing away a full ZSTD pass.
+                if !sample_only && pick.pooled != 0 && !must_standalone && occ_len >= 2 {
+                    let col_bytes: usize = vals.iter().map(|b| b.len()).sum();
+                    let mean_len = col_bytes / occ_len;
+                    if col_bytes >= 256
+                        && (mean_len >= 40 || dict_groups.get(cid).copied().unwrap_or("") == "text")
+                        && !vals.iter().all(|b| b.len() == mean_len)
+                    {
+                        deferred_prose[cid] = true;
+                        raw_backed[cid] = true;
+                        chosen[cid] = pick.clone();
+                        summaries.push(sum);
+                        col_costs.push(usize::MAX);
+                        col_blobs.push(Vec::new());
+                        col_graphs.push(None);
+                        continue;
+                    }
+                }
                 let (
                     mut best_graph,
                     mut best_blob,
@@ -5274,6 +5438,10 @@ impl PackRegistry {
                 let (mut want, mut near) = (pick.choice, false);
                 loop {
                     let all = want == Choice::Search;
+                    // Only memoize integer streams while exploring multiple candidates for a column;
+                    // replayed columns encode each stream once, so hashing/cloning into the memo is
+                    // pure overhead.
+                    let _memo = all.then(crate::payload::graph::EncodeMemoScope::new);
                     (best_graph, best_blob, best_cost, is_raw_fb, choice) =
                         (None, Vec::new(), usize::MAX, false, want);
                     tapes = Default::default();
@@ -5681,12 +5849,17 @@ impl PackRegistry {
                     }
                     want = Choice::Search;
                 }
-                chosen[cid] = Pick {
-                    choice,
-                    tapes,
-                    cells: occ_len,
-                    cost: best_cost,
-                    near,
+                chosen[cid] = if want != Choice::Search {
+                    pick.clone()
+                } else {
+                    Pick {
+                        choice,
+                        tapes,
+                        cells: occ_len,
+                        cost: best_cost,
+                        near,
+                        pooled: 0,
+                    }
                 };
 
                 if !used_ext[cid]
@@ -5728,6 +5901,7 @@ impl PackRegistry {
                 let vals = &occ_streams[cid];
                 if vals.is_empty()
                     || used_ext[cid]
+                    || deferred_prose[cid]
                     || standalone.get(cid).copied().unwrap_or(false)
                     || summaries[cid].numeric_kind != 0
                     || dict_groups.get(cid).copied().unwrap_or("") == "text"
@@ -5738,18 +5912,44 @@ impl PackRegistry {
                 let mut vocab: FastMap<&[u8], u32> = fast_map_with_capacity(vals.len().min(512));
                 let mut uniq_bytes = 0usize;
                 let mut ok = true;
+                let mut prev: Option<&[u8]> = None;
+                let mut prev_run = 0u32;
                 for &v in vals {
                     let inner = if all_q { &v[1..v.len() - 1] } else { v };
-                    if let Some(c) = vocab.get_mut(inner) {
-                        *c += 1;
-                    } else {
-                        if vocab.len() >= 4096 || uniq_bytes + inner.len() > (256 << 10) {
-                            ok = false;
-                            break;
-                        }
-                        uniq_bytes += inner.len();
-                        vocab.insert(inner, 1);
+                    if prev.is_some_and(|p| crate::wire::fast_eq(p, inner)) {
+                        prev_run += 1;
+                        continue;
                     }
+                    if prev_run > 0 {
+                        if let Some(p) = prev
+                            && let Some(c) = vocab.get_mut(p)
+                        {
+                            *c += prev_run;
+                        }
+                        prev_run = 0;
+                    }
+                    prev = Some(inner);
+                    let cur_len = vocab.len();
+                    match vocab.entry(inner) {
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            *e.get_mut() += 1;
+                        }
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            if cur_len >= 4096 || uniq_bytes + inner.len() > (256 << 10) {
+                                ok = false;
+                                break;
+                            }
+                            uniq_bytes += inner.len();
+                            e.insert(1);
+                        }
+                    }
+                }
+                if ok
+                    && prev_run > 0
+                    && let Some(p) = prev
+                    && let Some(c) = vocab.get_mut(p)
+                {
+                    *c += prev_run;
                 }
                 if ok {
                     if let Some((fb, skip)) = filter.as_mut()
@@ -5910,6 +6110,9 @@ impl PackRegistry {
             let mut read_by_peer = vec![false; n_cols];
             if paging.is_some() {
                 for blob in &col_blobs {
+                    if blob.is_empty() {
+                        continue;
+                    }
                     for c in crate::codecs::column_deps(blob).cols {
                         if let Some(read) = read_by_peer.get_mut(c as usize) {
                             *read = true;
@@ -5990,18 +6193,37 @@ impl PackRegistry {
                 // Pages cost a little more than one leaf. The pool is chosen as one leaf would
                 // be, then paged unless that costs over a quarter more: text that repeats
                 // across rows pays for its repeats in every page.
-                let pool = match paged {
-                    Some(p) if cost(&p) + 16 < cur_sum => Some(p),
-                    paged => {
-                        let whole = whole_pool(&cols);
-                        let w = cost(&whole);
-                        (w + 16 < cur_sum).then(|| match paged {
-                            Some(p) if cost(&p) * 4 <= w * 5 => p,
-                            _ => whole,
-                        })
+                let deferred_in_pool = prose_cols.iter().any(|&c| deferred_prose[c]);
+                let pool = if deferred_in_pool {
+                    let prefer_paged = prose_cols
+                        .iter()
+                        .all(|&c| !deferred_prose[c] || chosen[c].pooled == 2);
+                    match paged {
+                        Some(p) if prefer_paged => Some(p),
+                        paged => {
+                            let whole = whole_pool(&cols);
+                            let w = cost(&whole);
+                            Some(match paged {
+                                Some(p) if cost(&p) * 4 <= w * 5 => p,
+                                _ => whole,
+                            })
+                        }
+                    }
+                } else {
+                    match paged {
+                        Some(p) if cost(&p) + 16 < cur_sum => Some(p),
+                        paged => {
+                            let whole = whole_pool(&cols);
+                            let w = cost(&whole);
+                            (w + 16 < cur_sum).then(|| match paged {
+                                Some(p) if cost(&p) * 4 <= w * 5 => p,
+                                _ => whole,
+                            })
+                        }
                     }
                 };
                 if let Some((pages, member_specs, filters, rows)) = pool {
+                    let pool_mode = if pages.len() > 1 { 2u8 } else { 1u8 };
                     pool_pages = pages;
                     pool_filters = filters;
                     pool_rows = rows;
@@ -6009,7 +6231,21 @@ impl PackRegistry {
                         col_costs[cid] = blob.len();
                         col_blobs[cid] = blob;
                         col_graphs[cid] = Some(g);
+                        chosen[cid].pooled = pool_mode;
+                        deferred_prose[cid] = false;
                     }
+                }
+            }
+
+            // Encode any deferred prose columns that did not end up in a Phase-3 pool.
+            for cid in 0..n_cols {
+                if deferred_prose[cid] {
+                    let single = self.encode_single(&occ_streams[cid], 0, Some(&chosen[cid]));
+                    let (blob, cost) = single.graph.priced();
+                    col_costs[cid] = cost;
+                    col_blobs[cid] = blob;
+                    col_graphs[cid] = Some(single.graph);
+                    chosen[cid].pooled = 0;
                 }
             }
 

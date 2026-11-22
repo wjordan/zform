@@ -93,30 +93,45 @@ pub fn scan_json_str(s: &[u8], i: usize) -> Option<(usize, bool)> {
     const Q: u64 = LO * (b'"' as u64);
     const BS: u64 = LO * (b'\\' as u64);
 
-    if s.get(i) != Some(&b'"') {
+    let len = s.len();
+    if i >= len || s[i] != b'"' {
         return None;
     }
     let mut j = i + 1;
     let mut esc = false;
-    while j < s.len() {
+    let ptr = s.as_ptr();
+    #[cfg(target_arch = "x86_64")]
+    let (v_quote, v_slash, v_ctrl) = unsafe {
+        use std::arch::x86_64::*;
+        (
+            _mm_set1_epi8(b'"' as i8),
+            _mm_set1_epi8(b'\\' as i8),
+            _mm_set1_epi8(31),
+        )
+    };
+    while j < len {
         #[cfg(target_arch = "x86_64")]
-        while let Some(chunk) = s.get(j..).and_then(|rest| rest.first_chunk::<16>()) {
+        while j + 16 <= len {
             use std::arch::x86_64::*;
-            // SSE2 is baseline on x86-64. The array bounds the unaligned load.
+            // SAFETY: SSE2 is baseline on x86-64 and `j + 16 <= len` bounds the unaligned load.
             let mask = unsafe {
-                let v = _mm_loadu_si128(chunk.as_ptr().cast());
-                let quote = _mm_cmpeq_epi8(v, _mm_set1_epi8(b'"' as i8));
-                let slash = _mm_cmpeq_epi8(v, _mm_set1_epi8(b'\\' as i8));
-                let control = _mm_cmpeq_epi8(_mm_min_epu8(v, _mm_set1_epi8(31)), v);
+                let v = _mm_loadu_si128(ptr.add(j).cast());
+                let quote = _mm_cmpeq_epi8(v, v_quote);
+                let slash = _mm_cmpeq_epi8(v, v_slash);
+                let control = _mm_cmpeq_epi8(_mm_min_epu8(v, v_ctrl), v);
                 _mm_movemask_epi8(_mm_or_si128(control, _mm_or_si128(quote, slash)))
             };
             if mask != 0 {
                 j += mask.trailing_zeros() as usize;
+                let c = s[j];
+                if c == b'"' {
+                    return Some((j + 1, esc));
+                }
                 break;
             }
             j += 16;
         }
-        while j + 8 <= s.len() && (!cfg!(target_arch = "x86_64") || s.len() - j < 16) {
+        while j + 8 <= len && (!cfg!(target_arch = "x86_64") || len - j < 16) {
             let w = u64::from_le_bytes(s[j..j + 8].try_into().unwrap());
             let q = (w ^ Q).wrapping_sub(LO) & !(w ^ Q) & HI;
             let b = (w ^ BS).wrapping_sub(LO) & !(w ^ BS) & HI;
@@ -129,7 +144,7 @@ pub fn scan_json_str(s: &[u8], i: usize) -> Option<(usize, bool)> {
             j += (mask.trailing_zeros() >> 3) as usize;
             break;
         }
-        if j >= s.len() {
+        if j >= len {
             return None;
         }
         let c = s[j];
@@ -142,7 +157,7 @@ pub fn scan_json_str(s: &[u8], i: usize) -> Option<(usize, bool)> {
             match e {
                 b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => j += 2,
                 b'u' => {
-                    if j + 6 > s.len()
+                    if j + 6 > len
                         || !is_hex(s[j + 2])
                         || !is_hex(s[j + 3])
                         || !is_hex(s[j + 4])
@@ -162,6 +177,69 @@ pub fn scan_json_str(s: &[u8], i: usize) -> Option<(usize, bool)> {
         j += 1;
     }
     None
+}
+
+#[inline]
+fn skip_json_scalar(s: &[u8], i: usize) -> Option<usize> {
+    let &b = s.get(i)?;
+    match b {
+        b'"' => scan_json_str(s, i).map(|(e, _)| e),
+        b'-' | b'0'..=b'9' => scan_json_num(s, i),
+        b't' if s.get(i..i + 4) == Some(b"true") => Some(i + 4),
+        b'f' if s.get(i..i + 5) == Some(b"false") => Some(i + 5),
+        b'n' if s.get(i..i + 4) == Some(b"null") => Some(i + 4),
+        _ => None,
+    }
+}
+
+fn skip_json_value(s: &[u8], i: usize, depth: usize) -> Option<usize> {
+    if i >= s.len() || depth > MAX_PARSE_DEPTH {
+        return None;
+    }
+    match s[i] {
+        b'"' => scan_json_str(s, i).map(|(e, _)| e),
+        b'-' | b'0'..=b'9' => scan_json_num(s, i),
+        b't' if s.get(i..i + 4) == Some(b"true") => Some(i + 4),
+        b'f' if s.get(i..i + 5) == Some(b"false") => Some(i + 5),
+        b'n' if s.get(i..i + 4) == Some(b"null") => Some(i + 4),
+        b'{' => {
+            let mut p = skip_ws(s, i + 1);
+            if p < s.len() && s[p] == b'}' {
+                return Some(p + 1);
+            }
+            loop {
+                let (kend, _) = scan_json_str(s, p)?;
+                p = skip_ws(s, kend);
+                if s.get(p) != Some(&b':') {
+                    return None;
+                }
+                p = skip_ws(s, p + 1);
+                p = skip_json_value(s, p, depth + 1)?;
+                p = skip_ws(s, p);
+                match s.get(p) {
+                    Some(&b',') => p = skip_ws(s, p + 1),
+                    Some(&b'}') => return Some(p + 1),
+                    _ => return None,
+                }
+            }
+        }
+        b'[' => {
+            let mut p = skip_ws(s, i + 1);
+            if p < s.len() && s[p] == b']' {
+                return Some(p + 1);
+            }
+            loop {
+                p = skip_json_value(s, p, depth + 1)?;
+                p = skip_ws(s, p);
+                match s.get(p) {
+                    Some(&b',') => p = skip_ws(s, p + 1),
+                    Some(&b']') => return Some(p + 1),
+                    _ => return None,
+                }
+            }
+        }
+        _ => None,
+    }
 }
 
 fn scan_json_num(s: &[u8], i: usize) -> Option<usize> {
@@ -618,6 +696,12 @@ pub struct JsonTreeRuntime {
     /// Per-path flag: true when any candidate on this path is `RawPath` (must emit raw `val_slice`
     /// for all occurrences of this path and skip scanning its `value_col`).
     pub path_raw_filter: Vec<bool>,
+    /// Per-path `(1-based shape_id, prefix_u64, mask_u64)` from the first literal of each shape
+    /// for O(1) multi-shape dispatch without touching `JsonDoc`.
+    pub shape_heads: Vec<Vec<(u32, u64, u64)>>,
+    /// `value_col` for simple leaf paths (`shapes.is_empty() && cands.is_empty() && !is_referenced
+    /// && !path_raw_filter`), or `u16::MAX` otherwise.
+    pub simple_leaf: Vec<u16>,
     /// Flattened whole-block decode bytecode.
     pub(crate) fast_decode: FastJsonPlan,
 }
@@ -1010,6 +1094,45 @@ impl JsonTreePlan {
             path_op,
         };
 
+        let shape_heads: Vec<Vec<(u32, u64, u64)>> = self
+            .paths
+            .iter()
+            .map(|p| {
+                p.shapes
+                    .iter()
+                    .enumerate()
+                    .map(|(si, sh)| {
+                        let lit = sh.first().map_or(&[][..], |part| part.literal.as_slice());
+                        let k = lit.len().min(8);
+                        let mut buf = [0u8; 8];
+                        buf[..k].copy_from_slice(&lit[..k]);
+                        let mask = if k == 8 {
+                            u64::MAX
+                        } else {
+                            (1u64 << (k * 8)) - 1
+                        };
+                        ((si + 1) as u32, u64::from_le_bytes(buf), mask)
+                    })
+                    .collect()
+            })
+            .collect();
+        let simple_leaf: Vec<u16> = self
+            .paths
+            .iter()
+            .enumerate()
+            .map(|(pi, p)| {
+                if p.shapes.is_empty()
+                    && p.cands.is_empty()
+                    && !is_referenced[pi]
+                    && !path_raw_filter[pi]
+                {
+                    p.value_col
+                } else {
+                    u16::MAX
+                }
+            })
+            .collect();
+
         self.runtime = JsonTreeRuntime {
             trie,
             shape_maps,
@@ -1017,6 +1140,8 @@ impl JsonTreePlan {
             is_referenced,
             cand_filter,
             path_raw_filter,
+            shape_heads,
+            simple_leaf,
             fast_decode,
         };
     }
@@ -1221,8 +1346,9 @@ fn concat_fit<'v>(
     let mut free = None;
     let mut pos = 0;
     let take = |piece: &[u8], pos: &mut usize| {
-        let ok = t[*pos..].starts_with(piece);
-        *pos += piece.len();
+        let end = *pos + piece.len();
+        let ok = end <= t.len() && crate::wire::fast_eq(&t[*pos..end], piece);
+        *pos = end;
         ok
     };
     if !take(&lits[0], &mut pos) {
@@ -1243,6 +1369,16 @@ fn concat_fit<'v>(
     Some(free)
 }
 
+#[derive(Clone, Copy)]
+struct DirectMark {
+    streams: usize,
+    cols: usize,
+    scope: usize,
+    extra_filter: usize,
+    scratch: usize,
+    unshaped_bytes: usize,
+}
+
 /// Reusable encoder state for `JsonTreePlan` within a block.
 pub struct JsonTreeBlockSplitter<'a> {
     pub doc: JsonDoc,
@@ -1252,8 +1388,14 @@ pub struct JsonTreeBlockSplitter<'a> {
     /// Per-path `(row_gen, start, end)` avoiding 24 KiB per-row `scope.fill(None)` memset.
     scope: Vec<(u32, u32, u32)>,
     scope_row: u32,
-    /// Most recently matched 1-based `shape_id` per path for direct literal fast-path matching.
+    /// Two-entry MRU of 1-based `shape_id`s per path for direct streaming literal matching.
     last_shape: Vec<u32>,
+    prev_shape: Vec<u32>,
+    /// Lightweight rollback log used only while speculatively matching a shape directly on raw JSON.
+    undo_active: bool,
+    undo_streams: Vec<u16>,
+    undo_cols: Vec<u16>,
+    undo_scope: Vec<(u16, (u32, u32, u32))>,
     /// Bytes of objects whose key layout no kept shape matched, stored whole.
     pub unshaped_bytes: usize,
     /// When `collect_filter` is true, raw slices from `b64`/boundary-unsafe cands and JSON-tagged
@@ -1279,12 +1421,94 @@ impl<'a> JsonTreeBlockSplitter<'a> {
             scope: vec![(0, 0, 0); n_paths],
             scope_row: 0,
             last_shape: vec![1; n_paths],
+            prev_shape: vec![0; n_paths],
+            undo_active: false,
+            undo_streams: Vec::with_capacity(64),
+            undo_cols: Vec::with_capacity(128),
+            undo_scope: Vec::with_capacity(32),
             unshaped_bytes: 0,
             collect_filter,
             extra_filter_slices: Vec::new(),
             filter_unsafe: false,
             tmp: Vec::new(),
         }
+    }
+
+    #[inline(always)]
+    fn push_stream(&mut self, sid: usize, val: u32) {
+        self.struct_streams[sid].push(val);
+        if self.undo_active {
+            self.undo_streams.push(sid as u16);
+        }
+    }
+
+    #[inline(always)]
+    fn push_occ(
+        &mut self,
+        cid: usize,
+        raw_lexeme: &'a [u8],
+        has_nested: &[bool],
+        col_occs: &mut [Vec<crate::grammar::OccRef<'a>>],
+        scratch: &mut crate::grammar::RowScratch,
+    ) {
+        push_json_val_occ(cid, raw_lexeme, has_nested, col_occs, scratch);
+        if self.undo_active {
+            self.undo_cols.push(cid as u16);
+        }
+    }
+
+    #[inline(always)]
+    fn set_scope(&mut self, path_idx: usize, start: u32, end: u32) {
+        if self.undo_active {
+            self.undo_scope
+                .push((path_idx as u16, self.scope[path_idx]));
+        }
+        self.scope[path_idx] = (self.scope_row, start, end);
+    }
+
+    #[inline(always)]
+    fn record_shape_hit(&mut self, path_idx: usize, sid: u32) {
+        let cur = self.last_shape[path_idx];
+        if cur != sid {
+            self.prev_shape[path_idx] = cur;
+            self.last_shape[path_idx] = sid;
+        }
+    }
+
+    #[inline(always)]
+    fn mark_direct(&self, scratch: &crate::grammar::RowScratch) -> DirectMark {
+        DirectMark {
+            streams: self.undo_streams.len(),
+            cols: self.undo_cols.len(),
+            scope: self.undo_scope.len(),
+            extra_filter: self.extra_filter_slices.len(),
+            scratch: scratch.items.len(),
+            unshaped_bytes: self.unshaped_bytes,
+        }
+    }
+
+    #[cold]
+    fn rollback_direct(
+        &mut self,
+        mark: DirectMark,
+        col_occs: &mut [Vec<crate::grammar::OccRef<'a>>],
+        scratch: &mut crate::grammar::RowScratch,
+    ) {
+        for &sid in &self.undo_streams[mark.streams..] {
+            self.struct_streams[sid as usize].pop();
+        }
+        self.undo_streams.truncate(mark.streams);
+        for &cid in &self.undo_cols[mark.cols..] {
+            col_occs[cid as usize].pop();
+        }
+        self.undo_cols.truncate(mark.cols);
+        for &(p, old) in self.undo_scope[mark.scope..].iter().rev() {
+            self.scope[p as usize] = old;
+        }
+        self.undo_scope.truncate(mark.scope);
+        self.extra_filter_slices.truncate(mark.extra_filter);
+        scratch.items.truncate(mark.scratch);
+        self.unshaped_bytes = mark.unshaped_bytes;
     }
 
     /// Attempts to split `line` using `jt`, pushing `u32` structural tokens to `self.struct_streams`
@@ -1298,7 +1522,11 @@ impl<'a> JsonTreeBlockSplitter<'a> {
         col_occs: &mut [Vec<crate::grammar::OccRef<'a>>],
         scratch: &mut crate::grammar::RowScratch,
     ) -> bool {
-        if !self.doc.parse_root_object(line) {
+        if line.len() < 2
+            || line[0] != b'{'
+            || line[line.len() - 1] != b'}'
+            || line.len() > (u32::MAX as usize)
+        {
             return false;
         }
         self.scope_row = self.scope_row.wrapping_add(1);
@@ -1306,8 +1534,435 @@ impl<'a> JsonTreeBlockSplitter<'a> {
             self.scope.fill((0, 0, 0));
             self.scope_row = 1;
         }
+        // Fast path: match the root object's known shapes directly against `line` without
+        // constructing a `JsonDoc` AST or scanning JSON key strings.
+        let root_nshapes = jt.paths[0].shapes.len();
+        if root_nshapes > 0 {
+            self.undo_active = true;
+            self.undo_streams.clear();
+            self.undo_cols.clear();
+            self.undo_scope.clear();
+            let last_sid = self.last_shape[0];
+            let prev_sid = self.prev_shape[0];
+            let cands = [last_sid, prev_sid, 1];
+            for (ci, &sid) in cands.iter().enumerate() {
+                if sid == 0
+                    || (sid as usize) > root_nshapes
+                    || (ci > 0 && cands[..ci].contains(&sid))
+                {
+                    continue;
+                }
+                if self
+                    .try_match_shape_direct(
+                        0,
+                        Some(line.len()),
+                        0,
+                        sid,
+                        0,
+                        line,
+                        jt,
+                        has_nested,
+                        col_occs,
+                        scratch,
+                    )
+                    .is_some()
+                {
+                    self.undo_active = false;
+                    return true;
+                }
+            }
+            if root_nshapes > 2 && line.len() >= 8 {
+                let word = u64::from_le_bytes(line[..8].try_into().unwrap());
+                for &(sid, pref, mask) in &jt.runtime.shape_heads[0] {
+                    if sid == last_sid || sid == prev_sid || sid == 1 || (word & mask) != pref {
+                        continue;
+                    }
+                    if self
+                        .try_match_shape_direct(
+                            0,
+                            Some(line.len()),
+                            0,
+                            sid,
+                            0,
+                            line,
+                            jt,
+                            has_nested,
+                            col_occs,
+                            scratch,
+                        )
+                        .is_some()
+                    {
+                        self.undo_active = false;
+                        return true;
+                    }
+                }
+            }
+            self.undo_active = false;
+        }
+        if !self.doc.parse_root_object(line) {
+            return false;
+        }
         self.emit_node(0, 0, 0, line, jt, has_nested, col_occs, scratch);
         true
+    }
+
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn emit_leaf_slice(
+        &mut self,
+        path_idx: usize,
+        start: usize,
+        end: usize,
+        line: &'a [u8],
+        jt: &JsonTreePlan,
+        has_nested: &[bool],
+        col_occs: &mut [Vec<crate::grammar::OccRef<'a>>],
+        scratch: &mut crate::grammar::RowScratch,
+    ) {
+        let pdef = &jt.paths[path_idx];
+        let val_slice = &line[start..end];
+        let raw_path = self.collect_filter && jt.runtime.path_raw_filter[path_idx];
+        if raw_path {
+            self.extra_filter_slices.push(val_slice);
+        }
+        let mut sel = 0u32;
+        let mut stored = Some(val_slice);
+        if !pdef.cands.is_empty() {
+            let scope = &self.scope;
+            let cur_row = self.scope_row;
+            let val = |r: u16| {
+                let (row_gen, s, e) = scope[r as usize];
+                (row_gen == cur_row).then(|| &line[s as usize..e as usize])
+            };
+            for (ci, cand) in pdef.cands.iter().enumerate() {
+                if let Some(free) = cand_fit(cand, path_idx, val_slice, val, &mut self.tmp) {
+                    sel = (ci + 1) as u32;
+                    stored = free.map(|(s, e)| &val_slice[s..e]);
+                    if self.collect_filter
+                        && !raw_path
+                        && jt.runtime.cand_filter[path_idx][ci] == CandFilter::RawSlice
+                    {
+                        self.extra_filter_slices.push(val_slice);
+                    }
+                    break;
+                }
+            }
+            self.push_stream(pdef.sel_stream as usize, sel);
+        }
+        if let Some(cell) = stored
+            && pdef.value_col != u16::MAX
+        {
+            let cid = pdef.value_col as usize;
+            if self.collect_filter && !raw_path && has_nested[cid] {
+                self.extra_filter_slices.push(cell);
+            }
+            self.push_occ(cid, cell, has_nested, col_occs, scratch);
+        }
+        if jt.runtime.is_referenced[path_idx] {
+            self.set_scope(path_idx, start as u32, end as u32);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_direct_obj_or_fallback(
+        &mut self,
+        pos: usize,
+        path_idx: usize,
+        depth: usize,
+        line: &'a [u8],
+        jt: &JsonTreePlan,
+        has_nested: &[bool],
+        col_occs: &mut [Vec<crate::grammar::OccRef<'a>>],
+        scratch: &mut crate::grammar::RowScratch,
+    ) -> Option<usize> {
+        if pos >= line.len() || depth > MAX_PARSE_DEPTH {
+            return None;
+        }
+        let pdef = &jt.paths[path_idx];
+        if line[pos] != b'{' {
+            // Non-object (typically `null`) at a tabled object path: `shape_id = 0`, stored whole.
+            let vend = skip_json_value(line, pos, depth)?;
+            self.push_stream(pdef.shape_stream as usize, 0);
+            if pdef.value_col != u16::MAX {
+                let raw_sub = &line[pos..vend];
+                let cid = pdef.value_col as usize;
+                if self.collect_filter && has_nested[cid] {
+                    self.extra_filter_slices.push(raw_sub);
+                }
+                self.push_occ(cid, raw_sub, has_nested, col_occs, scratch);
+            }
+            return Some(vend);
+        }
+        let nshapes = pdef.shapes.len();
+        let last_sid = self.last_shape[path_idx];
+        let prev_sid = self.prev_shape[path_idx];
+        let cands = [last_sid, prev_sid, 1];
+        for (ci, &sid) in cands.iter().enumerate() {
+            if sid == 0 || (sid as usize) > nshapes || (ci > 0 && cands[..ci].contains(&sid)) {
+                continue;
+            }
+            if let Some(end) = self.try_match_shape_direct(
+                pos, None, path_idx, sid, depth, line, jt, has_nested, col_occs, scratch,
+            ) {
+                return Some(end);
+            }
+        }
+        if nshapes > 2 && pos + 8 <= line.len() {
+            let word = u64::from_le_bytes(line[pos..pos + 8].try_into().unwrap());
+            for &(sid, pref, mask) in &jt.runtime.shape_heads[path_idx] {
+                if sid == last_sid || sid == prev_sid || sid == 1 || (word & mask) != pref {
+                    continue;
+                }
+                if let Some(end) = self.try_match_shape_direct(
+                    pos, None, path_idx, sid, depth, line, jt, has_nested, col_occs, scratch,
+                ) {
+                    return Some(end);
+                }
+            }
+        }
+        // Local sub-object fallback: parse only this nested object with `JsonDoc` so the outer
+        // object stays on the zero-AST streaming path.
+        let ct = jt.runtime.path_trie_node[path_idx];
+        if ct == u32::MAX {
+            return None;
+        }
+        self.doc.nodes.clear();
+        self.doc.kids.clear();
+        self.doc.scratch_kids.clear();
+        let (vend, ni) = self.doc.parse_object(line, pos, depth)?;
+        self.emit_node(
+            ni,
+            path_idx,
+            ct as usize,
+            line,
+            jt,
+            has_nested,
+            col_occs,
+            scratch,
+        );
+        Some(vend)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_match_shape_direct(
+        &mut self,
+        mut pos: usize,
+        end_bound: Option<usize>,
+        path_idx: usize,
+        shape_id: u32,
+        depth: usize,
+        line: &'a [u8],
+        jt: &JsonTreePlan,
+        has_nested: &[bool],
+        col_occs: &mut [Vec<crate::grammar::OccRef<'a>>],
+        scratch: &mut crate::grammar::RowScratch,
+    ) -> Option<usize> {
+        if depth > MAX_PARSE_DEPTH {
+            return None;
+        }
+        let pdef = &jt.paths[path_idx];
+        let sh = &pdef.shapes[(shape_id - 1) as usize];
+        let (last_part, slot_parts) = sh.split_last()?;
+        let last_lit = last_part.literal.as_slice();
+
+        // O(1) prefix & root-tail pre-check before touching any state or undo log.
+        if let Some(first) = slot_parts.first() {
+            let fl = first.literal.as_slice();
+            if pos + fl.len() > line.len() || !crate::wire::fast_eq(&line[pos..pos + fl.len()], fl)
+            {
+                return None;
+            }
+        }
+        if let Some(end) = end_bound {
+            if end < pos + last_lit.len()
+                || !crate::wire::fast_eq(&line[end - last_lit.len()..end], last_lit)
+            {
+                return None;
+            }
+            if let Some(last_slot) = slot_parts.last() {
+                let before_end = end - last_lit.len();
+                if before_end > pos {
+                    let prev_b = line[before_end - 1];
+                    match last_slot.kind {
+                        SlotKind::Scalar if matches!(prev_b, b'}' | b']') => return None,
+                        SlotKind::Object
+                            if prev_b != b'}' && !line[..before_end].ends_with(b"null") =>
+                        {
+                            return None;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let mark = self.mark_direct(scratch);
+        self.push_stream(pdef.shape_stream as usize, shape_id);
+
+        for (si, p) in slot_parts.iter().enumerate() {
+            let lit = p.literal.as_slice();
+            let next_pos = pos + lit.len();
+            if next_pos > line.len() || !crate::wire::fast_eq(&line[pos..next_pos], lit) {
+                self.rollback_direct(mark, col_occs, scratch);
+                return None;
+            }
+            pos = next_pos;
+            match p.kind {
+                SlotKind::Scalar => {
+                    let Some(vend) = skip_json_scalar(line, pos) else {
+                        self.rollback_direct(mark, col_occs, scratch);
+                        return None;
+                    };
+                    let scid = jt.runtime.simple_leaf[p.path_idx as usize];
+                    if scid != u16::MAX && !has_nested[scid as usize] {
+                        col_occs[scid as usize]
+                            .push(crate::grammar::OccRef::Borrowed(&line[pos..vend]));
+                        self.undo_cols.push(scid);
+                    } else {
+                        self.emit_leaf_slice(
+                            p.path_idx as usize,
+                            pos,
+                            vend,
+                            line,
+                            jt,
+                            has_nested,
+                            col_occs,
+                            scratch,
+                        );
+                    }
+                    pos = vend;
+                }
+                SlotKind::Text => {
+                    let Some(vend) = skip_json_value(line, pos, depth + 1) else {
+                        self.rollback_direct(mark, col_occs, scratch);
+                        return None;
+                    };
+                    let scid = jt.runtime.simple_leaf[p.path_idx as usize];
+                    if scid != u16::MAX && !has_nested[scid as usize] {
+                        col_occs[scid as usize]
+                            .push(crate::grammar::OccRef::Borrowed(&line[pos..vend]));
+                        self.undo_cols.push(scid);
+                    } else {
+                        self.emit_leaf_slice(
+                            p.path_idx as usize,
+                            pos,
+                            vend,
+                            line,
+                            jt,
+                            has_nested,
+                            col_occs,
+                            scratch,
+                        );
+                    }
+                    pos = vend;
+                }
+                SlotKind::Object => {
+                    let Some(vend) = self.emit_direct_obj_or_fallback(
+                        pos,
+                        p.path_idx as usize,
+                        depth + 1,
+                        line,
+                        jt,
+                        has_nested,
+                        col_occs,
+                        scratch,
+                    ) else {
+                        self.rollback_direct(mark, col_occs, scratch);
+                        return None;
+                    };
+                    pos = vend;
+                }
+                SlotKind::Array => {
+                    if depth + 1 > MAX_PARSE_DEPTH {
+                        self.rollback_direct(mark, col_occs, scratch);
+                        return None;
+                    }
+                    let c_path = p.path_idx as usize;
+                    let cnt_stream = jt.paths[c_path].count_stream as usize;
+                    let elem_path = jt.paths[c_path].elem_path as usize;
+                    let elem_is_leaf = jt.paths[elem_path].shapes.is_empty();
+                    let next_lit = sh[si + 1].literal.as_slice();
+                    let sep = p.sep.as_slice();
+
+                    if line.get(pos..).is_some_and(|r| r.starts_with(next_lit)) {
+                        // Empty array `[]`: only valid when brackets are adjacent and sep is `,`.
+                        if !lit.ends_with(b"[") || !next_lit.starts_with(b"]") || sep != b"," {
+                            self.rollback_direct(mark, col_occs, scratch);
+                            return None;
+                        }
+                        self.push_stream(cnt_stream, 0);
+                    } else {
+                        let cnt_idx = self.struct_streams[cnt_stream].len();
+                        self.push_stream(cnt_stream, 0);
+                        let mut count = 0u32;
+                        loop {
+                            let vend = if elem_is_leaf {
+                                let Some(e) = skip_json_value(line, pos, depth + 2) else {
+                                    self.rollback_direct(mark, col_occs, scratch);
+                                    return None;
+                                };
+                                let scid = jt.runtime.simple_leaf[elem_path];
+                                if scid != u16::MAX && !has_nested[scid as usize] {
+                                    col_occs[scid as usize]
+                                        .push(crate::grammar::OccRef::Borrowed(&line[pos..e]));
+                                    self.undo_cols.push(scid);
+                                } else {
+                                    self.emit_leaf_slice(
+                                        elem_path, pos, e, line, jt, has_nested, col_occs, scratch,
+                                    );
+                                }
+                                e
+                            } else {
+                                let Some(e) = self.emit_direct_obj_or_fallback(
+                                    pos,
+                                    elem_path,
+                                    depth + 2,
+                                    line,
+                                    jt,
+                                    has_nested,
+                                    col_occs,
+                                    scratch,
+                                ) else {
+                                    self.rollback_direct(mark, col_occs, scratch);
+                                    return None;
+                                };
+                                e
+                            };
+                            pos = vend;
+                            count += 1;
+                            if !sep.is_empty()
+                                && pos + sep.len() <= line.len()
+                                && crate::wire::fast_eq(&line[pos..pos + sep.len()], sep)
+                            {
+                                pos += sep.len();
+                            } else {
+                                break;
+                            }
+                        }
+                        if count == 1 && sep != b"," {
+                            self.rollback_direct(mark, col_occs, scratch);
+                            return None;
+                        }
+                        self.struct_streams[cnt_stream][cnt_idx] = count;
+                    }
+                }
+                SlotKind::None => {
+                    self.rollback_direct(mark, col_occs, scratch);
+                    return None;
+                }
+            }
+        }
+
+        let end_pos = pos + last_lit.len();
+        if end_pos > line.len()
+            || !crate::wire::fast_eq(&line[pos..end_pos], last_lit)
+            || end_bound.is_some_and(|e| end_pos != e)
+        {
+            self.rollback_direct(mark, col_occs, scratch);
+            return None;
+        }
+        self.record_shape_hit(path_idx, shape_id);
+        Some(end_pos)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1327,47 +1982,16 @@ impl<'a> JsonTreeBlockSplitter<'a> {
 
         // Leaf / Text path (`shapes.is_empty()`): check derivations, else emit scalar/text slice!
         if pdef.shapes.is_empty() {
-            let val_slice = &line[v.start as usize..v.end as usize];
-            let raw_path = self.collect_filter && jt.runtime.path_raw_filter[path_idx];
-            if raw_path {
-                self.extra_filter_slices.push(val_slice);
-            }
-            let mut sel = 0u32;
-            let mut stored = Some(val_slice);
-            if !pdef.cands.is_empty() {
-                let scope = &self.scope;
-                let cur_row = self.scope_row;
-                let val = |r: u16| {
-                    let (row_gen, s, e) = scope[r as usize];
-                    (row_gen == cur_row).then(|| &line[s as usize..e as usize])
-                };
-                for (ci, cand) in pdef.cands.iter().enumerate() {
-                    if let Some(free) = cand_fit(cand, path_idx, val_slice, val, &mut self.tmp) {
-                        sel = (ci + 1) as u32;
-                        stored = free.map(|(s, e)| &val_slice[s..e]);
-                        if self.collect_filter
-                            && !raw_path
-                            && jt.runtime.cand_filter[path_idx][ci] == CandFilter::RawSlice
-                        {
-                            self.extra_filter_slices.push(val_slice);
-                        }
-                        break;
-                    }
-                }
-                self.struct_streams[pdef.sel_stream as usize].push(sel);
-            }
-            if let Some(cell) = stored
-                && pdef.value_col != u16::MAX
-            {
-                let cid = pdef.value_col as usize;
-                if self.collect_filter && !raw_path && has_nested[cid] {
-                    self.extra_filter_slices.push(cell);
-                }
-                push_json_val_occ(cid, cell, has_nested, col_occs, scratch);
-            }
-            if jt.runtime.is_referenced[path_idx] {
-                self.scope[path_idx] = (self.scope_row, v.start, v.end);
-            }
+            self.emit_leaf_slice(
+                path_idx,
+                v.start as usize,
+                v.end as usize,
+                line,
+                jt,
+                has_nested,
+                col_occs,
+                scratch,
+            );
             return;
         }
 
@@ -1384,7 +2008,7 @@ impl<'a> JsonTreeBlockSplitter<'a> {
             && !pdef.shapes.is_empty()
             && self.try_match_shape(ni, path_idx, 1, line, jt)
         {
-            self.last_shape[path_idx] = 1;
+            self.record_shape_hit(path_idx, 1);
             1
         } else if self.build_shape_key(ni, trie_node, line, jt) {
             let sid = jt.runtime.shape_maps[path_idx]
@@ -1392,13 +2016,13 @@ impl<'a> JsonTreeBlockSplitter<'a> {
                 .copied()
                 .unwrap_or(0);
             if sid > 0 {
-                self.last_shape[path_idx] = sid;
+                self.record_shape_hit(path_idx, sid);
             }
             sid
         } else {
             0
         };
-        self.struct_streams[pdef.shape_stream as usize].push(shape_id);
+        self.push_stream(pdef.shape_stream as usize, shape_id);
 
         if shape_id == 0 {
             self.child_slots.truncate(mark);
@@ -1411,7 +2035,7 @@ impl<'a> JsonTreeBlockSplitter<'a> {
                 if self.collect_filter && has_nested[cid] {
                     self.extra_filter_slices.push(raw_sub);
                 }
-                push_json_val_occ(cid, raw_sub, has_nested, col_occs, scratch);
+                self.push_occ(cid, raw_sub, has_nested, col_occs, scratch);
             }
             return;
         }
@@ -1437,7 +2061,7 @@ impl<'a> JsonTreeBlockSplitter<'a> {
                 }
                 SlotKind::Array => {
                     let av = self.doc.nodes[cs.node as usize];
-                    self.struct_streams[jt.paths[c_path].count_stream as usize].push(av.n);
+                    self.push_stream(jt.paths[c_path].count_stream as usize, av.n);
                     let elem_path = jt.paths[c_path].elem_path as usize;
                     let elem_trie = jt.runtime.trie[c_trie].elem_node.max(0) as usize;
                     for ek in self.doc.kid_range(cs.node as usize) {

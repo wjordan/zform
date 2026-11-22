@@ -2743,6 +2743,7 @@ fn a_sample_pick_is_tried_alone_unless_it_does_not_apply() {
         cells,
         cost,
         near: false,
+        pooled: 0,
     };
     let cost = usize::MAX;
     let stray = [
@@ -2781,8 +2782,8 @@ fn a_replayed_tape_codes_like_values_as_the_search_does_and_any_values_validly()
     let (sample_ids, sample_counter) = (ids(4096, &mut r), counter(4096));
     let (_, t_ids) = record(&sample_ids);
     let (_, t_counter) = record(&sample_counter);
-    // Recency, split, its codes as they are; and differences, too few bytes to say of what.
-    assert_eq!(t_ids, [0x31, 0x21, 0x10]);
+    // Recency, split, its codes as they are (IntStream left open); and differences, too few bytes to say of what.
+    assert_eq!(t_ids, [0x31, 0x21, 0x10, 0x40 | tape::OPEN]);
     assert_eq!(t_counter, [0x30, 0x10 | tape::OPEN]);
 
     let (block_ids, block_counter) = (ids(16384, &mut r), counter(16384));

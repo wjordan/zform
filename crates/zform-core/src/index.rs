@@ -72,15 +72,31 @@ fn spellings(text: &[u8], mut f: impl FnMut(u64, bool)) {
             f(w, start > 0 && end < n);
             return;
         }
-        let mut w = (r[0] as u64)
-            | ((r[1] as u64) << 8)
-            | ((r[2] as u64) << 16)
-            | ((r[3] as u64) << 24)
-            | ((r[4] as u64) << 32);
-        f(w, true);
-        for &l in &r[5..] {
-            w = (w >> 8) | ((l as u64) << 32);
+        // Load overlapping 5-byte grams directly from memory (no loop-carried shift dependency).
+        const MASK5: u64 = 0x00ff_ffff_ffff;
+        let ptr = r.as_ptr();
+        let mut i = 0usize;
+        // Up to `len - 8` we can safely load 8 bytes and extract 4 independent 5-byte grams.
+        while i + 8 <= len {
+            // SAFETY: `i + 8 <= len` bounds the unaligned 8-byte load within `r`.
+            let w8 = unsafe { ptr.add(i).cast::<u64>().read_unaligned() }.to_le();
+            f(w8 & MASK5, true);
+            f((w8 >> 8) & MASK5, true);
+            f((w8 >> 16) & MASK5, true);
+            f(w8 >> 24, true);
+            i += 4;
+        }
+        if i + 5 <= len {
+            let mut w = (r[i] as u64)
+                | ((r[i + 1] as u64) << 8)
+                | ((r[i + 2] as u64) << 16)
+                | ((r[i + 3] as u64) << 24)
+                | ((r[i + 4] as u64) << 32);
             f(w, true);
+            for &l in &r[i + 5..] {
+                w = (w >> 8) | ((l as u64) << 32);
+                f(w, true);
+            }
         }
     }
     let mut open = None::<usize>;
@@ -112,34 +128,18 @@ fn spellings(text: &[u8], mut f: impl FnMut(u64, bool)) {
         }
     }
 
-    // Eight bytes at a time for non-x86_64 or trailing <16 bytes.
-    const HI: u64 = 0x8080_8080_8080_8080;
-    let mut scan8 = |at: usize, w: u64| {
-        let x = w | 0x2020_2020_2020_2020;
-        let y = x & !HI;
-        let m = (y + 0x1f1f_1f1f_1f1f_1f1f) & !(y + 0x0505_0505_0505_0505) & !x & HI;
-        let mut edges = m ^ ((m << 8) | if open.is_some() { 0x80 } else { 0 });
-        while edges != 0 {
-            let p = at + edges.trailing_zeros() as usize / 8;
-            edges &= edges - 1;
-            match open.take() {
-                Some(s) => emit_run(text, s, p, n, &mut f),
-                None => open = Some(p),
+    // Direct byte scan for short strings / trailing <16 bytes (avoids SWAR + stack copy overhead).
+    while pos < n {
+        let is_alpha = (text[pos] | 0x20).wrapping_sub(b'a') < 26;
+        match (open, is_alpha) {
+            (None, true) => open = Some(pos),
+            (Some(s), false) => {
+                open = None;
+                emit_run(text, s, pos, n, &mut f);
             }
+            _ => {}
         }
-    };
-    while pos + 8 <= n {
-        scan8(
-            pos,
-            u64::from_le_bytes(text[pos..pos + 8].try_into().unwrap()),
-        );
-        pos += 8;
-    }
-    let tail = &text[pos..];
-    if !tail.is_empty() {
-        let mut b = [0u8; 8];
-        b[..tail.len()].copy_from_slice(tail);
-        scan8(pos, u64::from_le_bytes(b));
+        pos += 1;
     }
     if let Some(s) = open {
         emit_run(text, s, n, n, &mut f);

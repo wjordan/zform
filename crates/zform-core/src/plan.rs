@@ -585,8 +585,13 @@ fn sanitize_ctx_bytes(slice: &[u8]) -> String {
 
 fn train_templates_arm<'a>(rows: &[&'a [u8]], opts: &TrainOptions, plan: &mut ModelPlan) {
     let min_cluster = if rows.len() >= 64 { 4usize } else { 2usize };
-    // Ordered maps here and below: the plan must not depend on hash iteration order.
-    let mut clusters: BTreeMap<(Vec<Vec<u8>>, Vec<SlotClass>), Vec<&'a [u8]>> = BTreeMap::new();
+    // Hash by flat serialized key to avoid per-line `Vec<Vec<u8>>` allocations and `BTreeMap`
+    // comparisons; sort the resulting clusters by `(lits, classes)` so plan output is deterministic.
+    let mut key_to_idx: crate::payload::graph::FastMap<Vec<u8>, usize> =
+        crate::payload::graph::fast_map_with_capacity(64);
+    let mut clusters: Vec<((Vec<Vec<u8>>, Vec<SlotClass>), Vec<&'a [u8]>)> = Vec::new();
+    let mut key_buf = Vec::<u8>::with_capacity(256);
+    let mut spans = Vec::<(usize, usize, SlotClass)>::with_capacity(32);
     let mut unclustered = Vec::<&'a [u8]>::new();
 
     for &line in rows {
@@ -594,11 +599,11 @@ fn train_templates_arm<'a>(rows: &[&'a [u8]], opts: &TrainOptions, plan: &mut Mo
             continue;
         }
         let raw_spans = tokenize_template_line(line);
-        let mut spans = Vec::with_capacity(raw_spans.len());
+        spans.clear();
         let mut prev_end = 0usize;
         for (s, e, cls) in raw_spans {
             if !spans.is_empty() && s == prev_end {
-                let last: &mut (usize, usize, SlotClass) = spans.last_mut().unwrap();
+                let last = spans.last_mut().unwrap();
                 last.1 = e;
                 last.2 = SlotClass::Word;
             } else {
@@ -610,17 +615,37 @@ fn train_templates_arm<'a>(rows: &[&'a [u8]], opts: &TrainOptions, plan: &mut Mo
             unclustered.push(line);
             continue;
         }
-        let mut lits = Vec::with_capacity(spans.len() + 1);
-        let mut classes = Vec::with_capacity(spans.len());
+        key_buf.clear();
         let mut p = 0usize;
         for &(s, e, cls) in &spans {
-            lits.push(line[p..s].to_vec());
-            classes.push(cls);
+            let lit = &line[p..s];
+            key_buf.extend_from_slice(&(lit.len() as u32).to_le_bytes());
+            key_buf.extend_from_slice(lit);
+            key_buf.push(cls as u8);
             p = e;
         }
-        lits.push(line[p..].to_vec());
-        clusters.entry((lits, classes)).or_default().push(line);
+        let tail = &line[p..];
+        key_buf.extend_from_slice(&(tail.len() as u32).to_le_bytes());
+        key_buf.extend_from_slice(tail);
+
+        if let Some(&cid) = key_to_idx.get(&key_buf) {
+            clusters[cid].1.push(line);
+        } else {
+            let mut lits = Vec::with_capacity(spans.len() + 1);
+            let mut classes = Vec::with_capacity(spans.len());
+            let mut p = 0usize;
+            for &(s, e, cls) in &spans {
+                lits.push(line[p..s].to_vec());
+                classes.push(cls);
+                p = e;
+            }
+            lits.push(line[p..].to_vec());
+            let cid = clusters.len();
+            key_to_idx.insert(key_buf.clone(), cid);
+            clusters.push(((lits, classes), vec![line]));
+        }
     }
+    clusters.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
     let mut accepted: Vec<((Vec<Vec<u8>>, Vec<SlotClass>), Vec<&'a [u8]>)> = Vec::new();
     let mut singleton_lines = unclustered;

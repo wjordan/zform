@@ -24,9 +24,10 @@ use crate::json_tree::{
 };
 use crate::lex::parse_base64;
 use crate::order::{OrderReader, OrderSink, Restore};
-use crate::packs::{EncodedDenseBlock, PackRegistry, Paging};
+use crate::packs::{EncodedDenseBlock, PICK_CELLS, PackRegistry, Paging, Pick};
 use crate::payload::graph::NESTED_COLUMN_TAG;
 use crate::payload::library::{Harvest, Library, with_code_pricing};
+use crate::payload::tape;
 use crate::plan::{ProbeBackoff, Profile, TrainOptions, sample_strided, train_from_records};
 use crate::tables::Tables;
 use crate::wire::{
@@ -306,6 +307,12 @@ fn keep_rows(samples: &[&[u8]]) -> Vec<Vec<u8>> {
 // 1. Stateful Multi-Frame Stream Encoder
 // ============================================================================
 
+#[derive(Clone, Default)]
+struct FramePicks {
+    cols: Vec<Pick>,
+    struct_tape: Vec<u8>,
+}
+
 pub struct StreamEncoder {
     opts: PackOptions,
     active_plan: Option<ModelPlan>,
@@ -316,6 +323,7 @@ pub struct StreamEncoder {
     frames: usize,
     comp_offset: u64,
     seeds: Seeds,
+    picks: Option<Arc<FramePicks>>,
     /// A slice of the rows the plan was trained on: a retrain sees them too, so it keeps the
     /// layouts that the new chunk lacks.
     trained_rows: Vec<Vec<u8>>,
@@ -338,6 +346,7 @@ impl StreamEncoder {
             frames: 0,
             comp_offset: 0,
             seeds: Seeds::default(),
+            picks: None,
             trained_rows: Vec::new(),
             orders: Vec::new(),
             raw_offset: 0,
@@ -414,11 +423,20 @@ impl StreamEncoder {
         // A sync frame starts afresh, so frames of different groups encode at once.
         if !task.reuse {
             self.seeds = Seeds::default();
+            self.picks = None;
         }
         let mut seeds = self.seeds.clone();
-        let mut enc = encode_task(&self.opts, &task, fc, self.active_plan.as_ref(), &mut seeds);
+        let mut enc = encode_task(
+            &self.opts,
+            &task,
+            fc,
+            self.active_plan.as_ref(),
+            &mut seeds,
+            self.picks.as_deref(),
+        );
         if !task.reuse {
             self.seeds = seeds;
+            self.picks = enc.picks.take();
         }
         if let Some(p) = enc.plan.take() {
             self.active_plan = Some(p);
@@ -710,6 +728,8 @@ pub(crate) struct EncodedFrame {
     final_passthrough: bool,
     /// The model with the library a sync frame's blocks made.
     plan: Option<ModelPlan>,
+    /// Learned per-column picks and structural stream tape from a sync frame's blocks.
+    picks: Option<Arc<FramePicks>>,
     raw_len: usize,
     records: usize,
     framing: ResolvedFraming,
@@ -728,6 +748,7 @@ fn encode_task(
     fc: &FramedChunk<'_>,
     plan: Option<&ModelPlan>,
     seeds: &mut Seeds,
+    initial_picks: Option<&FramePicks>,
 ) -> EncodedFrame {
     let raw = fc.raw;
     let all_recs: Vec<&[u8]> = (0..fc.len()).map(|i| fc.record(i)).collect();
@@ -742,7 +763,7 @@ fn encode_task(
     let mut payload = Vec::new();
     let mut blocks = Vec::new();
     let mut sorted = false;
-    let (mut new_plan, mut raw_plan) = (None, None);
+    let (mut new_plan, mut raw_plan, mut new_picks) = (None, None, None);
     if task.passthrough {
         compress_leaf(&mut payload, raw, opts.backend, opts.level);
     } else {
@@ -760,7 +781,7 @@ fn encode_task(
             }
         };
         let mut body = Vec::new();
-        let (frame_blocks, lib, frame_sorted) = {
+        let (frame_blocks, lib, frame_sorted, frame_picks) = {
             let _dict = Scope::enter(opts.dictionary.clone());
             with_seeds(seeds, || {
                 encode_structural_blocks(
@@ -776,12 +797,16 @@ fn encode_task(
                     if opts.index { opts.pool_page_bytes } else { 0 },
                     task.code,
                     opts.packs.orders_rows(),
+                    initial_picks,
                     &mut body,
                 )
             })
         };
         blocks = frame_blocks;
         sorted = frame_sorted;
+        if !task.reuse {
+            new_picks = frame_picks.map(Arc::new);
+        }
         if !task.reuse {
             let mut with_lib = plan.clone();
             with_lib.library = Arc::clone(&lib);
@@ -836,6 +861,7 @@ fn encode_task(
         sorted,
         final_passthrough,
         plan: new_plan,
+        picks: new_picks,
         raw_plan,
         fit,
     }
@@ -888,8 +914,9 @@ fn encode_structural_blocks(
     page_bytes: usize,
     code: CodeSharing,
     reorder: bool,
+    initial_picks: Option<&FramePicks>,
     out: &mut Vec<u8>,
-) -> (Vec<FrameBlock>, Arc<Library>, bool) {
+) -> (Vec<FrameBlock>, Arc<Library>, bool, Option<FramePicks>) {
     let mut bounds = Vec::new();
     let mut s = 0usize;
     while s < all_recs.len() {
@@ -917,6 +944,7 @@ fn encode_structural_blocks(
         CodeSharing::Reuse => (false, 1),
         CodeSharing::Build { frames } => (frames > 1, bounds.len() * frames),
     };
+    let mut cur_picks: Option<FramePicks> = initial_picks.cloned();
     let mut pending: Vec<PendingBlock> =
         with_code_pricing(plan.library.clone(), share as u32, || {
             bounds
@@ -932,7 +960,7 @@ fn encode_structural_blocks(
                         }
                         None => recs,
                     };
-                    let mut p = encode_block_columns(
+                    let mut p = encode_block_columns_opts(
                         recs,
                         plan,
                         packs,
@@ -940,7 +968,35 @@ fn encode_structural_blocks(
                         level,
                         filter_bits,
                         page_bytes,
+                        false,
+                        cur_picks.as_ref().map(|fp| fp.cols.as_slice()),
+                        cur_picks
+                            .as_ref()
+                            .filter(|fp| !fp.struct_tape.is_empty())
+                            .map(|fp| fp.struct_tape.as_slice()),
                     );
+                    if !p.enc.picks.is_empty() {
+                        match &mut cur_picks {
+                            None => {
+                                cur_picks = Some(FramePicks {
+                                    cols: p.enc.picks.clone(),
+                                    struct_tape: std::mem::take(&mut p.struct_tape),
+                                });
+                            }
+                            Some(fp) => {
+                                if fp.cols.len() == p.enc.picks.len() {
+                                    for (dst, src) in fp.cols.iter_mut().zip(&p.enc.picks) {
+                                        if dst.cells < PICK_CELLS && src.cells > dst.cells {
+                                            *dst = src.clone();
+                                        }
+                                    }
+                                }
+                                if fp.struct_tape.is_empty() && !p.struct_tape.is_empty() {
+                                    fp.struct_tape = std::mem::take(&mut p.struct_tape);
+                                }
+                            }
+                        }
+                    }
                     p.relevel(plan, backend, level);
                     p
                 })
@@ -979,7 +1035,7 @@ fn encode_structural_blocks(
         });
         out.extend_from_slice(&eb.bytes);
     }
-    (blocks, library, sorted)
+    (blocks, library, sorted, cur_picks)
 }
 
 /// Where a frame's blocks get their library.
@@ -1071,6 +1127,8 @@ pub(crate) struct PendingBlock {
     index: Option<(Vec<u8>, u16, usize)>,
     /// Set when `relevel` mutated `enc.*_graphs` in place so `finish` re-encodes them once.
     releveled: bool,
+    /// Recorded `Site::IntStream` tape for `encode_json_struct_streams` on this block.
+    struct_tape: Vec<u8>,
 }
 
 impl PendingBlock {
@@ -1158,6 +1216,7 @@ impl PendingBlock {
             residual_bytes,
             index,
             releveled: _,
+            struct_tape: _,
         } = self;
         put_uvarint(&mut out, enc.shared_dict_blobs.len() as u64);
         for db in &enc.shared_dict_blobs {
@@ -1243,6 +1302,7 @@ impl PendingBlock {
 fn try_structural_filter_head(
     plan: &ModelPlan,
     split: &SplitResult<'_>,
+    occ_views: &[Vec<&[u8]>],
     bits: usize,
 ) -> Option<FilterBuilder> {
     if split.json_filter_unsafe {
@@ -1258,6 +1318,10 @@ fn try_structural_filter_head(
     }
 
     // Phase A: verify boundary safety before mutating anything.
+    // Cache per-column `(first_non_alpha, last_non_alpha)` checks for shape literals ending/starting
+    // with an ASCII letter (e.g. `subdir0`, `blk_...` digits next to letters).
+    let mut col_first_safe: Vec<Option<bool>> = vec![None; plan.columns.len()];
+    let mut col_last_safe: Vec<Option<bool>> = vec![None; plan.columns.len()];
     let mut json_used_shapes: Vec<u64> = Vec::new();
     let mut json_used_sels: Vec<u8> = Vec::new();
     for (vi, used) in used_variants.iter().copied().enumerate() {
@@ -1271,15 +1335,29 @@ fn try_structural_filter_head(
                     return None;
                 }
                 for j in 0..k {
+                    let cid = shape.slots[j] as usize;
                     let left_ok = (j == 0 && shape.literals[0].is_empty())
                         || shape.literals[j]
                             .last()
-                            .is_some_and(|b| !b.is_ascii_alphabetic());
+                            .is_some_and(|b| !b.is_ascii_alphabetic())
+                        || *col_first_safe[cid].get_or_insert_with(|| {
+                            occ_views[cid]
+                                .iter()
+                                .all(|v| v.first().is_some_and(|b| !b.is_ascii_alphabetic()))
+                        });
+                    if !left_ok {
+                        return None;
+                    }
                     let right_ok = (j + 1 == k && shape.literals[k].is_empty())
                         || shape.literals[j + 1]
                             .first()
-                            .is_some_and(|b| !b.is_ascii_alphabetic());
-                    if !left_ok || !right_ok {
+                            .is_some_and(|b| !b.is_ascii_alphabetic())
+                        || *col_last_safe[cid].get_or_insert_with(|| {
+                            occ_views[cid]
+                                .iter()
+                                .all(|v| v.last().is_some_and(|b| !b.is_ascii_alphabetic()))
+                        });
+                    if !right_ok {
                         return None;
                     }
                 }
@@ -1448,6 +1526,8 @@ fn encode_block_columns(
         filter_bits,
         page_bytes,
         false,
+        None,
+        None,
     )
 }
 
@@ -1461,16 +1541,25 @@ fn encode_block_columns_opts(
     filter_bits: Option<usize>,
     page_bytes: usize,
     sample_only: bool,
+    external_picks: Option<&[Pick]>,
+    external_struct_tape: Option<&[u8]>,
 ) -> PendingBlock {
-    // A large block is searched in full on rows from its middle; the block's columns then try
-    // what won there, which they would mostly pick again at many times the search.
-    let picks = (!sample_only && recs.len() >= 4 * SAMPLE_ROWS).then(|| {
-        let sample = &recs[(recs.len() - SAMPLE_ROWS) / 2..][..SAMPLE_ROWS];
-        let quiet = packs.for_sample();
-        encode_block_columns_opts(sample, plan, &quiet, backend, level, None, 0, true)
+    // A large block (`>= 4 * SAMPLE_ROWS`, e.g. 65k-row log blocks whose distribution can shift
+    // across job phases) samples its own middle `SAMPLE_ROWS` rows rather than reusing an earlier
+    // block's picks, avoiding both density drift and expensive 65k-row full-search fallbacks.
+    let use_external =
+        external_picks.filter(|_| recs.len() < 4 * SAMPLE_ROWS && plan.json_tree.is_some());
+    let sampled_picks = (use_external.is_none() && !sample_only && recs.len() >= 4 * SAMPLE_ROWS)
+        .then(|| {
+            let sample = &recs[(recs.len() - SAMPLE_ROWS) / 2..][..SAMPLE_ROWS];
+            let quiet = packs.for_sample();
+            encode_block_columns_opts(
+                sample, plan, &quiet, backend, level, None, 0, true, None, None,
+            )
             .enc
             .picks
-    });
+        });
+    let picks = use_external.or(sampled_picks.as_deref());
     let _mixing = packs.encoding_scope();
     let split = split_records_with_plan_opts(recs, plan, filter_bits.is_some());
     let n_cols = plan.columns.len();
@@ -1528,7 +1617,8 @@ fn encode_block_columns_opts(
         }
     }
 
-    let mut struct_fb = filter_bits.and_then(|bits| try_structural_filter_head(plan, &split, bits));
+    let mut struct_fb =
+        filter_bits.and_then(|bits| try_structural_filter_head(plan, &split, &occ_views, bits));
     let mut skip_col_filter = vec![false; n_cols];
     if struct_fb.is_some() {
         for (cid, col) in plan.columns.iter().enumerate() {
@@ -1563,7 +1653,7 @@ fn encode_block_columns_opts(
         packs,
         backend,
         level,
-        picks.as_deref(),
+        picks,
         sample_only,
         struct_fb
             .as_mut()
@@ -1580,6 +1670,7 @@ fn encode_block_columns_opts(
             residual_bytes: 0,
             index: None,
             releveled: false,
+            struct_tape: Vec::new(),
         };
     }
 
@@ -1588,10 +1679,33 @@ fn encode_block_columns_opts(
     let mut dir = BlockDir::default();
     encode_u32_seq(&split.variant_ids, backend, level, &mut out);
     dir.struct_head = out.len() as u32;
+    let mut struct_tape = Vec::new();
     if plan.json_tree.is_some() {
         let mut js_buf = Vec::new();
-        let (head, lens) =
-            encode_json_struct_streams(&split.json_struct_streams, backend, level, &mut js_buf);
+        let (head, lens) = match external_struct_tape {
+            Some(st) => {
+                let scope = tape::Scope::replay(st);
+                let res = encode_json_struct_streams(
+                    &split.json_struct_streams,
+                    backend,
+                    level,
+                    &mut js_buf,
+                );
+                scope.end();
+                res
+            }
+            None => {
+                let scope = tape::Scope::record();
+                let res = encode_json_struct_streams(
+                    &split.json_struct_streams,
+                    backend,
+                    level,
+                    &mut js_buf,
+                );
+                struct_tape = scope.end();
+                res
+            }
+        };
         put_uvarint(&mut out, js_buf.len() as u64);
         dir.struct_head = (out.len() + head) as u32;
         dir.streams = lens;
@@ -1636,6 +1750,7 @@ fn encode_block_columns_opts(
         residual_bytes: split.residual_bytes + split.unshaped_bytes,
         index,
         releveled: false,
+        struct_tape,
     }
 }
 
@@ -2688,15 +2803,23 @@ pub fn pack_stream<R: Read, W: Write>(reader: R, mut writer: W, opts: &PackOptio
             let small = !task.passthrough && fc.raw.len() <= SMALL_FRAME;
             let (c, plan) = (OwnedChunk::new(fc), plan.clone());
             fl.spawn(s, move || {
-                let (mut plan, mut seeds) = (plan, Seeds::default());
+                let (mut plan, mut seeds, mut picks) = (plan, Seeds::default(), None);
                 if let Some(l) = wait {
-                    let (p, sd) = l.get();
-                    (plan, seeds) = (Some(p), sd);
+                    let (p, sd, pk) = l.get();
+                    (plan, seeds, picks) = (Some(p), sd, pk);
                 }
-                let mut frame = encode_task(opts, &task, &c.view(), plan.as_deref(), &mut seeds);
+                let mut frame = encode_task(
+                    opts,
+                    &task,
+                    &c.view(),
+                    plan.as_deref(),
+                    &mut seeds,
+                    picks.as_deref(),
+                );
                 if let Some(l) = publish {
                     let p = frame.plan.take().map(Arc::new).or(plan);
-                    l.set(p.expect("a structural frame has a model"), seeds);
+                    let pk = frame.picks.take();
+                    l.set(p.expect("a structural frame has a model"), seeds, pk);
                 }
                 (task, frame)
             });
@@ -2778,15 +2901,23 @@ impl FrameQueue {
         };
         let (opts, plan) = (Arc::clone(&self.opts), self.plan.clone());
         self.fl.spawn_on(&self.pool, move || {
-            let (mut plan, mut seeds) = (plan, Seeds::default());
+            let (mut plan, mut seeds, mut picks) = (plan, Seeds::default(), None);
             if let Some(l) = wait {
-                let (p, sd) = l.get();
-                (plan, seeds) = (Some(p), sd);
+                let (p, sd, pk) = l.get();
+                (plan, seeds, picks) = (Some(p), sd, pk);
             }
-            let frame = encode_task(&opts, &task, &c.view(), plan.as_deref(), &mut seeds);
+            let frame = encode_task(
+                &opts,
+                &task,
+                &c.view(),
+                plan.as_deref(),
+                &mut seeds,
+                picks.as_deref(),
+            );
             if let Some(l) = publish {
                 let p = frame.plan.clone().map(Arc::new).or(plan);
-                l.set(p.expect("a structural frame has a model"), seeds);
+                let pk = frame.picks.clone();
+                l.set(p.expect("a structural frame has a model"), seeds, pk);
             }
             (task, frame)
         });
@@ -2927,21 +3058,25 @@ impl<T: Send> Inflight<T> {
     }
 }
 
-/// A sync frame's model and seeds once it is encoded, for the frames that start from them.
+/// A sync frame's model, seeds, and learned picks once it is encoded, for the frames that start
+/// from them.
 #[derive(Default)]
-struct Link(Mutex<Option<(Arc<ModelPlan>, Seeds)>>, Condvar);
+struct Link(
+    Mutex<Option<(Arc<ModelPlan>, Seeds, Option<Arc<FramePicks>>)>>,
+    Condvar,
+);
 
 impl Link {
-    fn set(&self, plan: Arc<ModelPlan>, seeds: Seeds) {
-        *self.0.lock().unwrap() = Some((plan, seeds));
+    fn set(&self, plan: Arc<ModelPlan>, seeds: Seeds, picks: Option<Arc<FramePicks>>) {
+        *self.0.lock().unwrap() = Some((plan, seeds, picks));
         self.1.notify_all();
     }
 
-    fn get(&self) -> (Arc<ModelPlan>, Seeds) {
+    fn get(&self) -> (Arc<ModelPlan>, Seeds, Option<Arc<FramePicks>>) {
         let g = self.1.wait_while(self.0.lock().unwrap(), |v| v.is_none());
         let g = g.unwrap();
-        let (p, s) = g.as_ref().unwrap();
-        (Arc::clone(p), s.clone())
+        let (p, s, pk) = g.as_ref().unwrap();
+        (Arc::clone(p), s.clone(), pk.clone())
     }
 }
 
@@ -3516,8 +3651,20 @@ mod unpack_threads_tests {
             None,
         );
         let split = split_records_with_plan_opts(&recs, &plan, true);
+        let occ_views: Vec<Vec<&[u8]>> = split
+            .col_occs
+            .iter()
+            .map(|c| {
+                c.iter()
+                    .map(|&occ| match occ {
+                        OccRef::Borrowed(b) => b,
+                        OccRef::Scratch(idx) => split.scratch.items[idx].as_slice(),
+                    })
+                    .collect()
+            })
+            .collect();
         assert!(
-            try_structural_filter_head(&plan, &split, DEFAULT_FILTER_BITS).is_some(),
+            try_structural_filter_head(&plan, &split, &occ_views, DEFAULT_FILTER_BITS).is_some(),
             "expected structural filter fast path on JSON"
         );
         let pb = encode_block_columns(

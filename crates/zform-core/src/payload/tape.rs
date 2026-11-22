@@ -34,6 +34,8 @@ pub(crate) enum Site {
     Mtf = 2,
     /// Parsed integers by difference, or by recency.
     ExactInt = 3,
+    /// Integer stream layout (`ForBitpack`, `ForPlanes`, `Rle`, `ForTail255`, `ZigZagVarint`).
+    IntStream = 4,
 }
 
 /// A stretch of encoding that records its choices or makes a tape's. The tape in progress
@@ -90,6 +92,12 @@ pub(crate) fn recorded(site: Site) -> Option<u8> {
             }
         }
     })
+}
+
+/// Whether a tape replay is currently active on this thread.
+#[inline]
+pub(crate) fn is_replaying() -> bool {
+    MODE.with_borrow(|mode| matches!(mode, Mode::Replay(..)))
 }
 
 /// Records `choice` at `site`, then the choices made inside what it chose.

@@ -32,7 +32,7 @@ thread_local! {
 /// these results are pure functions of the values and the encode options in scope.
 #[derive(Default)]
 struct EncodeMemo {
-    ints: FastMap<u64, Vec<(IntKey, Box<[i64]>, IntStream)>>,
+    ints: FastMap<u64, Vec<(IntKey, Box<[i64]>, IntStream, u8)>>,
     held: usize,
 }
 
@@ -333,7 +333,30 @@ impl IntStream {
 
     /// Automatically chooses the smallest domain-agnostic encoding for `vals`.
     pub fn auto_encode(vals: &[i64]) -> Self {
-        if vals.len() < MEMO_MIN_LEN || ENCODE_MEMO.with(|m| m.borrow().is_none()) {
+        let rec = tape::recorded(Site::IntStream);
+        if let Some(choice) = rec
+            && choice != tape::OPEN
+            && !CONTEXT_MIXING.with(Cell::get)
+        {
+            if let Some(s) = Self::encode_choice(vals, choice) {
+                return s;
+            }
+            let _apart = tape::Scope::apart();
+            return Self::auto_encode_memo(vals).0;
+        }
+        let _apart = rec.map(|_| tape::Scope::apart());
+        let (s, chosen) = Self::auto_encode_memo(vals);
+        if rec.is_none() {
+            tape::note(Site::IntStream, chosen, &[]);
+        }
+        s
+    }
+
+    fn auto_encode_memo(vals: &[i64]) -> (Self, u8) {
+        if vals.len() < MEMO_MIN_LEN
+            || tape::is_replaying()
+            || ENCODE_MEMO.with(|m| m.borrow().is_none())
+        {
             return Self::auto_encode_uncached(vals);
         }
         let key = int_key();
@@ -343,13 +366,13 @@ impl IntStream {
             let entries = m.as_ref()?.ints.get(&h)?;
             entries
                 .iter()
-                .find(|(k, v, _)| *k == key && **v == *vals)
-                .map(|(_, _, s)| s.clone())
+                .find(|(k, v, _, _)| *k == key && **v == *vals)
+                .map(|(_, _, s, c)| (s.clone(), *c))
         });
-        if let Some(s) = hit {
-            return s;
+        if let Some(res) = hit {
+            return res;
         }
-        let s = Self::auto_encode_uncached(vals);
+        let (s, c) = Self::auto_encode_uncached(vals);
         ENCODE_MEMO.with(|m| {
             if let Some(m) = m.borrow_mut().as_mut()
                 && m.held + vals.len() <= MEMO_MAX_HELD
@@ -358,18 +381,135 @@ impl IntStream {
                 m.ints
                     .entry(h)
                     .or_default()
-                    .push((key, vals.into(), s.clone()));
+                    .push((key, vals.into(), s.clone(), c));
             }
         });
-        s
+        (s, c)
     }
 
-    fn auto_encode_uncached(vals: &[i64]) -> Self {
-        let base = Self::auto_encode_inner(vals, true);
+    fn auto_encode_uncached(vals: &[i64]) -> (Self, u8) {
+        let (base, chosen) = Self::auto_encode_inner(vals, true);
         if CONTEXT_MIXING.with(Cell::get) {
-            Self::consider_context_mix(vals, base)
+            (Self::consider_context_mix(vals, base), tape::OPEN)
         } else {
-            base
+            (base, chosen)
+        }
+    }
+
+    /// Encodes `vals` directly with the recorded `Site::IntStream` variant, returning `None` if
+    /// that variant does not apply to `vals` (so the caller falls back to full search).
+    fn encode_choice(vals: &[i64], choice: u8) -> Option<Self> {
+        let len = vals.len() as u32;
+        if vals.is_empty() {
+            return Some(Self::Const { val: 0, len: 0 });
+        }
+        let (mut runs, mut min, mut max) = (1usize, vals[0], vals[0]);
+        for (&a, &b) in vals.iter().zip(&vals[1..]) {
+            runs += usize::from(a != b);
+            min = min.min(b);
+            max = max.max(b);
+        }
+        if runs == 1 {
+            return Some(Self::Const { val: vals[0], len });
+        }
+        let span = (max as u128).wrapping_sub(min as u128);
+        match choice {
+            0 if span <= u64::MAX as u128 => {
+                let bits = (64 - (span as u64).leading_zeros()) as u8;
+                let packed = bitpack_for_slice(vals, min, bits);
+                let leaf = pack_leaf(&packed);
+                Some(Self::ForBitpack {
+                    len,
+                    min,
+                    bits,
+                    leaf,
+                })
+            }
+            1 if span <= u64::MAX as u128 && vals.len() >= 24 => {
+                let max_u = span as u64;
+                let bits = (64 - max_u.leading_zeros()) as u8;
+                if bits == 8 {
+                    let packed = bitpack_for_slice(vals, min, 8);
+                    return Some(Self::ForBitpack {
+                        len,
+                        min,
+                        bits: 8,
+                        leaf: pack_leaf(&packed),
+                    });
+                }
+                let bw: u8 = if max_u <= 0xff {
+                    1
+                } else if max_u <= 0xffff {
+                    2
+                } else if max_u <= 0xffff_ffff {
+                    4
+                } else {
+                    8
+                };
+                let planes = for_planes_bytes(vals, min, bw);
+                Some(Self::ForPlanes {
+                    len,
+                    min,
+                    width: bw,
+                    leaf: pack_leaf(&planes),
+                })
+            }
+            2 if runs * 3 < vals.len() => {
+                let mut raw = Vec::with_capacity(runs * 5);
+                put_uvarint(&mut raw, runs as u64);
+                let mut i = 0;
+                while i < vals.len() {
+                    let v = vals[i];
+                    let mut j = i + 1;
+                    while j < vals.len() && vals[j] == v {
+                        j += 1;
+                    }
+                    put_ivarint(&mut raw, v);
+                    put_uvarint(&mut raw, (j - i) as u64);
+                    i = j;
+                }
+                Some(Self::Rle {
+                    len,
+                    leaf: pack_leaf(&raw),
+                })
+            }
+            3 if span <= u64::MAX as u128 && vals.len() >= 64 => {
+                let max_u = span as u64;
+                if max_u <= 0xff || max_u > (i64::MAX as u64) {
+                    return None;
+                }
+                let mut head_raw = Vec::with_capacity(vals.len());
+                let mut over = Vec::new();
+                for &v in vals {
+                    let s = (v as u64).wrapping_sub(min as u64);
+                    head_raw.push(s.min(0xff) as u8);
+                    if s >= 0xff {
+                        over.push((s - 0xff) as i64);
+                    }
+                }
+                if over.len() * 2 > vals.len() {
+                    return None;
+                }
+                let head_leaf = pack_leaf(&head_raw);
+                let (tail_s, _) = Self::auto_encode_inner(&over, false);
+                Some(Self::ForTail255 {
+                    len,
+                    min,
+                    head_leaf,
+                    tail: Box::new(tail_s),
+                })
+            }
+            4 => {
+                let mut zz = Vec::with_capacity(vals.len() * 2);
+                for &v in vals {
+                    put_ivarint(&mut zz, v);
+                }
+                Some(Self::ZigZagVarint {
+                    len,
+                    leaf: pack_leaf(&zz),
+                })
+            }
+            _ => None,
         }
     }
 
@@ -397,7 +537,7 @@ impl IntStream {
         if vals.len() > 2048 {
             let sample;
             (sample, rest) = vals.split_at(2048);
-            let sample_base = Self::auto_encode_inner(sample, true);
+            let sample_base = Self::auto_encode_inner(sample, true).0;
             wire.clear();
             sample_base.encode(&mut wire);
             // A small warm-up loss can recover on a longer lane; clear losses stop here.
@@ -430,10 +570,10 @@ impl IntStream {
         }
     }
 
-    fn auto_encode_inner(vals: &[i64], allow_tail: bool) -> Self {
+    fn auto_encode_inner(vals: &[i64], allow_tail: bool) -> (Self, u8) {
         let len = vals.len() as u32;
         if vals.is_empty() {
-            return Self::Const { val: 0, len: 0 };
+            return (Self::Const { val: 0, len: 0 }, tape::OPEN);
         }
         // One pass for the run count and range; a single run is a constant.
         let (mut runs, mut min, mut max) = (1usize, vals[0], vals[0]);
@@ -443,9 +583,28 @@ impl IntStream {
             max = max.max(b);
         }
         if runs == 1 {
-            return Self::Const { val: vals[0], len };
+            return (Self::Const { val: vals[0], len }, tape::OPEN);
         }
-        let mut best: Option<(usize, Self)> = None;
+        let mut best: Option<(usize, u8, Self)> = None;
+        let mut second_cost = usize::MAX;
+        fn consider(
+            best: &mut Option<(usize, u8, IntStream)>,
+            second_cost: &mut usize,
+            cost: usize,
+            id: u8,
+            stream: IntStream,
+        ) {
+            if let Some((b_cost, _, _)) = best {
+                if cost < *b_cost {
+                    *second_cost = (*b_cost).min(*second_cost);
+                    *best = Some((cost, id, stream));
+                } else {
+                    *second_cost = (*second_cost).min(cost);
+                }
+            } else {
+                *best = Some((cost, id, stream));
+            }
+        }
         if runs * 3 < vals.len() {
             let mut raw = Vec::with_capacity(runs * 5);
             put_uvarint(&mut raw, runs as u64);
@@ -461,7 +620,13 @@ impl IntStream {
                 i = j;
             }
             let leaf = pack_leaf(&raw);
-            best = Some((leaf.len() + 4, Self::Rle { len, leaf }));
+            consider(
+                &mut best,
+                &mut second_cost,
+                leaf.len() + 4,
+                2,
+                Self::Rle { len, leaf },
+            );
         }
 
         let span = (max as u128).wrapping_sub(min as u128);
@@ -471,17 +636,18 @@ impl IntStream {
             let packed = bitpack_for_slice(vals, min, bits);
             let leaf = pack_leaf(&packed);
             let cost = leaf.len() + 10;
-            if best.as_ref().is_none_or(|(b, _)| cost < *b) {
-                best = Some((
-                    cost,
-                    Self::ForBitpack {
-                        len,
-                        min,
-                        bits,
-                        leaf,
-                    },
-                ));
-            }
+            consider(
+                &mut best,
+                &mut second_cost,
+                cost,
+                0,
+                Self::ForBitpack {
+                    len,
+                    min,
+                    bits,
+                    leaf,
+                },
+            );
 
             if vals.len() >= 24 && bits != 8 {
                 let bw: u8 = if max_u <= 0xff {
@@ -493,30 +659,21 @@ impl IntStream {
                 } else {
                     8
                 };
-                let n = vals.len();
-                let mut planes = Vec::with_capacity(n * (bw as usize));
-                let min_u = min as u64;
-                // A plane at a time keeps the stores sequential without pre-zeroing.
-                for p in 0..(bw as usize) {
-                    let shift = 8 * p;
-                    planes.extend(
-                        vals.iter()
-                            .map(|&v| ((v as u64).wrapping_sub(min_u) >> shift) as u8),
-                    );
-                }
+                let planes = for_planes_bytes(vals, min, bw);
                 let pay_p = pack_leaf(&planes);
                 let p_cost = pay_p.len() + 10;
-                if best.as_ref().is_none_or(|(b, _)| p_cost < *b) {
-                    best = Some((
-                        p_cost,
-                        Self::ForPlanes {
-                            len,
-                            min,
-                            width: bw,
-                            leaf: pay_p,
-                        },
-                    ));
-                }
+                consider(
+                    &mut best,
+                    &mut second_cost,
+                    p_cost,
+                    1,
+                    Self::ForPlanes {
+                        len,
+                        min,
+                        width: bw,
+                        leaf: pay_p,
+                    },
+                );
             }
 
             if allow_tail && vals.len() >= 64 && max_u > 0xff && max_u <= (i64::MAX as u64) {
@@ -537,20 +694,27 @@ impl IntStream {
                     }
                     if over.len() * 2 <= vals.len() {
                         let head_leaf = pack_leaf(&head_raw);
-                        let tail_s = Self::auto_encode_inner(&over, false);
-                        let mut tb = Vec::new();
-                        tail_s.encode(&mut tb);
-                        let t_cost = head_leaf.len() + tb.len() + 10;
-                        if best.as_ref().is_none_or(|(b, _)| t_cost < *b) {
-                            best = Some((
+                        // Early lossless cutoff: even a 2-byte tail cannot beat `best`.
+                        if best
+                            .as_ref()
+                            .is_none_or(|(b, _, _)| head_leaf.len() + 12 < *b)
+                        {
+                            let (tail_s, _) = Self::auto_encode_inner(&over, false);
+                            let mut tb = Vec::new();
+                            tail_s.encode(&mut tb);
+                            let t_cost = head_leaf.len() + tb.len() + 10;
+                            consider(
+                                &mut best,
+                                &mut second_cost,
                                 t_cost,
+                                3,
                                 Self::ForTail255 {
                                     len,
                                     min,
                                     head_leaf,
                                     tail: Box::new(tail_s),
                                 },
-                            ));
+                            );
                         }
                     }
                 }
@@ -564,12 +728,24 @@ impl IntStream {
             }
             let leaf = pack_leaf(&zz);
             let cost = leaf.len() + 3;
-            if best.as_ref().is_none_or(|(b, _)| cost < *b) {
-                best = Some((cost, Self::ZigZagVarint { len, leaf }));
-            }
+            consider(
+                &mut best,
+                &mut second_cost,
+                cost,
+                4,
+                Self::ZigZagVarint { len, leaf },
+            );
         }
 
-        best.unwrap().1
+        let (best_cost, best_id, best_stream) = best.unwrap();
+        let chosen = if vals.len() >= 32
+            && (second_cost == usize::MAX || tape::clear(best_cost, second_cost))
+        {
+            best_id
+        } else {
+            tape::OPEN
+        };
+        (best_stream, chosen)
     }
 
     /// Linear-time selection for latency-sensitive native numeric columns. Uses the same
@@ -580,11 +756,18 @@ impl IntStream {
             return Self::Const { val: 0, len };
         }
         let (mut min, mut max, mut runs) = (vals[0], vals[0], 1usize);
-        for w in vals.windows(2) {
-            min = min.min(w[1]);
-            max = max.max(w[1]);
-            runs += usize::from(w[0] != w[1]);
+        let mut prev = vals[0];
+        for &v in &vals[1..] {
+            min = min.min(v);
+            max = max.max(v);
+            runs += usize::from(prev != v);
+            prev = v;
         }
+        Self::encode_fast_with_stats(vals, min, max, runs)
+    }
+
+    fn encode_fast_with_stats(vals: &[i64], min: i64, max: i64, runs: usize) -> Self {
+        let len = vals.len() as u32;
         if min == max {
             return Self::Const { val: min, len };
         }
@@ -607,13 +790,17 @@ impl IntStream {
             };
         }
         let bits = (64 - (max as u64).wrapping_sub(min as u64).leading_zeros()) as u8;
-        let varbytes = vals
-            .iter()
-            .map(|&v| {
-                ((64 - (((v << 1) ^ (v >> 63)) as u64).leading_zeros()).max(1) as usize).div_ceil(7)
-            })
-            .sum::<usize>();
-        let candidate = if varbytes + 8 < vals.len() * bits as usize / 8 {
+        let compute_varbytes = || {
+            vals.iter()
+                .map(|&v| {
+                    ((64 - (((v << 1) ^ (v >> 63)) as u64).leading_zeros()).max(1) as usize)
+                        .div_ceil(7)
+                })
+                .sum::<usize>()
+        };
+        // `varbytes >= vals.len()`, so `varbytes + 8 < vals.len() * bits / 8` is impossible when `bits <= 8`.
+        let mut varbytes_opt = (bits > 8).then(&compute_varbytes);
+        let candidate = if varbytes_opt.is_some_and(|vb| vb + 8 < vals.len() * bits as usize / 8) {
             let mut head = Vec::with_capacity(vals.len());
             let mut tail = Vec::new();
             for &v in vals {
@@ -626,14 +813,10 @@ impl IntStream {
             Self::ZigZagBytes {
                 len,
                 head_leaf: pack_leaf(&head),
-                tail: Box::new(Self::auto_encode_inner(&tail, false)),
+                tail: Box::new(Self::auto_encode_inner(&tail, false).0),
             }
         } else {
-            let raw = bitpack_u64(
-                vals.iter().map(|&v| (v as u64).wrapping_sub(min as u64)),
-                bits,
-                vals.len(),
-            );
+            let raw = bitpack_for_slice(vals, min, bits);
             Self::ForBitpack {
                 len,
                 min,
@@ -642,6 +825,7 @@ impl IntStream {
             }
         };
         if vals.len() <= 1024 {
+            let varbytes = *varbytes_opt.get_or_insert_with(compute_varbytes);
             let mut candidate = candidate;
             let mut framed = Vec::new();
             candidate.encode(&mut framed);
@@ -2187,69 +2371,102 @@ pub(crate) fn mtf_split(vals: &[i64]) -> (Vec<i64>, Vec<i64>) {
         .iter()
         .fold((i64::MAX, i64::MIN), |(l, h), &v| (l.min(v), h.max(v)));
     let span = (hi as i128 - lo as i128) as u128;
-    let mut dense = if span < (vals.len() as u128) * 2 + 1024 {
-        vec![u32::MAX; span as usize + 1]
-    } else {
-        Vec::new()
-    };
-    let mut sparse: FastMap<i64, u32> = if dense.is_empty() {
-        fast_map_with_capacity(vals.len().min(4096))
-    } else {
-        FastMap::default()
-    };
     let mut codes = Vec::with_capacity(vals.len());
     let mut misses = Vec::new();
-    let lo_u = lo as u64;
-    for (t, &v) in vals.iter().enumerate() {
-        let prev = if dense.is_empty() {
-            sparse.insert(v, t as u32)
-        } else {
+    let mut prev_val: Option<i64> = None;
+
+    if span < (vals.len() as u128) * 2 + 1024 {
+        let mut dense = vec![u32::MAX; span as usize + 1];
+        let lo_u = lo as u64;
+        for (t, &v) in vals.iter().enumerate() {
+            if prev_val == Some(v) {
+                dense[(v as u64).wrapping_sub(lo_u) as usize] = t as u32;
+                uses.clear(t - 1);
+                uses.set(t);
+                codes.push(1);
+                continue;
+            }
+            prev_val = Some(v);
             let slot = &mut dense[(v as u64).wrapping_sub(lo_u) as usize];
-            Some(std::mem::replace(slot, t as u32)).filter(|&p| p != u32::MAX)
-        };
-        let rank = prev.map(|prev| {
-            uses.clear(prev as usize);
-            uses.between_capped(prev as usize, t, MTF_WINDOW)
-        });
-        match rank {
-            Some(r) if r < MTF_WINDOW => codes.push(r as i64 + 1),
-            _ => {
+            let prev = std::mem::replace(slot, t as u32);
+            if prev != u32::MAX {
+                uses.clear(prev as usize);
+                let r = uses.between_capped(prev as usize, t, MTF_WINDOW);
+                if r < MTF_WINDOW {
+                    codes.push(r as i64 + 1);
+                } else {
+                    codes.push(0);
+                    misses.push(v);
+                }
+            } else {
                 codes.push(0);
                 misses.push(v);
             }
+            uses.set(t);
         }
-        uses.set(t);
+    } else {
+        let mut sparse: FastMap<i64, u32> = fast_map_with_capacity(vals.len().min(16384));
+        for (t, &v) in vals.iter().enumerate() {
+            if prev_val == Some(v) {
+                sparse.insert(v, t as u32);
+                uses.clear(t - 1);
+                uses.set(t);
+                codes.push(1);
+                continue;
+            }
+            prev_val = Some(v);
+            if let Some(prev) = sparse.insert(v, t as u32) {
+                uses.clear(prev as usize);
+                let r = uses.between_capped(prev as usize, t, MTF_WINDOW);
+                if r < MTF_WINDOW {
+                    codes.push(r as i64 + 1);
+                } else {
+                    codes.push(0);
+                    misses.push(v);
+                }
+            } else {
+                codes.push(0);
+                misses.push(v);
+            }
+            uses.set(t);
+        }
     }
     (codes, misses)
 }
 
-/// Times that are some value's last use, with a count per span of [`SPAN_BITS`] times.
+/// Times that are some value's last use, with two-level summaries (`SPAN_BITS` and `SUPER_BITS`).
 struct LastUses {
     words: Vec<u64>,
     spans: Vec<u32>,
+    supers: Vec<u32>,
 }
 
-/// 512 bits = 8 u64 words = 1 cache line per span, bounding edge word scans to at most 7 words.
+/// 512 bits = 8 u64 words = 1 cache line per span.
 const SPAN_BITS: usize = 512;
+/// 4096 bits = 8 spans = 64 u64 words per super-span.
+const SUPER_BITS: usize = 4096;
 
 impl LastUses {
     fn new(n: usize) -> Self {
         Self {
             words: vec![0; n.div_ceil(64)],
             spans: vec![0; n.div_ceil(SPAN_BITS)],
+            supers: vec![0; n.div_ceil(SUPER_BITS)],
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn set(&mut self, t: usize) {
         self.words[t >> 6] |= 1u64 << (t & 63);
-        self.spans[t / SPAN_BITS] += 1;
+        self.spans[t >> 9] += 1;
+        self.supers[t >> 12] += 1;
     }
 
-    #[inline]
+    #[inline(always)]
     fn clear(&mut self, t: usize) {
         self.words[t >> 6] &= !(1u64 << (t & 63));
-        self.spans[t / SPAN_BITS] -= 1;
+        self.spans[t >> 9] -= 1;
+        self.supers[t >> 12] -= 1;
     }
 
     /// Set times strictly between `a` and `b`, capped early at `cap`.
@@ -2267,10 +2484,11 @@ impl LastUses {
         }
         let mut n =
             (self.words[wl] & lo_mask).count_ones() + (self.words[wh] & hi_mask).count_ones();
-        const SPAN_WORDS: usize = SPAN_BITS / 64;
+        const SPAN_WORDS: usize = SPAN_BITS / 64; // 8
+        const SUPER_WORDS: usize = SUPER_BITS / 64; // 64
         let cap_u32 = cap as u32;
         let mut w = wl + 1;
-        // Scan prefix words up to the next span boundary.
+        // Prefix words up to the next span boundary.
         let next_span = (w + SPAN_WORDS - 1) & !(SPAN_WORDS - 1);
         let prefix_end = next_span.min(wh);
         while w < prefix_end {
@@ -2280,15 +2498,33 @@ impl LastUses {
         if n >= cap_u32 {
             return cap;
         }
-        // Scan whole cache-line spans at a time, stopping early once we exceed `cap`.
-        while w + SPAN_WORDS <= wh {
-            n += self.spans[w / SPAN_WORDS];
+        // Prefix spans up to the next super-span boundary.
+        let next_super = (w + SUPER_WORDS - 1) & !(SUPER_WORDS - 1);
+        let super_prefix_end = next_super.min(wh & !(SPAN_WORDS - 1));
+        while w < super_prefix_end {
+            n += self.spans[w >> 3];
             if n >= cap_u32 {
                 return cap;
             }
             w += SPAN_WORDS;
         }
-        // Scan suffix words.
+        // Whole 4096-bit super-spans at a time.
+        while w + SUPER_WORDS <= wh {
+            n += self.supers[w >> 6];
+            if n >= cap_u32 {
+                return cap;
+            }
+            w += SUPER_WORDS;
+        }
+        // Remaining whole 512-bit spans.
+        while w + SPAN_WORDS <= wh {
+            n += self.spans[w >> 3];
+            if n >= cap_u32 {
+                return cap;
+            }
+            w += SPAN_WORDS;
+        }
+        // Suffix words.
         while w < wh {
             n += self.words[w].count_ones();
             w += 1;
@@ -2473,14 +2709,18 @@ impl GraphBuilder {
     }
 
     pub fn add_ints(&mut self, vals: &[i64]) -> u16 {
-        match tape::recorded(Site::Ints) {
+        let rec = tape::recorded(Site::Ints);
+        match rec {
             Some(1) if !vals.is_empty() => {
                 return self.push_deltas(vals[0], IntStream::auto_encode(&deltas(vals)));
             }
             Some(0) => return self.push(GraphNode::IntStream(IntStream::auto_encode(vals))),
             _ => {}
         }
+        let _apart = rec.map(|_| tape::Scope::apart());
+        let scope = tape::Scope::record();
         let direct = IntStream::auto_encode(vals);
+        let t_dir = scope.end();
         // Short streams and those whose head rules differences out say little of longer ones.
         let mut chose = tape::OPEN;
         if vals.len() >= 16 {
@@ -2521,18 +2761,20 @@ impl GraphBuilder {
                     d_span < v_span || d_runs < v_runs || small_d * 4 >= k
                 };
                 if try_delta {
+                    let scope = tape::Scope::record();
                     let d_stream = IntStream::auto_encode(&deltas(vals));
+                    let t_del = scope.end();
                     let mut b_del = Vec::new();
                     d_stream.encode(&mut b_del);
                     if b_del.len() + 24 < b_dir.len() {
-                        tape::note(Site::Ints, 1, &[]);
+                        tape::note(Site::Ints, 1, &t_del);
                         return self.push_deltas(vals[0], d_stream);
                     }
                     chose = 0;
                 }
             }
         }
-        tape::note(Site::Ints, chose, &[]);
+        tape::note(Site::Ints, chose, if chose == 0 { &t_dir } else { &[] });
         self.push(GraphNode::IntStream(direct))
     }
 
@@ -2548,24 +2790,44 @@ impl GraphBuilder {
     /// Predicts signed lanes when their deltas need materially fewer bits. Prediction is
     /// an ordinary scan program, so readers need no knowledge of the encoder's policy.
     pub fn add_ints_fast(&mut self, vals: &[i64]) -> u16 {
-        if vals.len() < 2 || vals.iter().all(|v| *v == vals[0]) {
+        if vals.len() < 2 {
             return self.push(GraphNode::IntStream(IntStream::encode_fast(vals)));
         }
-        let runs = 1 + vals.windows(2).filter(|w| w[0] != w[1]).count();
+        // Single fused pass for const check, run count, linear-step check, min, and max.
+        let v0 = vals[0];
+        let step = vals[1].wrapping_sub(v0);
+        let mut runs = 1usize;
+        let mut linear = true;
+        let mut min = v0;
+        let mut max = v0;
+        let mut prev = v0;
+        for &v in &vals[1..] {
+            runs += usize::from(v != prev);
+            linear &= v.wrapping_sub(prev) == step;
+            min = min.min(v);
+            max = max.max(v);
+            prev = v;
+        }
+        if runs == 1 {
+            return self.push(GraphNode::IntStream(IntStream::Const {
+                val: v0,
+                len: vals.len() as u32,
+            }));
+        }
         if runs * 16 < vals.len() {
-            return self.push(GraphNode::IntStream(IntStream::encode_fast(vals)));
+            return self.push(GraphNode::IntStream(IntStream::encode_fast_with_stats(
+                vals, min, max, runs,
+            )));
         }
-        let step = vals[1].wrapping_sub(vals[0]);
-        if vals.windows(2).all(|w| w[1].wrapping_sub(w[0]) == step) {
+        if linear {
             let input = self.push(GraphNode::IntStream(IntStream::Const {
                 val: step,
                 len: vals.len() as u32,
             }));
             let b = Builder::new(1);
-            let output = b.scan_add(b.input(0), vals[0].wrapping_sub(step));
+            let output = b.scan_add(b.input(0), v0.wrapping_sub(step));
             return self.add_prog_i64(b.finish(&[(output, 8)]), vec![input], vec![]);
         }
-        let min = *vals.iter().min().unwrap();
         let mut factor = 0u64;
         for &v in vals {
             let mut delta = (v as u64).wrapping_sub(min as u64);
@@ -2597,13 +2859,25 @@ impl GraphBuilder {
             return self.add_prog_i64(b.finish(&[(output, 8)]), vec![input], vec![]);
         }
         let span = |lo: i64, hi: i64| 64 - (hi as u64).wrapping_sub(lo as u64).leading_zeros();
-        let bits = span(min, *vals.iter().max().unwrap()) as usize;
+        let bits = span(min, max) as usize;
+        // Single fused pass building `deltas` and `(d_min, d_max, d_runs)`.
         let mut deltas = Vec::with_capacity(vals.len());
-        // Use a real step in the first lane so centering sees no artificial outlier.
         deltas.push(step);
-        deltas.extend(vals.windows(2).map(|w| w[1].wrapping_sub(w[0])));
-        let delta_bits =
-            span(*deltas.iter().min().unwrap(), *deltas.iter().max().unwrap()) as usize;
+        let mut d_min = step;
+        let mut d_max = step;
+        let mut d_runs = 1usize;
+        let mut d_prev = step;
+        let mut p = v0;
+        for &v in &vals[1..] {
+            let d = v.wrapping_sub(p);
+            p = v;
+            deltas.push(d);
+            d_min = d_min.min(d);
+            d_max = d_max.max(d);
+            d_runs += usize::from(d != d_prev);
+            d_prev = d;
+        }
+        let delta_bits = span(d_min, d_max) as usize;
         let varint_bytes = || {
             deltas
                 .iter()
@@ -2616,12 +2890,16 @@ impl GraphBuilder {
         if bits.saturating_sub(delta_bits) * vals.len() > 40
             || varint_bytes() * 8 + 40 < bits * vals.len()
         {
-            let input = self.push(GraphNode::IntStream(IntStream::encode_fast(&deltas)));
+            let input = self.push(GraphNode::IntStream(IntStream::encode_fast_with_stats(
+                &deltas, d_min, d_max, d_runs,
+            )));
             let b = Builder::new(1);
-            let output = b.scan_add(b.input(0), vals[0].wrapping_sub(deltas[0]));
+            let output = b.scan_add(b.input(0), v0.wrapping_sub(deltas[0]));
             self.add_prog_i64(b.finish(&[(output, 8)]), vec![input], vec![])
         } else {
-            self.push(GraphNode::IntStream(IntStream::encode_fast(vals)))
+            self.push(GraphNode::IntStream(IntStream::encode_fast_with_stats(
+                vals, min, max, runs,
+            )))
         }
     }
 
@@ -2855,32 +3133,44 @@ impl GraphBuilder {
         } else {
             rows.len()
         };
-        let mut counts: FastMap<&[u8], (u32, usize)> = fast_map_with_capacity(rows.len().min(1024));
-        let mut n_uniq = 0usize;
+        let mut counts: FastMap<&[u8], usize> = fast_map_with_capacity(rows.len().min(1024));
+        let mut uniq_vals: Vec<(&[u8], u32, usize)> = Vec::with_capacity(rows.len().min(1024));
         // Each row's value by order of first appearance, so codes need no second lookup.
         let mut row_uniq = Vec::with_capacity(rows.len());
+        let mut prev_r: Option<&[u8]> = None;
+        let mut prev_u = 0usize;
         for &r in rows {
-            if let Some(e) = counts.get_mut(r) {
-                e.0 += 1;
-                row_uniq.push(e.1);
-            } else {
-                if n_uniq >= max_dict_uniq {
-                    return emit_raw_slice(self);
-                }
-                counts.insert(r, (1, n_uniq));
-                row_uniq.push(n_uniq);
-                n_uniq += 1;
+            if prev_r == Some(r) {
+                uniq_vals[prev_u].1 += 1;
+                row_uniq.push(prev_u);
+                continue;
             }
+            let u = match counts.entry(r) {
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    let id = *e.get();
+                    uniq_vals[id].1 += 1;
+                    id
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let id = uniq_vals.len();
+                    if id >= max_dict_uniq {
+                        return emit_raw_slice(self);
+                    }
+                    e.insert(id);
+                    uniq_vals.push((r, 1, id));
+                    id
+                }
+            };
+            prev_r = Some(r);
+            prev_u = u;
+            row_uniq.push(u);
         }
 
-        if n_uniq == rows.len() && rows.len() > 1 {
+        if uniq_vals.len() == rows.len() && rows.len() > 1 {
             return emit_raw_slice(self);
         }
 
-        let mut sorted: Vec<(&[u8], u32, usize)> = counts
-            .into_iter()
-            .map(|(s, (cnt, first_idx))| (s, cnt, first_idx))
-            .collect();
+        let mut sorted = uniq_vals;
         sorted.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
 
         let mut remap = vec![0i64; sorted.len()];
@@ -5008,6 +5298,57 @@ fn get_u16_list(cur: &mut Cursor<'_>, limit: usize) -> Result<Vec<u16>> {
         out.push(r as u16);
     }
     Ok(out)
+}
+
+fn for_planes_bytes(vals: &[i64], min: i64, bw: u8) -> Vec<u8> {
+    let n = vals.len();
+    let min_u = min as u64;
+    let total = n * (bw as usize);
+    let mut planes = Vec::with_capacity(total);
+    let ptr: *mut u8 = planes.as_mut_ptr();
+    // SAFETY: `planes` has capacity `n * bw` and every index written is strictly `< n * bw`.
+    unsafe {
+        match bw {
+            1 => {
+                for (i, &v) in vals.iter().enumerate() {
+                    *ptr.add(i) = (v as u64).wrapping_sub(min_u) as u8;
+                }
+            }
+            2 => {
+                let p0 = ptr;
+                let p1 = ptr.add(n);
+                for (i, &v) in vals.iter().enumerate() {
+                    let x = (v as u64).wrapping_sub(min_u);
+                    *p0.add(i) = x as u8;
+                    *p1.add(i) = (x >> 8) as u8;
+                }
+            }
+            4 => {
+                let p0 = ptr;
+                let p1 = ptr.add(n);
+                let p2 = ptr.add(n * 2);
+                let p3 = ptr.add(n * 3);
+                for (i, &v) in vals.iter().enumerate() {
+                    let x = (v as u64).wrapping_sub(min_u);
+                    *p0.add(i) = x as u8;
+                    *p1.add(i) = (x >> 8) as u8;
+                    *p2.add(i) = (x >> 16) as u8;
+                    *p3.add(i) = (x >> 24) as u8;
+                }
+            }
+            _ => {
+                for p in 0..(bw as usize) {
+                    let shift = 8 * p;
+                    let dst = ptr.add(p * n);
+                    for (i, &v) in vals.iter().enumerate() {
+                        *dst.add(i) = ((v as u64).wrapping_sub(min_u) >> shift) as u8;
+                    }
+                }
+            }
+        }
+        planes.set_len(total);
+    }
+    planes
 }
 
 fn bitpack_for_slice(vals: &[i64], min: i64, bits: u8) -> Vec<u8> {

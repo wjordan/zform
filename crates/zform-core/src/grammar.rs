@@ -813,8 +813,11 @@ pub fn tokenize_template_line(line: &[u8]) -> Vec<(usize, usize, SlotClass)> {
     let len = line.len();
     let mut i = 0usize;
     while i < len {
-        // 1. ISO-8601 / CLF / Syslog timestamp at boundary
-        if (i == 0 || !line[i - 1].is_ascii_alphanumeric())
+        let b = line[i];
+        // 1. ISO-8601 / CLF / Syslog timestamp at boundary (only starts with digit or month initial).
+        if (b.is_ascii_digit()
+            || matches!(b, b'J' | b'F' | b'M' | b'A' | b'S' | b'O' | b'N' | b'D'))
+            && (i == 0 || !line[i - 1].is_ascii_alphanumeric())
             && let Some((end, cls)) = try_scan_timestamp_at(line, i)
         {
             spans.push((i, end, cls));
@@ -822,7 +825,7 @@ pub fn tokenize_template_line(line: &[u8]) -> Vec<(usize, usize, SlotClass)> {
             continue;
         }
         // 2. Quoted string `"..."` (excluding empty `""` or >256B blobs)
-        if line[i] == b'"'
+        if b == b'"'
             && let Some(close) = scan_simple_quoted(line, i)
             && close > i + 2
             && close - i <= 258
@@ -850,38 +853,60 @@ pub fn tokenize_template_line(line: &[u8]) -> Vec<(usize, usize, SlotClass)> {
                 i = tok_end;
                 continue;
             }
-            // Standalone IPv4 (stops before `:port` so host IPs hit MTF-4096 and constant ports like `:50010` pin to literal!)
-            let ip_end = line[i..tok_end]
-                .iter()
-                .position(|&c| c == b':')
-                .map(|p| i + p)
-                .unwrap_or(tok_end);
-            if ip_end > i && parse_ipv4_or_port(&line[i..ip_end]).is_some_and(|x| x.1 == 0) {
-                spans.push((i, ip_end, SlotClass::IpPort));
-                i = ip_end;
-                continue;
+            // Standalone IPv4 (only if token starts with digit or `/digit`).
+            if b.is_ascii_digit() || (b == b'/' && tok.get(1).is_some_and(u8::is_ascii_digit)) {
+                let ip_end = memchr::memchr(b':', tok).map(|p| i + p).unwrap_or(tok_end);
+                if b.is_ascii_digit()
+                    && ip_end > i
+                    && parse_ipv4_or_port(&line[i..ip_end]).is_some_and(|x| x.1 == 0)
+                {
+                    spans.push((i, ip_end, SlotClass::IpPort));
+                    i = ip_end;
+                    continue;
+                }
+                if b == b'/'
+                    && ip_end > i + 1
+                    && parse_ipv4_or_port(&line[i + 1..ip_end]).is_some_and(|x| x.1 == 0)
+                {
+                    spans.push((i + 1, ip_end, SlotClass::IpPort));
+                    i = ip_end;
+                    continue;
+                }
             }
-            if tok.starts_with(b"/")
-                && ip_end > i + 1
-                && parse_ipv4_or_port(&line[i + 1..ip_end]).is_some_and(|x| x.1 == 0)
-            {
-                spans.push((i + 1, ip_end, SlotClass::IpPort));
-                i = ip_end;
-                continue;
-            }
-            if split_email(tok).is_some() {
+            if memchr::memchr(b'@', tok).is_some() && split_email(tok).is_some() {
                 spans.push((i, tok_end, SlotClass::Email));
                 i = tok_end;
                 continue;
             }
-            if (tok.starts_with(b"http://") || tok.starts_with(b"https://")) && tok.len() <= 256 {
+            if b == b'h'
+                && tok.len() <= 256
+                && (tok.starts_with(b"http://") || tok.starts_with(b"https://"))
+            {
                 spans.push((i, tok_end, SlotClass::Path));
                 i = tok_end;
                 continue;
             }
+            // Pure alphabetic word with at least one non-hex letter (`g..=z`/`G..=Z`) cannot hold
+            // any numeric, hex, IP, or sub-token slot: skip the entire word in one jump.
+            if b.is_ascii_alphabetic() {
+                let mut all_alpha = true;
+                let mut has_non_hex = false;
+                for &c in tok {
+                    if !c.is_ascii_alphabetic() {
+                        all_alpha = false;
+                        break;
+                    }
+                    if !c.is_ascii_hexdigit() {
+                        has_non_hex = true;
+                    }
+                }
+                if all_alpha && (has_non_hex || tok.len() < 8 || !tok.len().is_multiple_of(2)) {
+                    i = tok_end;
+                    continue;
+                }
+            }
         }
         // 4. Alphanumeric/numeric sub-tokens (keeps `blk_` and `/mnt/hadoop/.../job_` literal, masking only varying IDs!)
-        let b = line[i];
         if (b == b'-' || b == b'+')
             && i + 1 < len
             && line[i + 1].is_ascii_digit()
