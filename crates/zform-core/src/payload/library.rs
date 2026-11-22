@@ -342,9 +342,13 @@ pub struct Harvest {
 impl Harvest {
     /// Counts the code in a column payload written without a library.
     pub fn add_blob(&mut self, blob: &[u8]) {
-        let Ok(graph) = PayloadGraph::decode(blob, &DecodeBudget::default()) else {
-            return;
-        };
+        if let Ok(graph) = PayloadGraph::decode(blob, &DecodeBudget::default()) {
+            self.add_graph(&graph);
+        }
+    }
+
+    /// Counts the code in an already-decoded column graph.
+    pub fn add_graph(&mut self, graph: &PayloadGraph) {
         for node in &graph.nodes {
             match node {
                 GraphNode::ProgramI64 { prog, bufs, .. }

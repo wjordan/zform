@@ -3,14 +3,37 @@
 
 use std::cell::RefCell;
 use std::fmt;
+use std::ptr::NonNull;
+
+use zstd_safe::zstd_sys as zs;
 
 use crate::dictionary::Dictionary;
 
+struct RawDCtx(NonNull<zs::ZSTD_DCtx>);
+
+impl Drop for RawDCtx {
+    fn drop(&mut self) {
+        unsafe { zs::ZSTD_freeDCtx(self.0.as_ptr()) };
+    }
+}
+
+struct EncScratch {
+    cctx: Option<zstd_safe::CCtx<'static>>,
+    level: i32,
+    wlog: u32,
+    tmp: Vec<u8>,
+}
+
 thread_local! {
-    static ZSTD_ENC_SCRATCH: RefCell<(Option<zstd_safe::CCtx<'static>>, Vec<u8>)> =
-        const { RefCell::new((None, Vec::new())) };
-    static ZSTD_DEC_SCRATCH: RefCell<Option<zstd_safe::DCtx<'static>>> =
-        const { RefCell::new(None) };
+    static ZSTD_ENC_SCRATCH: RefCell<EncScratch> = const {
+        RefCell::new(EncScratch {
+            cctx: None,
+            level: i32::MIN,
+            wlog: 0,
+            tmp: Vec::new(),
+        })
+    };
+    static ZSTD_DEC_SCRATCH: RefCell<Option<RawDCtx>> = const { RefCell::new(None) };
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +108,15 @@ impl DecodeBudget {
         v.try_reserve_exact(len)
             .map_err(|_| Error::BudgetExceeded("out of memory"))?;
         v.resize(len, 0);
+        Ok(v)
+    }
+
+    #[inline]
+    pub(crate) fn alloc_uninit_vec(&self, len: usize, ctx: &'static str) -> Result<Vec<u8>> {
+        self.check_alloc(len, ctx)?;
+        let mut v = Vec::new();
+        v.try_reserve_exact(len)
+            .map_err(|_| Error::BudgetExceeded("out of memory"))?;
         Ok(v)
     }
 }
@@ -278,6 +310,7 @@ impl EntropyBackend {
 
 /// Writes a leaf: `[tag: u8][raw_len: varint][payload_len: varint][payload]`.
 pub(crate) fn put_leaf(out: &mut Vec<u8>, tag: EntropyBackend, raw_len: usize, payload: &[u8]) {
+    out.reserve(payload.len() + 12);
     out.push(tag as u8);
     put_uvarint(out, raw_len as u64);
     put_uvarint(out, payload.len() as u64);
@@ -310,27 +343,38 @@ pub(crate) fn compress_leaf_with(
                 let bound = zstd_safe::compress_bound(src.len());
                 ZSTD_ENC_SCRATCH.with(|cell| {
                     let mut borrow = cell.borrow_mut();
-                    let (cctx_opt, tmp) = &mut *borrow;
-                    if tmp.len() < bound {
-                        tmp.resize(bound, 0);
+                    let s = &mut *borrow;
+                    if s.tmp.len() < bound {
+                        s.tmp.resize(bound, 0);
                     }
-                    let tmp = &mut tmp[..bound];
+                    let tmp = &mut s.tmp[..bound];
                     let (tag, n) = match dict.and_then(|d| d.compress(tmp, src, zstd_level)) {
                         Some(n) => (EntropyBackend::ZstdDict, n),
                         None => {
-                            if cctx_opt.is_none() {
-                                *cctx_opt = zstd_safe::CCtx::try_create();
-                            }
-                            let Some(ctx) = cctx_opt.as_mut() else {
-                                return false;
-                            };
                             use zstd_safe::CParameter::{
                                 ChecksumFlag, CompressionLevel, WindowLog,
                             };
+                            if s.cctx.is_none() {
+                                if let Some(mut c) = zstd_safe::CCtx::try_create() {
+                                    let _ = c.set_parameter(ChecksumFlag(false));
+                                    s.cctx = Some(c);
+                                }
+                                s.level = i32::MIN;
+                                s.wlog = 0;
+                            }
+                            let Some(ctx) = s.cctx.as_mut() else {
+                                return false;
+                            };
                             let _ = ctx.reset(zstd_safe::ResetDirective::SessionOnly);
-                            let _ = ctx.set_parameter(CompressionLevel(zstd_level));
-                            let _ = ctx.set_parameter(ChecksumFlag(false));
-                            let _ = ctx.set_parameter(WindowLog(window_log(src.len())));
+                            if s.level != zstd_level {
+                                let _ = ctx.set_parameter(CompressionLevel(zstd_level));
+                                s.level = zstd_level;
+                            }
+                            let wlog = window_log(src.len());
+                            if s.wlog != wlog {
+                                let _ = ctx.set_parameter(WindowLog(wlog));
+                                s.wlog = wlog;
+                            }
                             match ctx.compress2(tmp, src) {
                                 Ok(n) => (EntropyBackend::Zstd, n),
                                 Err(_) => return false,
@@ -340,6 +384,11 @@ pub(crate) fn compress_leaf_with(
                     let shrunk = n + 2 < src.len();
                     if shrunk {
                         put_leaf(out, tag, src.len(), &tmp[..n]);
+                    }
+                    // Release oversized scratch buffers (>1 MiB) so worker threads don't pin
+                    // multi-MiB prose-pool buffers in thread-local storage across frames.
+                    if s.tmp.capacity() > (1 << 20) {
+                        s.tmp = Vec::new();
                     }
                     shrunk
                 })
@@ -388,32 +437,44 @@ pub(crate) fn decompress_leaf_with(
                     Error::Format("leaf needs a dictionary that was not given".into())
                 })?),
             };
-            let mut dst = budget.alloc_vec(raw_len, "zstd leaf")?;
+            let mut dst = budget.alloc_uninit_vec(raw_len, "zstd leaf")?;
             let n = ZSTD_DEC_SCRATCH.with(|cell| -> Result<usize> {
                 let mut borrow = cell.borrow_mut();
                 if borrow.is_none() {
-                    *borrow = zstd_safe::DCtx::try_create();
+                    *borrow = NonNull::new(unsafe { zs::ZSTD_createDCtx() }).map(RawDCtx);
                 }
                 let dctx = borrow
-                    .as_mut()
-                    .ok_or_else(|| Error::Format("failed to create zstd DCtx".into()))?;
-                let _ = dctx.reset(zstd_safe::ResetDirective::SessionOnly);
-                match dict {
-                    Some(d) => d.decompress(dctx, &mut dst[..], payload),
-                    None => dctx.decompress(&mut dst[..], payload),
-                }
-                .map_err(|code| {
-                    Error::Format(format!(
+                    .as_ref()
+                    .ok_or_else(|| Error::Format("failed to create zstd DCtx".into()))?
+                    .0
+                    .as_ptr();
+                let code = match dict {
+                    Some(d) => d.decompress_raw(dctx, dst.as_mut_ptr(), raw_len, payload),
+                    None => unsafe {
+                        zs::ZSTD_decompressDCtx(
+                            dctx,
+                            dst.as_mut_ptr().cast(),
+                            raw_len,
+                            payload.as_ptr().cast(),
+                            payload.len(),
+                        )
+                    },
+                };
+                if unsafe { zs::ZSTD_isError(code) } != 0 {
+                    return Err(Error::Format(format!(
                         "zstd decompress error: {}",
                         zstd_safe::get_error_name(code)
-                    ))
-                })
+                    )));
+                }
+                Ok(code)
             })?;
             if n != raw_len {
                 return Err(Error::Format(format!(
                     "zstd decoded {n} != expected {raw_len}"
                 )));
             }
+            // SAFETY: zstd wrote exactly `raw_len` initialized bytes into `dst`.
+            unsafe { dst.set_len(raw_len) };
             Ok(dst)
         }
         EntropyBackend::Lz4 => {
@@ -452,9 +513,13 @@ pub(crate) fn compress_pages(pages: &[Vec<u8>], level: i32) -> Vec<Vec<u8>> {
                 .is_ok()
             && c.load_dictionary(first).is_ok()
     });
+    let mut tmp = Vec::new();
     for page in &pages[1..] {
         let mut leaf = Vec::new();
-        let mut tmp = vec![0u8; zstd_safe::compress_bound(page.len())];
+        let bound = zstd_safe::compress_bound(page.len());
+        if tmp.len() < bound {
+            tmp.resize(bound, 0);
+        }
         let n = ctx
             .as_mut()
             .filter(|_| ready && page.len() >= 32)
@@ -462,7 +527,7 @@ pub(crate) fn compress_pages(pages: &[Vec<u8>], level: i32) -> Vec<Vec<u8>> {
                 c.reset(zstd_safe::ResetDirective::SessionOnly).ok()?;
                 // The first page stays in reach only within a frame's first window.
                 c.set_parameter(WindowLog(window_log(page.len()))).ok()?;
-                c.compress2(&mut tmp[..], page).ok()
+                c.compress2(&mut tmp[..bound], page).ok()
             });
         match n {
             Some(n) if n + 2 < page.len() => {
@@ -504,20 +569,38 @@ pub(crate) fn expand_page(leaf: &[u8], first: Option<&[u8]>, dst: &mut [u8]) -> 
             let n = ZSTD_DEC_SCRATCH.with(|cell| -> Result<usize> {
                 let mut borrow = cell.borrow_mut();
                 if borrow.is_none() {
-                    *borrow = zstd_safe::DCtx::try_create();
+                    *borrow = NonNull::new(unsafe { zs::ZSTD_createDCtx() }).map(RawDCtx);
                 }
                 let dctx = borrow
-                    .as_mut()
-                    .ok_or_else(|| Error::Format("failed to create zstd DCtx".into()))?;
-                let _ = dctx.reset(zstd_safe::ResetDirective::SessionOnly);
-                match first {
-                    Some(f) => dctx.decompress_using_dict(dst, payload, f),
-                    None => dctx.decompress(dst, payload),
-                }
-                .map_err(|code| {
+                    .as_ref()
+                    .ok_or_else(|| Error::Format("failed to create zstd DCtx".into()))?
+                    .0
+                    .as_ptr();
+                let code = unsafe {
+                    match first {
+                        Some(f) => zs::ZSTD_decompress_usingDict(
+                            dctx,
+                            dst.as_mut_ptr().cast(),
+                            dst.len(),
+                            payload.as_ptr().cast(),
+                            payload.len(),
+                            f.as_ptr().cast(),
+                            f.len(),
+                        ),
+                        None => zs::ZSTD_decompressDCtx(
+                            dctx,
+                            dst.as_mut_ptr().cast(),
+                            dst.len(),
+                            payload.as_ptr().cast(),
+                            payload.len(),
+                        ),
+                    }
+                };
+                if unsafe { zs::ZSTD_isError(code) } != 0 {
                     let name = zstd_safe::get_error_name(code);
-                    Error::Format(format!("zstd decompress error: {name}"))
-                })
+                    return Err(Error::Format(format!("zstd decompress error: {name}")));
+                }
+                Ok(code)
             })?;
             if n != raw_len {
                 return Err(Error::Format("text pool page length mismatch".into()));
@@ -541,6 +624,10 @@ pub fn skip_leaf(cur: &mut Cursor<'_>) -> Result<usize> {
 // --- Integrity Hashes: XXH64, CRC32 (IEEE), and SHA-256 ---
 
 pub fn xxh64(data: &[u8], seed: u64) -> u64 {
+    xxh64_pair(data, &[], seed)
+}
+
+pub(crate) fn xxh64_pair(a: &[u8], b: &[u8], seed: u64) -> u64 {
     const P1: u64 = 11400714785074694791;
     const P2: u64 = 14029467366897019727;
     const P3: u64 = 1609587929392839161;
@@ -558,57 +645,83 @@ pub fn xxh64(data: &[u8], seed: u64) -> u64 {
         acc ^= round(0, val);
         acc.wrapping_mul(P1).wrapping_add(P4)
     }
+    #[inline(always)]
+    fn stripe(v: &mut [u64; 4], block: &[u8; 32]) {
+        v[0] = round(v[0], u64::from_le_bytes(block[0..8].try_into().unwrap()));
+        v[1] = round(v[1], u64::from_le_bytes(block[8..16].try_into().unwrap()));
+        v[2] = round(v[2], u64::from_le_bytes(block[16..24].try_into().unwrap()));
+        v[3] = round(v[3], u64::from_le_bytes(block[24..32].try_into().unwrap()));
+    }
 
-    let mut p = 0usize;
-    let len = data.len();
-    let mut h: u64 = if len >= 32 {
-        let mut v1 = seed.wrapping_add(P1).wrapping_add(P2);
-        let mut v2 = seed.wrapping_add(P2);
-        let mut v3 = seed;
-        let mut v4 = seed.wrapping_sub(P1);
-        while p + 32 <= len {
-            v1 = round(v1, u64::from_le_bytes(data[p..p + 8].try_into().unwrap()));
-            v2 = round(
-                v2,
-                u64::from_le_bytes(data[p + 8..p + 16].try_into().unwrap()),
-            );
-            v3 = round(
-                v3,
-                u64::from_le_bytes(data[p + 16..p + 24].try_into().unwrap()),
-            );
-            v4 = round(
-                v4,
-                u64::from_le_bytes(data[p + 24..p + 32].try_into().unwrap()),
-            );
-            p += 32;
+    let total_len = a.len() + b.len();
+    let mut rem_buf = [0u8; 64];
+    let mut rem_len = 0usize;
+    let mut h: u64 = if total_len >= 32 {
+        let mut v = [
+            seed.wrapping_add(P1).wrapping_add(P2),
+            seed.wrapping_add(P2),
+            seed,
+            seed.wrapping_sub(P1),
+        ];
+        let (a_chunks, a_tail) = a.as_chunks::<32>();
+        for c in a_chunks {
+            stripe(&mut v, c);
         }
-        let mut h = v1
+        let b_rest = if a_tail.is_empty() {
+            b
+        } else if a_tail.len() + b.len() >= 32 {
+            let need = 32 - a_tail.len();
+            let mut bridge = [0u8; 32];
+            bridge[..a_tail.len()].copy_from_slice(a_tail);
+            bridge[a_tail.len()..].copy_from_slice(&b[..need]);
+            stripe(&mut v, &bridge);
+            &b[need..]
+        } else {
+            rem_buf[..a_tail.len()].copy_from_slice(a_tail);
+            rem_buf[a_tail.len()..a_tail.len() + b.len()].copy_from_slice(b);
+            rem_len = a_tail.len() + b.len();
+            &[]
+        };
+        if rem_len == 0 {
+            let (b_chunks, b_tail) = b_rest.as_chunks::<32>();
+            for c in b_chunks {
+                stripe(&mut v, c);
+            }
+            rem_buf[..b_tail.len()].copy_from_slice(b_tail);
+            rem_len = b_tail.len();
+        }
+        let mut h = v[0]
             .rotate_left(1)
-            .wrapping_add(v2.rotate_left(7))
-            .wrapping_add(v3.rotate_left(12))
-            .wrapping_add(v4.rotate_left(18));
-        h = merge_round(h, v1);
-        h = merge_round(h, v2);
-        h = merge_round(h, v3);
-        merge_round(h, v4)
+            .wrapping_add(v[1].rotate_left(7))
+            .wrapping_add(v[2].rotate_left(12))
+            .wrapping_add(v[3].rotate_left(18));
+        h = merge_round(h, v[0]);
+        h = merge_round(h, v[1]);
+        h = merge_round(h, v[2]);
+        merge_round(h, v[3])
     } else {
+        rem_buf[..a.len()].copy_from_slice(a);
+        rem_buf[a.len()..total_len].copy_from_slice(b);
+        rem_len = total_len;
         seed.wrapping_add(P5)
     };
 
-    h = h.wrapping_add(len as u64);
-    while p + 8 <= len {
-        let k1 = round(0, u64::from_le_bytes(data[p..p + 8].try_into().unwrap()));
+    let tail = &rem_buf[..rem_len];
+    let mut p = 0usize;
+    h = h.wrapping_add(total_len as u64);
+    while p + 8 <= rem_len {
+        let k1 = round(0, u64::from_le_bytes(tail[p..p + 8].try_into().unwrap()));
         h ^= k1;
         h = h.rotate_left(27).wrapping_mul(P1).wrapping_add(P4);
         p += 8;
     }
-    if p + 4 <= len {
-        h ^= (u32::from_le_bytes(data[p..p + 4].try_into().unwrap()) as u64).wrapping_mul(P1);
+    if p + 4 <= rem_len {
+        h ^= (u32::from_le_bytes(tail[p..p + 4].try_into().unwrap()) as u64).wrapping_mul(P1);
         h = h.rotate_left(23).wrapping_mul(P2).wrapping_add(P3);
         p += 4;
     }
-    while p < len {
-        h ^= (data[p] as u64).wrapping_mul(P5);
+    while p < rem_len {
+        h ^= (tail[p] as u64).wrapping_mul(P5);
         h = h.rotate_left(11).wrapping_mul(P1);
         p += 1;
     }
@@ -619,14 +732,26 @@ pub fn xxh64(data: &[u8], seed: u64) -> u64 {
     h ^ (h >> 32)
 }
 
+const CRC32_TABLE: [u32; 256] = {
+    let mut t = [0u32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut c = i as u32;
+        let mut j = 0;
+        while j < 8 {
+            c = (c >> 1) ^ (0xedb8_8320 & (c & 1).wrapping_neg());
+            j += 1;
+        }
+        t[i] = c;
+        i += 1;
+    }
+    t
+};
+
 pub fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xffff_ffffu32;
     for &b in data {
-        crc ^= b as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-        }
+        crc = CRC32_TABLE[((crc ^ b as u32) & 0xff) as usize] ^ (crc >> 8);
     }
     !crc
 }

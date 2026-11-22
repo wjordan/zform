@@ -47,9 +47,34 @@ pub const ESCAPES: u32 = 1 << 26;
 pub const ANY_LETTERS: u32 = (1 << 27) - 1;
 
 /// The letters of `text`, as `ColSummary::letters` holds them.
+#[inline]
 pub fn letters_of(text: &[u8]) -> u32 {
+    const HI: u64 = 0x8080_8080_8080_8080;
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const BS: u64 = LO * (b'\\' as u64);
     let mut mask = 0u32;
-    for &b in text {
+    let (chunks, tail) = text.as_chunks::<8>();
+    for &c in chunks {
+        let w = u64::from_le_bytes(c);
+        let x = w | 0x2020_2020_2020_2020;
+        let y = x & !HI;
+        let letters = (y + 0x1f1f_1f1f_1f1f_1f1f) & !(y + 0x0505_0505_0505_0505) & !x & HI;
+        let bs = (w ^ BS).wrapping_sub(LO) & !(w ^ BS) & HI;
+        if (letters | bs) == 0 {
+            continue;
+        }
+        if bs != 0 {
+            mask |= ESCAPES;
+        }
+        let mut m = letters;
+        while m != 0 {
+            let idx = (m.trailing_zeros() >> 3) as usize;
+            m &= m - 1;
+            let l = (c[idx] | 0x20).wrapping_sub(b'a');
+            mask |= 1u32 << l;
+        }
+    }
+    for &b in tail {
         let l = (b | 0x20).wrapping_sub(b'a');
         if l < 26 {
             mask |= 1 << l;
@@ -62,17 +87,27 @@ pub fn letters_of(text: &[u8]) -> u32 {
 
 /// Bounds of a column whose every value is a timestamp, bare or as a JSON string.
 pub(crate) fn time_bounds(vals: &[&[u8]]) -> Option<(i64, i64)> {
-    let mut times = vals.iter().map(|v| {
+    let parse = |v: &[u8]| {
         let v = v
             .strip_prefix(b"\"")
             .and_then(|v| v.strip_suffix(b"\""))
             .unwrap_or(v);
         parse_timestamp(v).map(|(ns, _)| ns)
-    });
-    let first = times.next()??;
-    times.try_fold((first, first), |(lo, hi), v| {
-        v.map(|v| (lo.min(v), hi.max(v)))
-    })
+    };
+    let (&first_slice, rest) = vals.split_first()?;
+    let first = parse(first_slice)?;
+    let (mut lo, mut hi) = (first, first);
+    let mut prev = first_slice;
+    for &s in rest {
+        if s == prev {
+            continue;
+        }
+        prev = s;
+        let v = parse(s)?;
+        lo = lo.min(v);
+        hi = hi.max(v);
+    }
+    Some((lo, hi))
 }
 
 /// Bounds of a column whose every value is an exact integer.
@@ -100,19 +135,39 @@ pub(crate) fn int_bounds(vals: &[&[u8]]) -> Option<(i64, i64)> {
             false => i64::try_from(u).ok(),
         }
     };
-    let mut ints = vals.iter().map(|v| value(v));
-    let first = ints.next()??;
-    ints.try_fold((first, first), |(lo, hi), v| {
-        v.map(|v| (lo.min(v), hi.max(v)))
-    })
+    let (&first_slice, rest) = vals.split_first()?;
+    let first = value(first_slice)?;
+    let (mut lo, mut hi) = (first, first);
+    let mut prev = first_slice;
+    for &s in rest {
+        if s == prev {
+            continue;
+        }
+        prev = s;
+        let v = value(s)?;
+        lo = lo.min(v);
+        hi = hi.max(v);
+    }
+    Some((lo, hi))
 }
 
 impl ColSummary {
     pub fn of(vals: &[&[u8]]) -> Self {
-        let letters = vals.iter().fold(0, |m, v| m | letters_of(v));
+        let mut mask = 0u32;
+        let mut prev: Option<&[u8]> = None;
+        for &v in vals {
+            if prev == Some(v) {
+                continue;
+            }
+            prev = Some(v);
+            mask |= letters_of(v);
+            if mask == ANY_LETTERS {
+                break;
+            }
+        }
         Self {
             all_null: vals.is_empty(),
-            letters,
+            letters: mask,
             ..Self::default()
         }
     }
@@ -133,13 +188,7 @@ pub fn encode_u32_seq(vals: &[u32], backend: EntropyBackend, level: i32, out: &m
 /// Decodes a self-delimited `u32` sequence written by [`encode_u32_seq`].
 pub fn decode_u32_seq(cur: &mut Cursor<'_>, budget: &DecodeBudget) -> Result<Vec<u32>> {
     let stream = IntStream::decode_wire(cur, budget, 0)?;
-    let ints = stream.unpack(budget)?;
-    let mut out = Vec::with_capacity(ints.len());
-    for v in ints {
-        let u = u32::try_from(v).map_err(|_| Error::Format("u32_seq value out of range".into()))?;
-        out.push(u);
-    }
-    Ok(out)
+    stream.unpack_u32(budget)
 }
 
 /// Standalone column-slice encoder used by model training (`plan.rs`) and nested-plan fallbacks.
@@ -252,6 +301,40 @@ pub fn encode_dense_block_columns(
     )
 }
 
+/// Internal variant of [`encode_dense_block_columns`] with `sample_only` and optional structural
+/// substring `filter` feeding.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_dense_block_columns_opts(
+    occ_streams: &[Vec<&[u8]>],
+    dict_groups: &[&str],
+    horiz_cands: &[Vec<usize>],
+    preencoded_nested: &mut [Option<(ColSummary, Vec<u8>)>],
+    standalone: &[bool],
+    layout: Option<(&ModelPlan, &[u32])>,
+    paging: Option<crate::packs::Paging<'_>>,
+    packs: &PackRegistry,
+    backend: EntropyBackend,
+    level: i32,
+    picks: Option<&[crate::packs::Pick]>,
+    sample_only: bool,
+    filter: Option<(&mut crate::index::FilterBuilder, &[bool])>,
+) -> EncodedDenseBlock {
+    packs.encode_dense_block_with_opts(
+        occ_streams,
+        dict_groups,
+        horiz_cands,
+        preencoded_nested,
+        standalone,
+        layout,
+        paging,
+        backend,
+        level,
+        picks,
+        sample_only,
+        filter,
+    )
+}
+
 /// A block's text pool as a reader holds it.
 pub enum PoolParts<'a> {
     Leaf(&'a [u8]),
@@ -315,19 +398,45 @@ pub fn align_cells(
         .collect();
     let mut out = Vec::with_capacity(variant_ids.len());
     let mut k = 0i64;
-    for &v in variant_ids {
-        let &(nk, na) = counts
-            .get(v as usize)
-            .ok_or_else(|| Error::Format("variant id out of range".into()))?;
-        if na != 0 {
-            if na == u32::MAX {
-                return Err(Error::Format(
-                    "ExtAlign record has no placed key cell".into(),
-                ));
+    let no_err_simple = counts.iter().all(|&(_, na)| na <= 1);
+    if no_err_simple {
+        let ptr: *mut i64 = out.as_mut_ptr();
+        let mut len = 0usize;
+        let n_counts = counts.len();
+        for &v in variant_ids {
+            let vi = v as usize;
+            if vi >= n_counts {
+                return Err(Error::Format("variant id out of range".into()));
             }
-            out.extend(std::iter::repeat_n(k, na as usize));
+            let (nk, na) = counts[vi];
+            // SAFETY: `len <= i < variant_ids.len() <= out.capacity()`, and `na` is 0 or 1.
+            unsafe {
+                *ptr.add(len) = k;
+            }
+            len += na as usize;
+            k += nk;
         }
-        k += nk;
+        // SAFETY: every slot in `0..len` was written above.
+        unsafe {
+            out.set_len(len);
+        }
+    } else {
+        for &v in variant_ids {
+            let &(nk, na) = counts
+                .get(v as usize)
+                .ok_or_else(|| Error::Format("variant id out of range".into()))?;
+            if na != 0 {
+                if na == u32::MAX {
+                    return Err(Error::Format(
+                        "ExtAlign record has no placed key cell".into(),
+                    ));
+                }
+                for _ in 0..na {
+                    out.push(k);
+                }
+            }
+            k += nk;
+        }
     }
     Ok(out)
 }

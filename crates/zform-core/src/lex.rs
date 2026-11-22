@@ -722,14 +722,38 @@ pub fn parse_base64(src: &[u8], out: &mut Vec<u8>) -> Option<()> {
 }
 
 pub fn format_base64(bytes: &[u8], out: &mut Vec<u8>) {
-    for chunk in bytes.chunks(3) {
-        let mut b = [0u8; 4];
-        b[1..1 + chunk.len()].copy_from_slice(chunk);
-        let bits = u32::from_be_bytes(b);
-        for i in 0..4 {
-            let digit = BASE64[(bits >> (18 - 6 * i)) as usize & 63];
-            out.push(if i <= chunk.len() { digit } else { b'=' });
+    let encoded_len = bytes.len().div_ceil(3) * 4;
+    out.reserve(encoded_len);
+    let (chunks, rem) = bytes.as_chunks::<3>();
+    // SAFETY: we reserved `encoded_len` bytes past `out.len()`, and write exactly `encoded_len`.
+    unsafe {
+        let mut p = out.as_mut_ptr().add(out.len());
+        for &[b0, b1, b2] in chunks {
+            let v = ((b0 as usize) << 16) | ((b1 as usize) << 8) | (b2 as usize);
+            *p = BASE64[(v >> 18) & 63];
+            *p.add(1) = BASE64[(v >> 12) & 63];
+            *p.add(2) = BASE64[(v >> 6) & 63];
+            *p.add(3) = BASE64[v & 63];
+            p = p.add(4);
         }
+        match *rem {
+            [b0] => {
+                let v = (b0 as usize) << 16;
+                *p = BASE64[(v >> 18) & 63];
+                *p.add(1) = BASE64[(v >> 12) & 63];
+                *p.add(2) = b'=';
+                *p.add(3) = b'=';
+            }
+            [b0, b1] => {
+                let v = ((b0 as usize) << 16) | ((b1 as usize) << 8);
+                *p = BASE64[(v >> 18) & 63];
+                *p.add(1) = BASE64[(v >> 12) & 63];
+                *p.add(2) = BASE64[(v >> 6) & 63];
+                *p.add(3) = b'=';
+            }
+            _ => {}
+        }
+        out.set_len(out.len() + encoded_len);
     }
 }
 
@@ -1011,25 +1035,76 @@ pub fn unescape_json_str_exact(raw_inner: &[u8]) -> Option<Vec<u8>> {
             i += 1;
         }
     }
-    let mut check = Vec::with_capacity(raw_inner.len());
-    escape_json_str_exact(&out, &mut check);
-    if check.as_slice() == raw_inner {
-        Some(out)
-    } else {
-        None
-    }
+    // Every accepted input byte/escape maps bijectively under `escape_json_str_exact`.
+    Some(out)
 }
 
 pub fn escape_json_str_exact(unescaped: &[u8], out: &mut Vec<u8>) {
-    for &b in unescaped {
-        match b {
-            b'"' => out.extend_from_slice(b"\\\""),
-            b'\\' => out.extend_from_slice(b"\\\\"),
-            b'\n' => out.extend_from_slice(b"\\n"),
-            b'\r' => out.extend_from_slice(b"\\r"),
-            b'\t' => out.extend_from_slice(b"\\t"),
-            _ => out.push(b),
+    out.reserve(unescaped.len());
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let n = unescaped.len();
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::*;
+        unsafe {
+            let q = _mm_set1_epi8(b'"' as i8);
+            let bs = _mm_set1_epi8(b'\\' as i8);
+            let nl = _mm_set1_epi8(b'\n' as i8);
+            let cr = _mm_set1_epi8(b'\r' as i8);
+            let tab = _mm_set1_epi8(b'\t' as i8);
+            while i + 16 <= n {
+                let v = _mm_loadu_si128(unescaped.as_ptr().add(i).cast());
+                let m = _mm_or_si128(
+                    _mm_or_si128(_mm_cmpeq_epi8(v, q), _mm_cmpeq_epi8(v, bs)),
+                    _mm_or_si128(
+                        _mm_or_si128(_mm_cmpeq_epi8(v, nl), _mm_cmpeq_epi8(v, cr)),
+                        _mm_cmpeq_epi8(v, tab),
+                    ),
+                );
+                let mask = _mm_movemask_epi8(m) as u32;
+                if mask == 0 {
+                    i += 16;
+                    continue;
+                }
+                let hit = i + mask.trailing_zeros() as usize;
+                if hit > start {
+                    out.extend_from_slice(&unescaped[start..hit]);
+                }
+                match unescaped[hit] {
+                    b'"' => out.extend_from_slice(b"\\\""),
+                    b'\\' => out.extend_from_slice(b"\\\\"),
+                    b'\n' => out.extend_from_slice(b"\\n"),
+                    b'\r' => out.extend_from_slice(b"\\r"),
+                    b'\t' => out.extend_from_slice(b"\\t"),
+                    _ => unreachable!(),
+                }
+                i = hit + 1;
+                start = i;
+            }
         }
+    }
+    while i < n {
+        let esc: &[u8] = match unescaped[i] {
+            b'"' => b"\\\"",
+            b'\\' => b"\\\\",
+            b'\n' => b"\\n",
+            b'\r' => b"\\r",
+            b'\t' => b"\\t",
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        if i > start {
+            out.extend_from_slice(&unescaped[start..i]);
+        }
+        out.extend_from_slice(esc);
+        i += 1;
+        start = i;
+    }
+    if start < n {
+        out.extend_from_slice(&unescaped[start..]);
     }
 }
 

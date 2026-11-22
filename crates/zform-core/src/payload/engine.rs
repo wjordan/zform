@@ -667,23 +667,111 @@ impl<'p> CompiledProgram<'p> {
                     }
                 }
             }
-            let cols: Vec<(&[T], &[u8])> = (sinks.iter().zip(lens.chunks_exact(nc)))
-                .map(|(&(v, _), w)| (col(v), &w[..n]))
-                .collect();
-            for r in 0..n {
-                for &(x, w) in &cols {
-                    let (x, w) = (x[r], w[r] as usize);
-                    // Store a whole lane where it fits and advance by the sink's width.
-                    if pos + T::BYTES <= out.len() {
-                        out[pos..pos + T::BYTES]
-                            .copy_from_slice(&x.u64().to_le_bytes()[..T::BYTES]);
-                    } else {
-                        out[pos..pos + w].copy_from_slice(&x.u64().to_le_bytes()[..w]);
-                    }
-                    pos += w;
+            // Keep sink slices on the stack for the common <=8-sink case (no per-chunk Vec alloc).
+            let mut stack_cols: [(&[T], &[u8]); 8] = [(&[], &[]); 8];
+            let mut heap_cols = Vec::new();
+            let cols: &[(&[T], &[u8])] = if sinks.len() <= 8 {
+                for (dst, (&(v, _), w)) in stack_cols
+                    .iter_mut()
+                    .zip(sinks.iter().zip(lens.chunks_exact(nc)))
+                {
+                    *dst = (col(v), &w[..n]);
                 }
-                if let Some(e) = ends.as_deref_mut() {
+                &stack_cols[..sinks.len()]
+            } else {
+                heap_cols.extend(
+                    sinks
+                        .iter()
+                        .zip(lens.chunks_exact(nc))
+                        .map(|(&(v, _), w)| (col(v), &w[..n])),
+                );
+                &heap_cols
+            };
+            let max_row = sinks.len() * T::BYTES;
+            let out_len = out.len();
+            // Fast path when `out` has room for full-lane stores without checking per sink.
+            let safe_limit = out_len.checked_sub(max_row + T::BYTES);
+            let mut r = 0usize;
+            if let Some(e) = ends.as_deref_mut() {
+                if let Some(safe_limit) = safe_limit {
+                    if cols.len() == 1 {
+                        let (xs, ws) = cols[0];
+                        while r < n && pos <= safe_limit {
+                            let w = ws[r] as usize;
+                            // SAFETY: `pos + T::BYTES <= out_len` holds because `pos <= safe_limit`.
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    xs[r].u64().to_le_bytes().as_ptr(),
+                                    out.as_mut_ptr().add(pos),
+                                    T::BYTES,
+                                );
+                            }
+                            pos += w;
+                            e[row + r] = pos as u32;
+                            r += 1;
+                        }
+                    } else {
+                        while r < n && pos <= safe_limit {
+                            for &(xs, ws) in cols {
+                                let w = ws[r] as usize;
+                                // SAFETY: `pos + T::BYTES <= out_len` throughout the row.
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        xs[r].u64().to_le_bytes().as_ptr(),
+                                        out.as_mut_ptr().add(pos),
+                                        T::BYTES,
+                                    );
+                                }
+                                pos += w;
+                            }
+                            e[row + r] = pos as u32;
+                            r += 1;
+                        }
+                    }
+                }
+                while r < n {
+                    for &(xs, ws) in cols {
+                        let (x, w) = (xs[r], ws[r] as usize);
+                        if pos + T::BYTES <= out_len {
+                            out[pos..pos + T::BYTES]
+                                .copy_from_slice(&x.u64().to_le_bytes()[..T::BYTES]);
+                        } else {
+                            out[pos..pos + w].copy_from_slice(&x.u64().to_le_bytes()[..w]);
+                        }
+                        pos += w;
+                    }
                     e[row + r] = pos as u32;
+                    r += 1;
+                }
+            } else {
+                if let Some(safe_limit) = safe_limit {
+                    while r < n && pos <= safe_limit {
+                        for &(xs, ws) in cols {
+                            let w = ws[r] as usize;
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    xs[r].u64().to_le_bytes().as_ptr(),
+                                    out.as_mut_ptr().add(pos),
+                                    T::BYTES,
+                                );
+                            }
+                            pos += w;
+                        }
+                        r += 1;
+                    }
+                }
+                while r < n {
+                    for &(xs, ws) in cols {
+                        let (x, w) = (xs[r], ws[r] as usize);
+                        if pos + T::BYTES <= out_len {
+                            out[pos..pos + T::BYTES]
+                                .copy_from_slice(&x.u64().to_le_bytes()[..T::BYTES]);
+                        } else {
+                            out[pos..pos + w].copy_from_slice(&x.u64().to_le_bytes()[..w]);
+                        }
+                        pos += w;
+                    }
+                    r += 1;
                 }
             }
         });

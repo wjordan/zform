@@ -1,11 +1,11 @@
 //! The `ZFM1` framed stream, which is a file's data region. A frame carries a model, or reuses the
 //! previous frame's, and self-contained blocks. The encoder collects the index region as it goes.
 
-use crate::cells::{Cells, Col, underflow};
+use crate::cells::{Cells, Col, FastBuf, FastCol, underflow};
 use crate::codecs::{
     ANY_LETTERS, BlockDecodeCtx, ColSummary, PoolParts, Seeds, column_deps, decode_present_slice,
-    decode_u32_seq, encode_dense_block_columns, encode_present_slice, encode_u32_seq,
-    ensure_dense_block_column, with_seeds,
+    decode_u32_seq, encode_dense_block_columns_opts, encode_present_slice, encode_u32_seq,
+    ensure_dense_block_column, letters_of, with_seeds,
 };
 use crate::dictionary::{Dictionary, DictionaryBuilder, Scope};
 use crate::framing::{
@@ -13,16 +13,19 @@ use crate::framing::{
 };
 use crate::grammar::{
     BlockReconstructor, ModelPlan, OccRef, PlanVariant, SplitResult, split_records_with_plan,
+    split_records_with_plan_opts,
 };
 use crate::index::{
     BlockDir, BlockKind, ColEntry, FilterBuilder, INDEX_MAGIC, IndexBuilder, KIND_JSON,
     KIND_RESIDUAL, KIND_SHAPE, KIND_SHAPE_CELL, page_filter_page,
 };
-use crate::json_tree::{decode_json_struct_streams, encode_json_struct_streams};
+use crate::json_tree::{
+    CandFilter, JsonCand, SlotKind, decode_json_struct_streams, encode_json_struct_streams,
+};
 use crate::lex::parse_base64;
 use crate::order::{OrderReader, OrderSink, Restore};
 use crate::packs::{EncodedDenseBlock, PackRegistry, Paging};
-use crate::payload::graph::{NESTED_COLUMN_TAG, PayloadGraph};
+use crate::payload::graph::NESTED_COLUMN_TAG;
 use crate::payload::library::{Harvest, Library, with_code_pricing};
 use crate::plan::{ProbeBackoff, Profile, TrainOptions, sample_strided, train_from_records};
 use crate::tables::Tables;
@@ -1066,35 +1069,27 @@ pub(crate) struct PendingBlock {
     residual_bytes: usize,
     /// Filter page, row kinds and row count, when a filter size was given.
     index: Option<(Vec<u8>, u16, usize)>,
+    /// Set when `relevel` mutated `enc.*_graphs` in place so `finish` re-encodes them once.
+    releveled: bool,
 }
 
 impl PendingBlock {
-    /// The payloads that are column graphs: the shared dictionaries and every column but the
-    /// nested ones, which hold blocks of their own.
-    fn graphs<'a>(&'a mut self, plan: &'a ModelPlan) -> impl Iterator<Item = &'a mut Vec<u8>> {
-        let cols = self
-            .enc
-            .col_blobs
-            .iter_mut()
-            .zip(&plan.columns)
-            .filter(|(_, c)| c.nested_plan.is_none())
-            .map(|(b, _)| b);
-        self.enc.shared_dict_blobs.iter_mut().chain(cols)
-    }
-
     /// Recompresses the leaves the column search priced at a cheaper level than `level`.
     fn relevel(&mut self, plan: &ModelPlan, backend: EntropyBackend, level: i32) {
         if crate::payload::graph::search_level(level) == level {
             return;
         }
-        let budget = DecodeBudget::default();
-        for blob in self.graphs(plan) {
-            if let Ok(mut g) = PayloadGraph::decode(blob, &budget)
-                && g.relevel(backend, level).is_ok()
+        for g in self.enc.shared_dict_graphs.iter_mut().flatten() {
+            let _ = g.relevel(backend, level);
+        }
+        for (g_opt, c) in self.enc.col_graphs.iter_mut().zip(&plan.columns) {
+            if c.nested_plan.is_none()
+                && let Some(g) = g_opt
             {
-                *blob = g.encode();
+                let _ = g.relevel(backend, level);
             }
         }
+        self.releveled = true;
         if let [pl] = self.enc.pool_pages.as_mut_slice()
             && let Ok(l) = crate::payload::graph::relevel_leaf(pl, backend, level, true)
         {
@@ -1103,8 +1098,15 @@ impl PendingBlock {
     }
 
     fn harvest(&mut self, plan: &ModelPlan, into: &mut Harvest) {
-        for blob in self.graphs(plan) {
-            into.add_blob(blob);
+        for g in self.enc.shared_dict_graphs.iter().flatten() {
+            into.add_graph(g);
+        }
+        for (g_opt, c) in self.enc.col_graphs.iter().zip(&plan.columns) {
+            if c.nested_plan.is_none()
+                && let Some(g) = g_opt
+            {
+                into.add_graph(g);
+            }
         }
     }
 
@@ -1116,13 +1118,34 @@ impl PendingBlock {
         backend: EntropyBackend,
         level: i32,
     ) -> EncodedBlock {
-        if !lib.is_empty() {
-            let budget = DecodeBudget::default();
-            for blob in self.graphs(plan) {
-                if let Ok(g) = PayloadGraph::decode(blob, &budget)
-                    && g.has_code()
+        let lib_opt = (!lib.is_empty()).then_some(lib);
+        if self.releveled || lib_opt.is_some() {
+            for (blob, g_opt) in self
+                .enc
+                .shared_dict_blobs
+                .iter_mut()
+                .zip(&self.enc.shared_dict_graphs)
+            {
+                if let Some(g) = g_opt
+                    && (self.releveled || (lib_opt.is_some() && g.has_code()))
                 {
-                    *blob = g.encode_linked(Some(lib));
+                    *blob = g.encode_linked(lib_opt);
+                }
+            }
+            for ((blob, g_opt), c) in self
+                .enc
+                .col_blobs
+                .iter_mut()
+                .zip(&self.enc.col_graphs)
+                .zip(&plan.columns)
+            {
+                if c.nested_plan.is_some() {
+                    continue;
+                }
+                if let Some(g) = g_opt
+                    && (self.releveled || (lib_opt.is_some() && g.has_code()))
+                {
+                    *blob = g.encode_linked(lib_opt);
                 }
             }
         }
@@ -1134,6 +1157,7 @@ impl PendingBlock {
             residual_rows,
             residual_bytes,
             index,
+            releveled: _,
         } = self;
         put_uvarint(&mut out, enc.shared_dict_blobs.len() as u64);
         for db in &enc.shared_dict_blobs {
@@ -1212,6 +1236,199 @@ impl PendingBlock {
     }
 }
 
+/// Attempts to populate the fixed structural pieces of a block substring filter (used shape
+/// literals, boundary-safe `JsonCand` literals, and raw slices captured during split).
+/// Returns `Some(fb)` iff every used variant/shape/candidate has non-letter boundaries so adding
+/// column values afterwards is 100% bit-exact with scanning every raw record.
+fn try_structural_filter_head(
+    plan: &ModelPlan,
+    split: &SplitResult<'_>,
+    bits: usize,
+) -> Option<FilterBuilder> {
+    if split.json_filter_unsafe {
+        return None;
+    }
+    let mut used_variants = vec![false; plan.variants.len()];
+    for &v in &split.variant_ids {
+        let vi = v as usize;
+        if vi >= used_variants.len() {
+            return None;
+        }
+        used_variants[vi] = true;
+    }
+
+    // Phase A: verify boundary safety before mutating anything.
+    let mut json_used_shapes: Vec<u64> = Vec::new();
+    let mut json_used_sels: Vec<u8> = Vec::new();
+    for (vi, used) in used_variants.iter().copied().enumerate() {
+        if !used {
+            continue;
+        }
+        match &plan.variants[vi] {
+            PlanVariant::Shape(shape) => {
+                let k = shape.slots.len();
+                if shape.literals.len() != k + 1 {
+                    return None;
+                }
+                for j in 0..k {
+                    let left_ok = (j == 0 && shape.literals[0].is_empty())
+                        || shape.literals[j]
+                            .last()
+                            .is_some_and(|b| !b.is_ascii_alphabetic());
+                    let right_ok = (j + 1 == k && shape.literals[k].is_empty())
+                        || shape.literals[j + 1]
+                            .first()
+                            .is_some_and(|b| !b.is_ascii_alphabetic());
+                    if !left_ok || !right_ok {
+                        return None;
+                    }
+                }
+            }
+            PlanVariant::ShapeCell { .. } => return None,
+            PlanVariant::JsonTree => {
+                let jt = plan.json_tree.as_ref()?;
+                json_used_shapes.resize(jt.paths.len(), 0);
+                json_used_sels.resize(jt.paths.len(), 0);
+                for (pi, pdef) in jt.paths.iter().enumerate() {
+                    if !pdef.shapes.is_empty() {
+                        let stream = split.json_struct_streams.get(pdef.shape_stream as usize)?;
+                        let mut mask = 0u64;
+                        let mut saw_zero = false;
+                        for &sid in stream {
+                            if sid == 0 {
+                                saw_zero = true;
+                            } else if (sid as usize) <= pdef.shapes.len() && sid <= 64 {
+                                mask |= 1u64 << (sid - 1);
+                            } else {
+                                return None;
+                            }
+                        }
+                        if saw_zero && pdef.value_col == u16::MAX {
+                            return None;
+                        }
+                        let mut m = mask;
+                        while m != 0 {
+                            let si = m.trailing_zeros() as usize;
+                            m &= m - 1;
+                            let sh = &pdef.shapes[si];
+                            let n = sh.len();
+                            if n == 0 || sh[n - 1].kind != SlotKind::None {
+                                return None;
+                            }
+                            for j in 0..n - 1 {
+                                let left_ok = (j == 0 && sh[0].literal.is_empty())
+                                    || sh[j]
+                                        .literal
+                                        .last()
+                                        .is_some_and(|b| !b.is_ascii_alphabetic());
+                                let right_ok = (j + 1 == n - 1 && sh[n - 1].literal.is_empty())
+                                    || sh[j + 1]
+                                        .literal
+                                        .first()
+                                        .is_some_and(|b| !b.is_ascii_alphabetic());
+                                if !left_ok || !right_ok {
+                                    return None;
+                                }
+                                if sh[j].kind == SlotKind::Array
+                                    && (sh[j].sep.is_empty() || letters_of(&sh[j].sep) != 0)
+                                {
+                                    return None;
+                                }
+                            }
+                        }
+                        json_used_shapes[pi] = mask;
+                    }
+                    if !pdef.cands.is_empty() {
+                        let stream = split.json_struct_streams.get(pdef.sel_stream as usize)?;
+                        let mut mask = 0u8;
+                        for &sel in stream {
+                            if sel == 0 {
+                                if pdef.value_col == u16::MAX {
+                                    return None;
+                                }
+                            } else if (sel as usize) <= pdef.cands.len() && sel <= 8 {
+                                mask |= 1u8 << (sel - 1);
+                            } else {
+                                return None;
+                            }
+                        }
+                        json_used_sels[pi] = mask;
+                    }
+                }
+            }
+        }
+    }
+
+    // Phase B: all used structural boundaries are non-letter safe; add literals once per block!
+    let mut fb = FilterBuilder::new(bits);
+    for (vi, used) in used_variants.iter().copied().enumerate() {
+        if !used {
+            continue;
+        }
+        match &plan.variants[vi] {
+            PlanVariant::Shape(shape) => {
+                for lit in &shape.literals {
+                    if !lit.is_empty() {
+                        fb.add_text(lit);
+                    }
+                }
+            }
+            PlanVariant::JsonTree => {
+                let jt = plan.json_tree.as_ref().unwrap();
+                for (pi, pdef) in jt.paths.iter().enumerate() {
+                    let mut sm = json_used_shapes[pi];
+                    while sm != 0 {
+                        let si = sm.trailing_zeros() as usize;
+                        sm &= sm - 1;
+                        for part in &pdef.shapes[si] {
+                            if !part.literal.is_empty() {
+                                fb.add_text(&part.literal);
+                            }
+                        }
+                    }
+                    if !jt.runtime.path_raw_filter[pi] {
+                        let mut cm = json_used_sels[pi];
+                        while cm != 0 {
+                            let ci = cm.trailing_zeros() as usize;
+                            cm &= cm - 1;
+                            if jt.runtime.cand_filter[pi][ci] == CandFilter::Safe {
+                                match &pdef.cands[ci] {
+                                    JsonCand::Copy { .. } => {}
+                                    JsonCand::Affix { prefix, suffix, .. } => {
+                                        if !prefix.is_empty() {
+                                            fb.add_text(prefix);
+                                        }
+                                        if !suffix.is_empty() {
+                                            fb.add_text(suffix);
+                                        }
+                                    }
+                                    JsonCand::MultiConcat { lits, .. } => {
+                                        for l in lits {
+                                            if !l.is_empty() {
+                                                fb.add_text(l);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            PlanVariant::ShapeCell { .. } => unreachable!(),
+        }
+    }
+    let mut prev: Option<&[u8]> = None;
+    for &s in &split.extra_filter_slices {
+        if prev == Some(s) {
+            continue;
+        }
+        prev = Some(s);
+        fb.add_text(s);
+    }
+    Some(fb)
+}
+
 /// Splits `recs` into columns and encodes each, under the code pricing in effect.
 fn encode_block_columns(
     recs: &[&[u8]],
@@ -1222,17 +1439,40 @@ fn encode_block_columns(
     filter_bits: Option<usize>,
     page_bytes: usize,
 ) -> PendingBlock {
+    encode_block_columns_opts(
+        recs,
+        plan,
+        packs,
+        backend,
+        level,
+        filter_bits,
+        page_bytes,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_block_columns_opts(
+    recs: &[&[u8]],
+    plan: &ModelPlan,
+    packs: &PackRegistry,
+    backend: EntropyBackend,
+    level: i32,
+    filter_bits: Option<usize>,
+    page_bytes: usize,
+    sample_only: bool,
+) -> PendingBlock {
     // A large block is searched in full on rows from its middle; the block's columns then try
     // what won there, which they would mostly pick again at many times the search.
-    let picks = (recs.len() >= 4 * SAMPLE_ROWS).then(|| {
+    let picks = (!sample_only && recs.len() >= 4 * SAMPLE_ROWS).then(|| {
         let sample = &recs[(recs.len() - SAMPLE_ROWS) / 2..][..SAMPLE_ROWS];
         let quiet = packs.for_sample();
-        encode_block_columns(sample, plan, &quiet, backend, level, None, 0)
+        encode_block_columns_opts(sample, plan, &quiet, backend, level, None, 0, true)
             .enc
             .picks
     });
     let _mixing = packs.encoding_scope();
-    let split = split_records_with_plan(recs, plan);
+    let split = split_records_with_plan_opts(recs, plan, filter_bits.is_some());
     let n_cols = plan.columns.len();
 
     // Materialize dense `&[u8]` occurrence streams into `split` + `split.scratch`
@@ -1252,15 +1492,20 @@ fn encode_block_columns(
     let mut preencoded_nested: Vec<Option<(ColSummary, Vec<u8>)>> = vec![None; n_cols];
     for cid in 0..n_cols {
         if let Some(child_plan) = &plan.columns[cid].nested_plan {
-            let is_json_tagged = plan.columns[cid].name.starts_with("$.");
-            preencoded_nested[cid] = Some(encode_nested_column_tagged(
-                &occ_views[cid],
-                is_json_tagged,
-                child_plan,
-                packs,
-                backend,
-                level,
-            ));
+            if sample_only {
+                // Phase 1 only checks `.is_some()` for nested columns; skip recursive encoding.
+                preencoded_nested[cid] = Some((ColSummary::default(), Vec::new()));
+            } else {
+                let is_json_tagged = plan.columns[cid].name.starts_with("$.");
+                preencoded_nested[cid] = Some(encode_nested_column_tagged(
+                    &occ_views[cid],
+                    is_json_tagged,
+                    child_plan,
+                    packs,
+                    backend,
+                    level,
+                ));
+            }
         }
     }
 
@@ -1283,14 +1528,31 @@ fn encode_block_columns(
         }
     }
 
+    let mut struct_fb = filter_bits.and_then(|bits| try_structural_filter_head(plan, &split, bits));
+    let mut skip_col_filter = vec![false; n_cols];
+    if struct_fb.is_some() {
+        for (cid, col) in plan.columns.iter().enumerate() {
+            if col.nested_plan.is_some() && col.name.starts_with("$.") {
+                skip_col_filter[cid] = true;
+            }
+        }
+        if let Some(jt) = &plan.json_tree {
+            for (pi, pdef) in jt.paths.iter().enumerate() {
+                if jt.runtime.path_raw_filter[pi] && pdef.value_col != u16::MAX {
+                    skip_col_filter[pdef.value_col as usize] = true;
+                }
+            }
+        }
+    }
+
     let cell_rows = |want: &[bool]| {
         crate::query::cell_rows(plan, &split.json_struct_streams, &split.variant_ids, want).ok()
     };
-    let paging = (page_bytes > 0).then_some(Paging {
+    let paging = (!sample_only && page_bytes > 0).then_some(Paging {
         page_bytes,
         cell_rows: &cell_rows,
     });
-    let enc = encode_dense_block_columns(
+    let enc = encode_dense_block_columns_opts(
         &occ_views,
         &dict_groups,
         &horiz_cands,
@@ -1302,7 +1564,24 @@ fn encode_block_columns(
         backend,
         level,
         picks.as_deref(),
+        sample_only,
+        struct_fb
+            .as_mut()
+            .map(|fb| (fb, skip_col_filter.as_slice())),
     );
+
+    if sample_only {
+        return PendingBlock {
+            out: Vec::new(),
+            dir: BlockDir::default(),
+            enc,
+            per_row: Vec::new(),
+            residual_rows: 0,
+            residual_bytes: 0,
+            index: None,
+            releveled: false,
+        };
+    }
 
     // Layout: row structure, shared dictionaries, text pool, column lengths, columns.
     let mut out = Vec::new();
@@ -1320,11 +1599,32 @@ fn encode_block_columns(
     }
     dir.struct_len = out.len() as u32;
     let index = filter_bits.map(|bits| {
-        let mut fb = FilterBuilder::new(bits);
-        for r in recs {
-            fb.add_text(r);
-        }
-        (fb.finish(), row_kinds(plan, &split.variant_ids), recs.len())
+        let filter = if let Some(mut fb) = struct_fb {
+            for cid in 0..n_cols {
+                if skip_col_filter[cid] || enc.filtered_cols.get(cid).copied().unwrap_or(false) {
+                    continue;
+                }
+                if (enc.summaries[cid].letters & 0x03ff_ffff) == 0 {
+                    continue;
+                }
+                let mut prev: Option<&[u8]> = None;
+                for &v in &occ_views[cid] {
+                    if prev == Some(v) {
+                        continue;
+                    }
+                    prev = Some(v);
+                    fb.add_text(v);
+                }
+            }
+            fb.finish()
+        } else {
+            let mut fb = FilterBuilder::new(bits);
+            for r in recs {
+                fb.add_text(r);
+            }
+            fb.finish()
+        };
+        (filter, row_kinds(plan, &split.variant_ids), recs.len())
     });
     PendingBlock {
         out,
@@ -1335,6 +1635,7 @@ fn encode_block_columns(
         // A JSON object in a key layout the plan lacks is stored whole: not placed either.
         residual_bytes: split.residual_bytes + split.unshaped_bytes,
         index,
+        releveled: false,
     }
 }
 
@@ -1754,7 +2055,11 @@ fn decode_block_col<'c>(
 
 /// A block's row structure: variant ids, then the JSON structure streams.
 pub(crate) enum Structure<'a> {
-    Whole(&'a [u8]),
+    Whole {
+        raw: &'a [u8],
+        variant_ids: Vec<u32>,
+        json_streams: Option<&'a [u8]>,
+    },
     /// The variant ids, which lead the streams, and each stream. A block whose rows are all of
     /// the model's one JSON variant is read without its variant ids.
     Parts {
@@ -1775,11 +2080,17 @@ impl<'a> BlockParts<'a> {
     /// Splits a whole block.
     pub fn of_block(bytes: &'a [u8], plan: &ModelPlan, budget: &DecodeBudget) -> Result<Self> {
         let mut cur = Cursor::new(bytes);
-        decode_u32_seq(&mut cur, budget)?;
-        if plan.json_tree.is_some() {
-            cur.bytes()?;
-        }
-        let structure = Structure::Whole(&bytes[..bytes.len() - cur.remaining()]);
+        let variant_ids = decode_u32_seq(&mut cur, budget)?;
+        let json_streams = if plan.json_tree.is_some() {
+            Some(cur.bytes()?)
+        } else {
+            None
+        };
+        let structure = Structure::Whole {
+            raw: &bytes[..bytes.len() - cur.remaining()],
+            variant_ids,
+            json_streams,
+        };
         let n_dicts = cur.uvar()? as usize;
         if n_dicts > 4096 {
             return Err(Error::Format("too many block shared dicts".into()));
@@ -1861,15 +2172,15 @@ impl<'a> BlockRows<'a> {
         }
         let n_streams = plan.json_tree.as_ref().map_or(0, |jt| jt.n_struct_streams);
         let (variant_ids, json_streams) = match parts.structure {
-            Structure::Whole(bytes) => {
-                let mut cur = Cursor::new(bytes);
-                let variant_ids = decode_u32_seq(&mut cur, budget)?;
-                let streams = match &plan.json_tree {
-                    Some(_) => decode_json_struct_streams(
-                        &mut Cursor::new(cur.bytes()?),
-                        n_streams,
-                        budget,
-                    )?,
+            Structure::Whole {
+                variant_ids,
+                json_streams,
+                ..
+            } => {
+                let streams = match json_streams {
+                    Some(js) => {
+                        decode_json_struct_streams(&mut Cursor::new(js), n_streams, budget)?
+                    }
                     None => Vec::new(),
                 };
                 (variant_ids, streams)
@@ -1977,6 +2288,100 @@ impl<'a> BlockRows<'a> {
             }
         }
         fields.iter().for_each(|f| self.recon.advance(f.2, n));
+        self.next = n;
+        Ok(true)
+    }
+
+    /// Whole-block fast emitter for `Lf`/`Crlf`/`Nul`-framed blocks: pre-decodes all non-empty
+    /// columns into direct [`FastCol`] cursors and writes every row through register-cached
+    /// [`FastBuf`] with zero per-cell `block_col` cache lookups or `Vec::reserve` overhead.
+    /// Returns `Ok(false)` (having written nothing) if the block needs the general row loop.
+    pub(crate) fn emit_all_delimited(
+        &mut self,
+        out: &mut Vec<u8>,
+        delim: &[u8],
+        skip_last_delim: bool,
+        budget: &DecodeBudget,
+    ) -> Result<bool> {
+        let n = self.variant_ids.len();
+        if self.next != 0 || n == 0 {
+            return Ok(false);
+        }
+        let all_json = self.plan.json_tree_variant_id().is_some_and(|jvi| {
+            self.plan
+                .json_tree
+                .as_ref()
+                .is_some_and(|jt| !jt.runtime.fast_decode.path_op.is_empty())
+                && !self.plan.columns.iter().any(|c| c.nested_plan.is_some())
+                && self.variant_ids.iter().all(|&v| v == jvi)
+        });
+        let all_shapes = !all_json
+            && self
+                .variant_ids
+                .iter()
+                .all(|&v| matches!(self.plan.variants[v as usize], PlanVariant::Shape(_)));
+        if !all_json && !all_shapes {
+            return Ok(false);
+        }
+
+        let n_cols = self.plan.columns.len();
+        for cid in 0..n_cols {
+            if self.ctx.col_blobs[cid].is_some_and(|b| b != [0]) {
+                block_col(cid, self.plan, &mut self.ctx, budget)?;
+            }
+        }
+        let mut fast_cols: Vec<FastCol<'_>> = self
+            .ctx
+            .cache
+            .iter()
+            .map(|c| match c {
+                Some(col) => FastCol::from_col(col, 0),
+                None => FastCol::Missing,
+            })
+            .collect();
+
+        let mut buf = FastBuf::new(out);
+        if all_json {
+            let jt = self.plan.json_tree.as_ref().unwrap();
+            let jr = self.recon.json_rec_mut().unwrap();
+            jr.emit_fast_block(
+                n,
+                jt,
+                &mut fast_cols,
+                &mut buf,
+                delim,
+                skip_last_delim,
+                budget,
+            )?;
+        } else {
+            let max_row = budget.max_block_decoded_bytes;
+            for (r, &vid) in self.variant_ids.iter().enumerate() {
+                let PlanVariant::Shape(s) = &self.plan.variants[vid as usize] else {
+                    unreachable!();
+                };
+                let row_start = buf.len();
+                buf.put_lit(&s.literals[0]);
+                for (&cid, lit) in s.slots.iter().zip(&s.literals[1..]) {
+                    if !fast_cols
+                        .get_mut(cid as usize)
+                        .is_some_and(|c| c.write_next(&mut buf))
+                    {
+                        return Err(underflow());
+                    }
+                    buf.put_lit(lit);
+                }
+                if buf.len() - row_start > max_row {
+                    return Err(Error::BudgetExceeded("reconstructed row size"));
+                }
+                if r + 1 < n || !skip_last_delim {
+                    if delim.len() == 1 {
+                        buf.put_byte(delim[0]);
+                    } else {
+                        buf.put_lit(delim);
+                    }
+                }
+            }
+        }
         self.next = n;
         Ok(true)
     }
@@ -2133,28 +2538,33 @@ fn decode_frame(
 
     let mut frame_out = budget.alloc_vec(0, "frame output")?;
     frame_out
-        .try_reserve(hdr.raw_len.min(budget.max_single_alloc_bytes))
+        .try_reserve(
+            hdr.raw_len
+                .saturating_add(64)
+                .min(budget.max_single_alloc_bytes),
+        )
         .map_err(|_| Error::BudgetExceeded("frame output reserve"))?;
 
     frame_out.extend_from_slice(&bdir.prefix);
     let mut emitted = 0usize;
-    let put = |out: &mut Vec<u8>,
-               emitted: &mut usize,
-               body: &mut dyn FnMut(&mut Vec<u8>) -> Result<()>| {
-        if *emitted > 0 {
-            out.extend_from_slice(&bdir.sep);
-        }
-        *emitted += 1;
-        frame_record(out, hdr.framing, *emitted == hdr.record_count, body)
-    };
+    let total_records = hdr.record_count;
     // Records with nothing around or between them can be written all at once.
     let bare = matches!(hdr.framing, ResolvedFraming::FixedStride { .. }) && bdir.sep.is_empty();
+    let simple_lf = bdir.sep.is_empty()
+        && matches!(
+            hdr.framing,
+            ResolvedFraming::Lf { .. } | ResolvedFraming::Crlf { .. } | ResolvedFraming::Nul { .. }
+        );
     for (nrows, bslice) in &bdir.blocks {
         if (hdr.flags & FLAG_SORTED_ROWS) != 0 {
             let recs = decode_single_block_records(bslice, *nrows, plan, budget)?;
             for i in sort_records(&recs) {
                 let rec = recs.get(i as usize).unwrap();
-                put(&mut frame_out, &mut emitted, &mut |o| {
+                if emitted > 0 && !bdir.sep.is_empty() {
+                    frame_out.extend_from_slice(&bdir.sep);
+                }
+                emitted += 1;
+                frame_record(&mut frame_out, hdr.framing, emitted == total_records, |o| {
                     o.extend_from_slice(rec);
                     Ok(())
                 })?;
@@ -2164,9 +2574,35 @@ fn decode_frame(
             let mut rows = BlockRows::open(bslice, *nrows, plan, budget)?;
             if bare && rows.emit_fixed(&mut frame_out, budget)? {
                 emitted += *nrows;
+            } else if simple_lf {
+                let n = *nrows;
+                let (delim, open_end): (&[u8], bool) = match hdr.framing {
+                    ResolvedFraming::Lf { open_end } => (b"\n", open_end),
+                    ResolvedFraming::Crlf { open_end } => (b"\r\n", open_end),
+                    ResolvedFraming::Nul { open_end } => (b"\0", open_end),
+                    _ => unreachable!(),
+                };
+                let skip_last_delim = open_end && emitted + n == total_records;
+                if rows.emit_all_delimited(&mut frame_out, delim, skip_last_delim, budget)? {
+                    emitted += n;
+                } else {
+                    for _ in 0..n {
+                        emitted += 1;
+                        rows.emit(&mut frame_out, budget)?;
+                        if emitted < total_records || !open_end {
+                            frame_out.extend_from_slice(delim);
+                        }
+                    }
+                }
             } else {
                 for _ in 0..*nrows {
-                    put(&mut frame_out, &mut emitted, &mut |o| rows.emit(o, budget))?;
+                    if emitted > 0 && !bdir.sep.is_empty() {
+                        frame_out.extend_from_slice(&bdir.sep);
+                    }
+                    emitted += 1;
+                    frame_record(&mut frame_out, hdr.framing, emitted == total_records, |o| {
+                        rows.emit(o, budget)
+                    })?;
                 }
             }
         }
@@ -3052,5 +3488,52 @@ mod unpack_threads_tests {
         }
         // The index region is skipped unread, so damage there goes unseen.
         assert!(errors > 20, "{errors}");
+    }
+
+    #[test]
+    fn structural_filter_matches_raw_records() {
+        let mut raw = Vec::new();
+        for i in 0..500u64 {
+            let line = format!(
+                "{{\"id\":\"{}\",\"type\":\"PushEvent\",\"actor\":{{\"login\":\"user{}\",\"url\":\"https://api.github.com/users/user{}\"}},\"repo\":{{\"name\":\"org/repo{}\"}},\"payload\":{{\"commits\":[{{\"sha\":\"{:040x}\",\"message\":\"Fix bug number {} in module alpha\"}}]}}}}\n",
+                10_000 + i,
+                i % 17,
+                i % 17,
+                i % 11,
+                i * 7919,
+                i
+            );
+            raw.extend_from_slice(line.as_bytes());
+        }
+        let recs: Vec<&[u8]> = raw
+            .split(|&b| b == b'\n')
+            .filter(|r| !r.is_empty())
+            .collect();
+        let plan = crate::plan::train_from_records(
+            &recs,
+            ResolvedFraming::Lf { open_end: false },
+            &crate::plan::TrainOptions::default(),
+            None,
+        );
+        let split = split_records_with_plan_opts(&recs, &plan, true);
+        assert!(
+            try_structural_filter_head(&plan, &split, DEFAULT_FILTER_BITS).is_some(),
+            "expected structural filter fast path on JSON"
+        );
+        let pb = encode_block_columns(
+            &recs,
+            &plan,
+            &PackRegistry::default(),
+            EntropyBackend::Zstd,
+            3,
+            Some(DEFAULT_FILTER_BITS),
+            0,
+        );
+        let got = pb.index.unwrap().0;
+        let mut ref_fb = FilterBuilder::new(DEFAULT_FILTER_BITS);
+        for r in &recs {
+            ref_fb.add_text(r);
+        }
+        assert_eq!(got, ref_fb.finish());
     }
 }

@@ -64,12 +64,18 @@ impl FloatEncoder {
             self.integers.push(i);
             true
         }) {
-            let mut graph = GraphBuilder::new(values.len());
-            let ints = graph.add_ints_fast(&self.integers);
-            let b = Builder::new(1);
-            let value = b.r(Op::I64ToF64, b.input(0));
-            let root = graph.add_prog_i64(b.finish(&[(value, 8)]), vec![ints], vec![]);
-            return graph.finish(root).fuse_numeric_programs().encode_numeric();
+            return zform_core::payload::graph::with_encode_opts(
+                crate::EntropyBackend::Zstd,
+                1,
+                || {
+                    let mut graph = GraphBuilder::new(values.len());
+                    let ints = graph.add_ints_fast(&self.integers);
+                    let b = Builder::new(1);
+                    let value = b.r(Op::I64ToF64, b.input(0));
+                    let root = graph.add_prog_i64(b.finish(&[(value, 8)]), vec![ints], vec![]);
+                    graph.finish(root).fuse_numeric_programs().encode_numeric()
+                },
+            );
         }
         let fits = |e: u8, mode: Scale| {
             let scale = 10f64.powi(e as i32);
@@ -136,25 +142,30 @@ impl FloatEncoder {
             self.residuals
                 .push((v.to_bits() ^ reconstruct(i, factor, mode).to_bits()) as i64);
         }
-        let mut graph = GraphBuilder::new(values.len());
-        let ints = graph.add_ints_fast(&self.integers);
-        let exceptions = self.residuals.iter().any(|v| *v != 0);
-        let b = Builder::new(if exceptions { 2 } else { 1 });
-        let mut output = b.r(Op::I64ToF64, b.input(0));
-        if exponent != 0 {
-            output = match mode {
-                Scale::Divide => b.rf(Op::F64DivI, output, factor),
-                Scale::Multiply => b.rf(Op::F64MulI, output, 1.0 / factor),
-                Scale::MilliTwice => b.rf(Op::F64DivI, b.rf(Op::F64DivI, output, 1000.), 1000.),
-            };
-        }
-        let mut inputs = vec![ints];
-        if exceptions {
-            inputs.push(graph.add_ints_fast(&self.residuals));
-            output = b.rr(Op::Xor, output, b.input(1));
-        }
-        let root = graph.add_prog_i64(b.finish(&[(output, 8)]), inputs, vec![]);
-        let candidate = graph.finish(root).fuse_numeric_programs().encode_numeric();
+        let candidate =
+            zform_core::payload::graph::with_encode_opts(crate::EntropyBackend::Zstd, 1, || {
+                let mut graph = GraphBuilder::new(values.len());
+                let ints = graph.add_ints_fast(&self.integers);
+                let exceptions = self.residuals.iter().any(|v| *v != 0);
+                let b = Builder::new(if exceptions { 2 } else { 1 });
+                let mut output = b.r(Op::I64ToF64, b.input(0));
+                if exponent != 0 {
+                    output = match mode {
+                        Scale::Divide => b.rf(Op::F64DivI, output, factor),
+                        Scale::Multiply => b.rf(Op::F64MulI, output, 1.0 / factor),
+                        Scale::MilliTwice => {
+                            b.rf(Op::F64DivI, b.rf(Op::F64DivI, output, 1000.), 1000.)
+                        }
+                    };
+                }
+                let mut inputs = vec![ints];
+                if exceptions {
+                    inputs.push(graph.add_ints_fast(&self.residuals));
+                    output = b.rr(Op::Xor, output, b.input(1));
+                }
+                let root = graph.add_prog_i64(b.finish(&[(output, 8)]), inputs, vec![]);
+                graph.finish(root).fuse_numeric_programs().encode_numeric()
+            });
         if candidate.len() < values.len() * 2 {
             return candidate;
         }
@@ -212,17 +223,13 @@ pub fn decode_f64_body(
     if range.start > range.end || range.end > count {
         return Err(Error::InvalidArgument("numeric selection range".into()));
     }
-    let mut values = CoreDecoder::decode_ints_body(body, count as u64, budget)?;
+    let values = CoreDecoder::decode_ints_body(body, count as u64, budget)?;
     if values.len() != count {
         return Err(Error::Format("numeric row count mismatch".into()));
     }
-    values.truncate(range.end);
-    if range.start > 0 {
-        values.drain(..range.start);
-    }
-    Ok(values
-        .into_iter()
-        .map(|v| f64::from_bits(v as u64))
+    Ok(values[range.start..range.end]
+        .iter()
+        .map(|&v| f64::from_bits(v as u64))
         .collect())
 }
 
@@ -352,15 +359,27 @@ pub fn encode_f64_with_base(values: &[f64], base: &[f64]) -> Result<Vec<u8>> {
         }
         differences.push(integer);
     }
-    let mut graph = GraphBuilder::new(values.len());
-    let input = graph.add_ints_fast(&differences);
-    let pool = graph.add_ext_pool();
-    let prior = graph.add_byte_chunks(pool, 8);
-    let b = Builder::new(2);
-    let delta = b.r(Op::I64ToF64, b.input(0));
-    let value = b.rr(Op::F64Add, b.input(1), delta);
-    let root = graph.add_prog_i64(b.finish(&[(value, 8)]), vec![input, prior], vec![]);
-    Ok(graph.finish(root).fuse_numeric_programs().encode_numeric())
+    if differences.iter().all(|&d| d == 0) {
+        let mut graph = GraphBuilder::new(values.len());
+        let pool = graph.add_ext_pool();
+        let root = graph.add_byte_chunks(pool, 8);
+        return Ok(graph.finish(root).encode_numeric());
+    }
+    Ok(zform_core::payload::graph::with_encode_opts(
+        crate::EntropyBackend::Zstd,
+        1,
+        || {
+            let mut graph = GraphBuilder::new(values.len());
+            let input = graph.add_ints_fast(&differences);
+            let pool = graph.add_ext_pool();
+            let prior = graph.add_byte_chunks(pool, 8);
+            let b = Builder::new(2);
+            let delta = b.r(Op::I64ToF64, b.input(0));
+            let value = b.rr(Op::F64Add, b.input(1), delta);
+            let root = graph.add_prog_i64(b.finish(&[(value, 8)]), vec![input, prior], vec![]);
+            graph.finish(root).fuse_numeric_programs().encode_numeric()
+        },
+    ))
 }
 
 pub fn decode_f64_with_base(
@@ -369,14 +388,61 @@ pub fn decode_f64_with_base(
     base: Option<&[f64]>,
     budget: &DecodeBudget,
 ) -> Result<Vec<f64>> {
+    use zform_core::payload::graph::GraphNode;
+    use zform_core::payload::ir::{Len, Width};
     let graph = PayloadGraph::decode(bytes, budget)?;
     if graph.rows as usize != count {
         return Err(Error::Format("numeric row count mismatch".into()));
     }
-    let pool = if let Some(base) = base {
+    // Fast path for the two canonical `encode_f64_with_base` shapes without copying `base` into a byte Pool.
+    if let Some(base) = base {
         if base.len() != count {
             return Err(Error::InvalidArgument("numeric base length".into()));
         }
+        match &graph.nodes[graph.root as usize] {
+            GraphNode::ByteChunks {
+                buf,
+                chunk_bytes: 8,
+            } if matches!(graph.nodes[*buf as usize], GraphNode::ExtPool) => {
+                return Ok(base.to_vec());
+            }
+            GraphNode::ProgramI64 { prog, inputs, bufs }
+                if bufs.is_empty()
+                    && inputs.len() == 2
+                    && prog.width == Width::W64
+                    && prog.n_in == 2
+                    && prog.ops.len() == 2
+                    && prog.ops[0].op == Op::I64ToF64
+                    && prog.ops[0].a == 0
+                    && prog.ops[1].op == Op::F64Add
+                    && prog.ops[1].a == 1
+                    && prog.ops[1].b == 2
+                    && prog.sinks == [(3, Len::Fixed(8))] =>
+            {
+                if let (
+                    GraphNode::IntStream(delta_stream),
+                    GraphNode::ByteChunks {
+                        buf,
+                        chunk_bytes: 8,
+                    },
+                ) = (
+                    &graph.nodes[inputs[0] as usize],
+                    &graph.nodes[inputs[1] as usize],
+                ) && matches!(graph.nodes[*buf as usize], GraphNode::ExtPool)
+                    && delta_stream.len() == count
+                {
+                    let deltas = delta_stream.unpack(budget)?;
+                    let mut out = Vec::with_capacity(count);
+                    for (&b, &d) in base.iter().zip(&deltas) {
+                        out.push(b + d as f64);
+                    }
+                    return Ok(out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let pool = if let Some(base) = base {
         budget.check_alloc(count.saturating_mul(8), "numeric base")?;
         Some(std::sync::Arc::new(zform_core::cells::Pool::whole(
             base.iter()

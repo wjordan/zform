@@ -1493,6 +1493,12 @@ impl<'f> Session<'f> {
         rows: &RowSet,
         mut f: impl FnMut(u64, usize, Option<&[u8]>) -> Result<()>,
     ) -> Result<Step<()>> {
+        // Fast streaming path: when every block is pure JSON and every requested path maps 1:1 to
+        // a non-nested per-row column without array values, emit directly from decoded columns
+        // without copying values into `BlockVals::arena`.
+        if let Some(step) = self.fields_fast(src, paths, rows, &mut f)? {
+            return Ok(step);
+        }
         self.begin_values(format!("f{paths:?}{:?}", rows.ranges()));
         let blocks = match self.collect_values(src, paths, rows)? {
             Step::Ready(b) => b,
@@ -1521,6 +1527,138 @@ impl<'f> Session<'f> {
         Ok(Step::Ready(()))
     }
 
+    /// Streams `fields` directly from decoded per-row columns with zero arena copying when every
+    /// touched block is pure JSON and every requested path has a direct non-nested `row_col`.
+    /// Returns `Ok(None)` to fall back to the general `collect_values` path.
+    fn fields_fast(
+        &mut self,
+        src: &dyn Source,
+        paths: &[&str],
+        rows: &RowSet,
+        f: &mut impl FnMut(u64, usize, Option<&[u8]>) -> Result<()>,
+    ) -> Result<Option<Step<()>>> {
+        if paths.is_empty() {
+            return Ok(None);
+        }
+        let file = self.file;
+        let blocks = file.blocks_in(Some(rows));
+        if blocks.is_empty() {
+            return Ok(Some(Step::Ready(())));
+        }
+        let mut missing = Vec::new();
+        let mut dirs = Vec::with_capacity(blocks.len());
+        for &b in &blocks {
+            match self.dir(src, b)? {
+                Some(dir) => dirs.push(dir),
+                None => missing.push(dir_page(&file.root.blocks[b])),
+            }
+        }
+        if !missing.is_empty() {
+            return Ok(Some(Step::Missing(missing)));
+        }
+        // Check eligibility across all blocks and gather missing data ranges in one batch.
+        let mut plan_cols: Vec<(u32, u16, Vec<u16>)> = Vec::with_capacity(blocks.len());
+        for (&b, dir) in blocks.iter().zip(&dirs) {
+            let e = &file.root.blocks[b];
+            let BlockKind::Structured { model, kinds } = e.kind else {
+                return Ok(None);
+            };
+            if kinds & !KIND_JSON != 0 {
+                return Ok(None);
+            }
+            let plan = &file.plans[model as usize];
+            let m = BlockMeta {
+                model,
+                plan,
+                kinds,
+                dir,
+                filter: Filter::NONE,
+                pages: &[],
+            };
+            let mut cols = Vec::with_capacity(paths.len());
+            for path in paths {
+                let Some(col) = self.plans.field(&m, path).row_col(kinds, dir) else {
+                    return Ok(None);
+                };
+                if plan.columns[col as usize].nested_plan.is_some() {
+                    return Ok(None);
+                }
+                // Check for possible paged text pools (let general path handle paged pools).
+                let col_deps = &dir.col(col as usize).deps;
+                if col_deps.pool && !dir.pages.is_empty() && e.pages_len > 0 {
+                    return Ok(None);
+                }
+                cols.push(col);
+            }
+            if src.get(whole(e)).is_none() {
+                let want = self.value_parts(paths, model, kinds, dir);
+                missing.extend(
+                    want.ranges(e, dir)
+                        .into_iter()
+                        .filter(|r| src.get(*r).is_none()),
+                );
+            }
+            plan_cols.push((model, kinds, cols));
+        }
+        let _dict = self.dict(src, &mut missing)?;
+        if !missing.is_empty() {
+            return Ok(Some(Step::Missing(missing)));
+        }
+        // Verify no column in any block holds JSON array values (`[` prefix) before invoking `f`
+        // (or check per block and stream; since `row_col` is scalar/string in 99.9% of cases,
+        // verify cheaply before streaming the first row!).
+        let budget = &file.budget;
+        let mut scratch = Vec::new();
+        for ((&b, dir), (model, kinds, cols)) in blocks.iter().zip(&dirs).zip(&plan_cols) {
+            let e = &file.root.blocks[b];
+            let first = file.starts[b];
+            let plan = &file.plans[*model as usize];
+            let want = self.value_parts(paths, *model, *kinds, dir);
+            let Some((parts, is_whole)) = load_parts(src, e, dir, plan, &want, budget)? else {
+                return Ok(None);
+            };
+            let mut br = BlockRows::of_parts(parts, e.rows as usize, plan, budget)?;
+            // Pre-decode all requested columns for this block.
+            for &c in cols {
+                br.col(c as usize, budget)?;
+            }
+            // If any requested column contains a bare JSON array value (`[`), fall back for safety
+            // only if we haven't emitted anything yet (otherwise split per-cell via json_values_at).
+            let mut cell_doc = crate::json_tree::JsonDoc::default();
+            for r in rows.within(first, first + e.rows).flat_map(|(s, t)| s..t) {
+                let row = first + r as u64;
+                for (p, &c) in cols.iter().enumerate() {
+                    let col = br.ctx.cache[c as usize].as_ref().unwrap();
+                    let lex = col.get(r as usize, &mut scratch)?;
+                    if lex.first() != Some(&b'[') {
+                        f(row, p, Some(lex))?;
+                    } else {
+                        let mut any = false;
+                        let mut err = Ok(());
+                        let ok = crate::json_tree::json_values_at(
+                            &mut cell_doc,
+                            lex,
+                            b"",
+                            &mut |s, t| {
+                                any = true;
+                                if err.is_ok() {
+                                    err = f(row, p, Some(&lex[s..t]));
+                                }
+                            },
+                        );
+                        err?;
+                        if !ok || !any {
+                            f(row, p, None)?;
+                        }
+                    }
+                }
+            }
+            self.stats.blocks_partial += usize::from(!is_whole);
+            self.stats.blocks_whole += usize::from(is_whole);
+        }
+        Ok(Some(Step::Ready(())))
+    }
+
     /// Calls `f(value, rows)` for each distinct value of `path` in each block that holds rows of
     /// `within`, with the rows of `within` in that block that have it. A value that occurs in
     /// several blocks is reported once per block.
@@ -1531,6 +1669,9 @@ impl<'f> Session<'f> {
         within: &RowSet,
         mut f: impl FnMut(&[u8], &[u64]) -> Result<()>,
     ) -> Result<Step<()>> {
+        if let Some(step) = self.distinct_fast(src, path, within, &mut f)? {
+            return Ok(step);
+        }
         self.begin_values(format!("d{path:?}{:?}", within.ranges()));
         let blocks = match self.collect_values(src, &[path], within)? {
             Step::Ready(b) => b,
@@ -1540,7 +1681,7 @@ impl<'f> Session<'f> {
             let first = self.file.starts[b];
             let v = &self.values[&b];
             let mut groups = Vec::<(&[u8], Vec<u64>)>::new();
-            let mut by_value = HashMap::<&[u8], usize>::new();
+            let mut by_value: crate::payload::graph::FastMap<&[u8], usize> = Default::default();
             for &(row, s, t) in &v.vals[0] {
                 let value = &v.arena[s as usize..t as usize];
                 let g = *by_value.entry(value).or_insert_with(|| {
@@ -1558,6 +1699,270 @@ impl<'f> Session<'f> {
         }
         self.values.clear();
         Ok(Step::Ready(()))
+    }
+
+    /// Fast dictionary/const/slice path for `distinct`: groups rows directly by dictionary
+    /// ordinal without copying cell bytes or hashing strings.
+    fn distinct_fast(
+        &mut self,
+        src: &dyn Source,
+        path: &str,
+        within: &RowSet,
+        f: &mut impl FnMut(&[u8], &[u64]) -> Result<()>,
+    ) -> Result<Option<Step<()>>> {
+        let file = self.file;
+        let blocks = file.blocks_in(Some(within));
+        if blocks.is_empty() {
+            return Ok(Some(Step::Ready(())));
+        }
+        let mut missing = Vec::new();
+        let mut dirs = Vec::with_capacity(blocks.len());
+        for &b in &blocks {
+            match self.dir(src, b)? {
+                Some(dir) => dirs.push(dir),
+                None => missing.push(dir_page(&file.root.blocks[b])),
+            }
+        }
+        if !missing.is_empty() {
+            return Ok(Some(Step::Missing(missing)));
+        }
+        let mut plan_cols = Vec::with_capacity(blocks.len());
+        for (&b, dir) in blocks.iter().zip(&dirs) {
+            let e = &file.root.blocks[b];
+            let BlockKind::Structured { model, kinds } = e.kind else {
+                return Ok(None);
+            };
+            if kinds & !KIND_JSON != 0 {
+                return Ok(None);
+            }
+            let plan = &file.plans[model as usize];
+            let m = BlockMeta {
+                model,
+                plan,
+                kinds,
+                dir,
+                filter: Filter::NONE,
+                pages: &[],
+            };
+            let Some(col) = self.plans.field(&m, path).row_col(kinds, dir) else {
+                return Ok(None);
+            };
+            if plan.columns[col as usize].nested_plan.is_some() {
+                return Ok(None);
+            }
+            let col_deps = &dir.col(col as usize).deps;
+            if col_deps.pool && !dir.pages.is_empty() && e.pages_len > 0 {
+                return Ok(None);
+            }
+            if src.get(whole(e)).is_none() {
+                let want = self.value_parts(&[path], model, kinds, dir);
+                missing.extend(
+                    want.ranges(e, dir)
+                        .into_iter()
+                        .filter(|r| src.get(*r).is_none()),
+                );
+            }
+            plan_cols.push((model, kinds, col));
+        }
+        let _dict = self.dict(src, &mut missing)?;
+        if !missing.is_empty() {
+            return Ok(Some(Step::Missing(missing)));
+        }
+        let budget = &file.budget;
+        let mut scratch = Vec::new();
+        for ((&b, dir), &(model, kinds, col_id)) in blocks.iter().zip(&dirs).zip(&plan_cols) {
+            let e = &file.root.blocks[b];
+            let first = file.starts[b];
+            let plan = &file.plans[model as usize];
+            let want = self.value_parts(&[path], model, kinds, dir);
+            let Some((parts, is_whole)) = load_parts(src, e, dir, plan, &want, budget)? else {
+                return Ok(None);
+            };
+            let mut br = BlockRows::of_parts(parts, e.rows as usize, plan, budget)?;
+            let col = br.col(col_id as usize, budget)?;
+            let sel = within.within(first, first + e.rows).flat_map(|(s, t)| s..t);
+            match col {
+                crate::cells::Col::Const { val, .. } if val.first() != Some(&b'[') => {
+                    let rows: Vec<u64> = sel.map(|r| first + r as u64).collect();
+                    if !rows.is_empty() {
+                        f(val, &rows)?;
+                    }
+                }
+                crate::cells::Col::Dict { dict, ords }
+                    if !dict.iter().any(|v| v.first() == Some(&b'[')) =>
+                {
+                    let mut groups: Vec<Vec<u64>> = vec![Vec::new(); dict.len()];
+                    for r in sel {
+                        groups[ords[r as usize] as usize].push(first + r as u64);
+                    }
+                    for (ord, rows) in groups.into_iter().enumerate() {
+                        if !rows.is_empty() {
+                            f(dict.get(ord).unwrap(), &rows)?;
+                        }
+                    }
+                }
+                crate::cells::Col::Quoted { inner, map } => match &**inner {
+                    crate::cells::Col::Const { val, .. } => {
+                        if map.is_empty() {
+                            let rows: Vec<u64> = sel.map(|r| first + r as u64).collect();
+                            if !rows.is_empty() {
+                                scratch.clear();
+                                scratch.push(b'"');
+                                scratch.extend_from_slice(val);
+                                scratch.push(b'"');
+                                f(&scratch, &rows)?;
+                            }
+                        } else {
+                            let (mut quoted_rows, mut null_rows) = (Vec::new(), Vec::new());
+                            for r in sel {
+                                if map[r as usize] == crate::cells::NULL_CELL {
+                                    null_rows.push(first + r as u64);
+                                } else {
+                                    quoted_rows.push(first + r as u64);
+                                }
+                            }
+                            if !quoted_rows.is_empty() {
+                                scratch.clear();
+                                scratch.push(b'"');
+                                scratch.extend_from_slice(val);
+                                scratch.push(b'"');
+                                f(&scratch, &quoted_rows)?;
+                            }
+                            if !null_rows.is_empty() {
+                                f(b"null", &null_rows)?;
+                            }
+                        }
+                    }
+                    crate::cells::Col::Dict { dict, ords } => {
+                        let mut groups: Vec<Vec<u64>> = vec![Vec::new(); dict.len()];
+                        let mut null_rows = Vec::new();
+                        if map.is_empty() {
+                            for r in sel {
+                                groups[ords[r as usize] as usize].push(first + r as u64);
+                            }
+                        } else {
+                            for r in sel {
+                                let m = map[r as usize];
+                                if m == crate::cells::NULL_CELL {
+                                    null_rows.push(first + r as u64);
+                                } else {
+                                    groups[ords[m as usize] as usize].push(first + r as u64);
+                                }
+                            }
+                        }
+                        for (ord, rows) in groups.into_iter().enumerate() {
+                            if !rows.is_empty() {
+                                scratch.clear();
+                                scratch.push(b'"');
+                                scratch.extend_from_slice(dict.get(ord).unwrap());
+                                scratch.push(b'"');
+                                f(&scratch, &rows)?;
+                            }
+                        }
+                        if !null_rows.is_empty() {
+                            f(b"null", &null_rows)?;
+                        }
+                    }
+                    _ => {
+                        let mut arena = Vec::new();
+                        let mut groups: Vec<((usize, usize), Vec<u64>)> = Vec::new();
+                        let mut by_val: crate::payload::graph::FastMap<Vec<u8>, usize> =
+                            Default::default();
+                        for r in sel {
+                            scratch.clear();
+                            col.write(r as usize, &mut scratch)?;
+                            let g = if let Some(&idx) = by_val.get(scratch.as_slice()) {
+                                idx
+                            } else {
+                                let s = arena.len();
+                                arena.extend_from_slice(&scratch);
+                                let idx = groups.len();
+                                groups.push(((s, arena.len()), Vec::new()));
+                                by_val.insert(scratch.clone(), idx);
+                                idx
+                            };
+                            groups[g].1.push(first + r as u64);
+                        }
+                        for ((s, t), rows) in groups {
+                            f(&arena[s..t], &rows)?;
+                        }
+                    }
+                },
+                _ => {
+                    // Direct borrow from Flat/Pool without arena copy if no `[` array cells.
+                    let mut groups: Vec<(&[u8], Vec<u64>)> = Vec::new();
+                    let mut by_val: crate::payload::graph::FastMap<&[u8], usize> =
+                        Default::default();
+                    let mut has_array = false;
+                    if let Some((buf, ends)) = col.laid() {
+                        for r in sel {
+                            let i = r as usize;
+                            let s = if i == 0 { 0 } else { ends[i - 1] as usize };
+                            let e_off = ends[i] as usize;
+                            let val = &buf[s..e_off];
+                            if val.first() == Some(&b'[') {
+                                has_array = true;
+                                break;
+                            }
+                            let g = *by_val.entry(val).or_insert_with(|| {
+                                groups.push((val, Vec::new()));
+                                groups.len() - 1
+                            });
+                            groups[g].1.push(first + r as u64);
+                        }
+                    } else {
+                        has_array = true;
+                    }
+                    if has_array {
+                        // Rare fallback for array cells or paged columns.
+                        let mut cell_doc = crate::json_tree::JsonDoc::default();
+                        let mut arena = Vec::new();
+                        let mut owned_groups: Vec<((usize, usize), Vec<u64>)> = Vec::new();
+                        let mut owned_by_val: crate::payload::graph::FastMap<Vec<u8>, usize> =
+                            Default::default();
+                        for r in within.within(first, first + e.rows).flat_map(|(s, t)| s..t) {
+                            let lex = col.get(r as usize, &mut scratch)?;
+                            let row = first + r as u64;
+                            let mut add_v = |val: &[u8]| {
+                                let g = if let Some(&idx) = owned_by_val.get(val) {
+                                    idx
+                                } else {
+                                    let s = arena.len();
+                                    arena.extend_from_slice(val);
+                                    let idx = owned_groups.len();
+                                    owned_groups.push(((s, arena.len()), Vec::new()));
+                                    owned_by_val.insert(val.to_vec(), idx);
+                                    idx
+                                };
+                                if owned_groups[g].1.last() != Some(&row) {
+                                    owned_groups[g].1.push(row);
+                                }
+                            };
+                            if lex.first() != Some(&b'[') {
+                                add_v(lex);
+                            } else {
+                                crate::json_tree::json_values_at(
+                                    &mut cell_doc,
+                                    lex,
+                                    b"",
+                                    &mut |s, t| add_v(&lex[s..t]),
+                                );
+                            }
+                        }
+                        for ((s, t), rows) in owned_groups {
+                            f(&arena[s..t], &rows)?;
+                        }
+                    } else {
+                        for (val, rows) in groups {
+                            f(val, &rows)?;
+                        }
+                    }
+                }
+            }
+            self.stats.blocks_partial += usize::from(!is_whole);
+            self.stats.blocks_whole += usize::from(is_whole);
+        }
+        Ok(Some(Step::Ready(())))
     }
 }
 

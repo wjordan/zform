@@ -54,27 +54,67 @@ pub fn tokens(text: &[u8], mut f: impl FnMut(u64, bool)) {
 }
 
 /// `tokens`, with each token as the letters it stands for, read as one little-endian word.
-#[inline]
+#[inline(always)]
 fn spellings(text: &[u8], mut f: impl FnMut(u64, bool)) {
     let n = text.len();
-    let mut run = |start: usize, end: usize| {
-        let run = &text[start..end];
-        if run.len() < WORD_MIN {
+    #[inline(always)]
+    fn emit_run(text: &[u8], start: usize, end: usize, n: usize, f: &mut impl FnMut(u64, bool)) {
+        let len = end - start;
+        if len < WORD_MIN {
             return;
         }
-        let (head, rest) = run.split_at(run.len().min(GRAM));
-        let mut w = head.iter().rev().fold(0u64, |w, &l| (w << 8) | l as u64);
-        f(w, run.len() >= GRAM || (start > 0 && end < n));
-        for &l in rest {
-            w = (w >> 8) | ((l as u64) << (8 * GRAM - 8));
+        let r = &text[start..end];
+        if len < GRAM {
+            let mut w = (r[0] as u64) | ((r[1] as u64) << 8) | ((r[2] as u64) << 16);
+            if len == 4 {
+                w |= (r[3] as u64) << 24;
+            }
+            f(w, start > 0 && end < n);
+            return;
+        }
+        let mut w = (r[0] as u64)
+            | ((r[1] as u64) << 8)
+            | ((r[2] as u64) << 16)
+            | ((r[3] as u64) << 24)
+            | ((r[4] as u64) << 32);
+        f(w, true);
+        for &l in &r[5..] {
+            w = (w >> 8) | ((l as u64) << 32);
             f(w, true);
         }
-    };
-    // Eight bytes at a time: a byte's top bit marks a letter, and a run's ends are where the
-    // mark changes. Bytes past the text read as zero, which is not a letter.
+    }
+    let mut open = None::<usize>;
+    let mut pos = 0usize;
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::*;
+        // SAFETY: SSE2 is baseline on x86_64; each chunk is 16 in-bounds bytes.
+        unsafe {
+            let v20 = _mm_set1_epi8(0x20);
+            let v31 = _mm_set1_epi8(31);
+            let vlim = _mm_set1_epi8(-102);
+            while pos + 16 <= n {
+                let v = _mm_loadu_si128(text.as_ptr().add(pos).cast());
+                let x = _mm_or_si128(v, v20);
+                let m = _mm_movemask_epi8(_mm_cmplt_epi8(_mm_add_epi8(x, v31), vlim)) as u32;
+                let mut edges = (m ^ ((m << 1) | u32::from(open.is_some()))) & 0xffff;
+                while edges != 0 {
+                    let p = pos + edges.trailing_zeros() as usize;
+                    edges &= edges - 1;
+                    match open.take() {
+                        Some(s) => emit_run(text, s, p, n, &mut f),
+                        None => open = Some(p),
+                    }
+                }
+                pos += 16;
+            }
+        }
+    }
+
+    // Eight bytes at a time for non-x86_64 or trailing <16 bytes.
     const HI: u64 = 0x8080_8080_8080_8080;
-    let mut open = None;
-    let mut scan = |at: usize, w: u64| {
+    let mut scan8 = |at: usize, w: u64| {
         let x = w | 0x2020_2020_2020_2020;
         let y = x & !HI;
         let m = (y + 0x1f1f_1f1f_1f1f_1f1f) & !(y + 0x0505_0505_0505_0505) & !x & HI;
@@ -83,20 +123,26 @@ fn spellings(text: &[u8], mut f: impl FnMut(u64, bool)) {
             let p = at + edges.trailing_zeros() as usize / 8;
             edges &= edges - 1;
             match open.take() {
-                Some(s) => run(s, p),
+                Some(s) => emit_run(text, s, p, n, &mut f),
                 None => open = Some(p),
             }
         }
     };
-    let (chunks, tail) = text.as_chunks::<8>();
-    for (at, &c) in (0..).step_by(8).zip(chunks) {
-        scan(at, u64::from_le_bytes(c));
+    while pos + 8 <= n {
+        scan8(
+            pos,
+            u64::from_le_bytes(text[pos..pos + 8].try_into().unwrap()),
+        );
+        pos += 8;
     }
-    let mut b = [0u8; 8];
-    b[..tail.len()].copy_from_slice(tail);
-    scan(n - tail.len(), u64::from_le_bytes(b));
+    let tail = &text[pos..];
+    if !tail.is_empty() {
+        let mut b = [0u8; 8];
+        b[..tail.len()].copy_from_slice(tail);
+        scan8(pos, u64::from_le_bytes(b));
+    }
     if let Some(s) = open {
-        run(s, n);
+        emit_run(text, s, n, n, &mut f);
     }
 }
 
@@ -117,12 +163,7 @@ pub fn needle_tokens(needle: &[u8], whole: bool) -> Option<Vec<u64>> {
 
 pub struct FilterBuilder {
     bits: Vec<u64>,
-    /// Spellings `add_text` has added, each where its hash puts it. Records repeat their words,
-    /// and most tokens of a text are found here.
-    recent: Box<[u64; RECENT]>,
 }
-
-const RECENT: usize = 1 << 12;
 
 impl FilterBuilder {
     /// `max_bits` is rounded up to a power of two of at least 64.
@@ -130,29 +171,26 @@ impl FilterBuilder {
         let n = max_bits.max(64).next_power_of_two();
         Self {
             bits: vec![0u64; n / 64],
-            recent: Box::new([0; RECENT]),
         }
     }
 
-    /// Adds the tokens of `text`.
+    /// Adds the tokens of `text` branchlessly into the L1-resident bitset.
     pub fn add_text(&mut self, text: &[u8]) {
+        let words = self.bits.len() - 1;
+        let bits = self.bits.as_mut_slice();
         spellings(text, |w, _| {
-            let slot =
-                (w.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - RECENT.trailing_zeros())) as usize;
-            if self.recent[slot] != w {
-                self.recent[slot] = w;
-                self.add(mix(w));
-            }
+            let t = mix(w);
+            bits[(t >> 6) as usize & words] |= 1u64 << (t & 63);
+            bits[(t >> 38) as usize & words] |= 1u64 << ((t >> 32) & 63);
         })
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn add(&mut self, token: u64) {
         // A power-of-two word count masks the index, which also spares its bounds check.
         let words = self.bits.len() - 1;
-        for p in [token, token >> 32] {
-            self.bits[(p >> 6) as usize & words] |= 1u64 << (p & 63);
-        }
+        self.bits[(token >> 6) as usize & words] |= 1u64 << (token & 63);
+        self.bits[(token >> 38) as usize & words] |= 1u64 << ((token >> 32) & 63);
     }
 
     /// The filter's bytes, halved while under three tenths of its bits are set.
@@ -171,11 +209,27 @@ impl FilterBuilder {
         self.bits.iter().flat_map(|w| w.to_le_bytes()).collect()
     }
 
-    /// A pool page's filter: halved while at most `PAGE_FILL` of the half's bits would be set.
-    pub fn finish_page(mut self) -> Vec<u8> {
-        while self.bits.len() > 1 {
-            let half = self.bits.len() / 2;
-            let (lo, hi) = self.bits.split_at(half);
+    /// Merges all set bits from `other` into `self` when `other` has at least as many words
+    /// (both are powers of two). Returns `true` if merged, `false` if `other` is narrower.
+    pub(crate) fn merge_from(&mut self, other: &Self) -> bool {
+        if other.bits.len() < self.bits.len() {
+            return false;
+        }
+        let mask = self.bits.len() - 1;
+        for (i, &w) in other.bits.iter().enumerate() {
+            self.bits[i & mask] |= w;
+        }
+        true
+    }
+
+    /// Finishes one pool page's filter and resets `self` for the next page, reusing allocations
+    /// and keeping `recent` hot in L1 cache.
+    pub(crate) fn finish_page_and_reset(&mut self) -> Vec<u8> {
+        let orig_len = self.bits.len();
+        let mut len = orig_len;
+        while len > 1 {
+            let half = len / 2;
+            let (lo, hi) = self.bits[..len].split_at(half);
             let set: u32 = lo.iter().zip(hi).map(|(a, b)| (a | b).count_ones()).sum();
             if set as usize * 1000 > PAGE_FILL * half * 64 {
                 break;
@@ -183,9 +237,19 @@ impl FilterBuilder {
             for i in 0..half {
                 self.bits[i] |= self.bits[half + i];
             }
-            self.bits.truncate(half);
+            len = half;
         }
-        self.bits.iter().flat_map(|w| w.to_le_bytes()).collect()
+        let out: Vec<u8> = self.bits[..len]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        self.bits.fill(0);
+        out
+    }
+
+    /// A pool page's filter: halved while at most `PAGE_FILL` of the half's bits would be set.
+    pub fn finish_page(mut self) -> Vec<u8> {
+        self.finish_page_and_reset()
     }
 }
 

@@ -138,7 +138,7 @@ fn found(finder: &Finder<'_>, len: usize, word: bool, text: &[u8]) -> bool {
 pub(crate) enum Test<'a> {
     Eq(&'a [u8]),
     In(&'a [Vec<u8>]),
-    Contains(&'a [u8]),
+    Contains(&'a [u8], Box<memchr::memmem::Finder<'a>>),
     Int(Option<i64>, Option<i64>),
     Time(Option<i64>, Option<i64>),
     Exists,
@@ -149,7 +149,10 @@ impl<'a> Test<'a> {
         Some(match pred {
             Predicate::FieldEq { field, value } => (field.as_str(), Test::Eq(value)),
             Predicate::FieldIn { field, values } => (field.as_str(), Test::In(values)),
-            Predicate::FieldContains { field, needle } => (field.as_str(), Test::Contains(needle)),
+            Predicate::FieldContains { field, needle } => (
+                field.as_str(),
+                Test::Contains(needle, Box::new(memchr::memmem::Finder::new(needle))),
+            ),
             Predicate::FieldIntRange { field, min, max } => (field.as_str(), Test::Int(*min, *max)),
             Predicate::FieldTimeRange {
                 field,
@@ -168,7 +171,7 @@ impl<'a> Test<'a> {
         match self {
             Test::Eq(want) => v == *want,
             Test::In(wants) => wants.iter().any(|w| w == v),
-            Test::Contains(needle) => memchr::memmem::find(v, needle).is_some(),
+            Test::Contains(_, finder) => finder.find(v).is_some(),
             Test::Int(lo, hi) => parse_exact_int(v).is_some_and(|(x, _)| within(x, lo, hi)),
             Test::Time(lo, hi) => parse_timestamp(v).is_some_and(|(x, _)| within(x, lo, hi)),
             Test::Exists => true,
@@ -193,7 +196,7 @@ impl<'a> Test<'a> {
         match self {
             Test::Eq(want) => eq(want),
             Test::In(wants) => wants.iter().any(|w| eq(w)),
-            Test::Contains(needle) => tokens_ok(needle, false),
+            Test::Contains(needle, _) => tokens_ok(needle, false),
             Test::Int(lo, hi) => {
                 s.numeric_kind != 1
                     || !(lo.is_some_and(|lo| s.max_val < lo) || hi.is_some_and(|hi| s.min_val > hi))
@@ -429,7 +432,7 @@ impl FieldPlan {
 
     /// The column whose cell `i` is the one value the field has in row `i`, in a block where
     /// that holds for every row.
-    fn row_col(&self, kinds: u16, dir: &BlockDir) -> Option<u16> {
+    pub(crate) fn row_col(&self, kinds: u16, dir: &BlockDir) -> Option<u16> {
         let live = |c: u16| !dir.col(c as usize).summary.all_null;
         if !self.prunable || kinds != KIND_JSON || self.borrows(dir) {
             return None;
@@ -1569,24 +1572,84 @@ pub(crate) fn eval(
     }
 }
 
+enum ColVerdict {
+    AllFalse(usize),
+    AllTrue(usize),
+    Mask(Vec<bool>),
+}
+
+impl ColVerdict {
+    fn len(&self) -> usize {
+        match self {
+            Self::AllFalse(n) | Self::AllTrue(n) => *n,
+            Self::Mask(v) => v.len(),
+        }
+    }
+
+    fn any_true(&self) -> bool {
+        match self {
+            Self::AllFalse(_) => false,
+            Self::AllTrue(n) => *n > 0,
+            Self::Mask(v) => v.contains(&true),
+        }
+    }
+
+    #[inline]
+    fn get(&self, i: usize) -> Option<bool> {
+        match self {
+            Self::AllFalse(n) => (i < *n).then_some(false),
+            Self::AllTrue(n) => (i < *n).then_some(true),
+            Self::Mask(v) => v.get(i).copied(),
+        }
+    }
+}
+
 /// By cell of `col`, whether its value passes `test`. `None` when a cell holds an array, whose
 /// elements are the values. `escapes` is false when no cell has a backslash.
-fn cell_verdicts(col: &Col, escapes: bool, test: &Test<'_>) -> Result<Option<Vec<bool>>> {
+fn cell_verdicts(col: &Col, escapes: bool, test: &Test<'_>) -> Result<Option<ColVerdict>> {
     let mut buf = Vec::new();
-    let by_entry =
-        |ords: &[u32], entries: Vec<bool>| ords.iter().map(|&o| entries[o as usize]).collect();
+    let by_dict = |ords: &[u32], entries: Vec<bool>| -> ColVerdict {
+        let mut hits = 0usize;
+        let mut single = 0u32;
+        for (idx, &ok) in entries.iter().enumerate() {
+            if ok {
+                hits += 1;
+                single = idx as u32;
+            }
+        }
+        if hits == 0 {
+            return ColVerdict::AllFalse(ords.len());
+        }
+        if hits == entries.len() {
+            return ColVerdict::AllTrue(ords.len());
+        }
+        if hits == 1 {
+            return ColVerdict::Mask(ords.iter().map(|&o| o == single).collect());
+        }
+        ColVerdict::Mask(ords.iter().map(|&o| entries[o as usize]).collect())
+    };
     // `ok` of each cell, without a call per cell where the cells lie back to back.
-    let mut each = |c: &Col, ok: &mut dyn FnMut(&[u8]) -> bool| -> Result<Vec<bool>> {
+    let mut each = |c: &Col, ok: &mut dyn FnMut(&[u8]) -> bool| -> Result<ColVerdict> {
+        if let Col::Const { val, n } = c {
+            return Ok(if ok(val) {
+                ColVerdict::AllTrue(*n)
+            } else {
+                ColVerdict::AllFalse(*n)
+            });
+        }
         let Some((bytes, ends)) = c.laid() else {
-            return (0..c.len())
-                .map(|i| c.get(i, &mut buf).map(&mut *ok))
-                .collect();
+            return Ok(ColVerdict::Mask(
+                (0..c.len())
+                    .map(|i| c.get(i, &mut buf).map(&mut *ok))
+                    .collect::<Result<_>>()?,
+            ));
         };
         let mut start = 0usize;
-        Ok(ends
-            .iter()
-            .map(|&e| ok(&bytes[std::mem::replace(&mut start, e as usize)..e as usize]))
-            .collect())
+        Ok(ColVerdict::Mask(
+            ends.iter()
+                .map(|&e| ok(&bytes[std::mem::replace(&mut start, e as usize)..e as usize]))
+                .collect(),
+        ))
     };
     if let Col::Quoted { inner, map } = col {
         // What `logical` makes of the cell `"e"`.
@@ -1594,28 +1657,36 @@ fn cell_verdicts(col: &Col, escapes: bool, test: &Test<'_>) -> Result<Option<Vec
             Some(plain) => test.ok(&plain),
             None => test.ok(e),
         };
-        let cells: Vec<bool> = match &**inner {
-            Col::Dict { dict, ords } => by_entry(ords, dict.iter().map(&mut ok).collect()),
+        let cells = match &**inner {
+            Col::Dict { dict, ords } => by_dict(ords, dict.iter().map(&mut ok).collect()),
             c => each(c, &mut ok)?,
         };
         if map.is_empty() {
             return Ok(Some(cells));
         }
         let null = test.ok(b"null");
+        if matches!(cells, ColVerdict::AllFalse(_)) && !null {
+            return Ok(Some(ColVerdict::AllFalse(map.len())));
+        }
+        if matches!(cells, ColVerdict::AllTrue(_)) && null {
+            return Ok(Some(ColVerdict::AllTrue(map.len())));
+        }
         let cell = |&j: &u32| match cells.get(j as usize) {
             _ if j == NULL_CELL => Ok(null),
-            Some(&pass) => Ok(pass),
+            Some(pass) => Ok(pass),
             None => Err(underflow()),
         };
-        return Ok(Some(map.iter().map(cell).collect::<Result<_>>()?));
+        return Ok(Some(ColVerdict::Mask(
+            map.iter().map(cell).collect::<Result<_>>()?,
+        )));
     }
     let mut array = false;
     let mut ok = |lex: &[u8]| {
         array |= lex.first() == Some(&b'[');
         test.ok(&logical(lex))
     };
-    let cells: Vec<bool> = match col {
-        Col::Dict { dict, ords } => by_entry(ords, dict.iter().map(&mut ok).collect()),
+    let cells = match col {
+        Col::Dict { dict, ords } => by_dict(ords, dict.iter().map(&mut ok).collect()),
         _ => each(col, &mut ok)?,
     };
     Ok((!array).then_some(cells))
@@ -1638,7 +1709,7 @@ fn eval_leaf_cells(
     if !fp.prunable || fp.subtree_cols.iter().any(|&(c, _)| !summary(c).all_null) {
         return Ok(None);
     }
-    let mut passing: Vec<(u16, Vec<bool>)> = Vec::with_capacity(fp.leaf_cols.len());
+    let mut passing: Vec<(u16, ColVerdict)> = Vec::with_capacity(fp.leaf_cols.len());
     let cols = fp.leaf_cols.iter().chain(&fp.copy_cols);
     for &c in cols.filter(|&&c| !summary(c).all_null) {
         if plan.columns[c as usize].nested_plan.is_some() {
@@ -1656,15 +1727,21 @@ fn eval_leaf_cells(
         if cells.len() != tri.len() {
             return Err(underflow());
         }
-        tri.iter_mut()
-            .zip(cells)
-            .for_each(|(t, &pass)| *t = if pass { YES } else { NO });
+        match cells {
+            ColVerdict::AllFalse(_) => tri.fill(NO),
+            ColVerdict::AllTrue(_) => tri.fill(YES),
+            ColVerdict::Mask(mask) => {
+                tri.iter_mut()
+                    .zip(mask)
+                    .for_each(|(t, &pass)| *t = if pass { YES } else { NO });
+            }
+        }
         return Ok(Some(tri));
     }
     let (Some(jt), Some(jvi)) = (&plan.json_tree, json_variant(plan)) else {
         return Ok(Some(tri));
     };
-    if passing.iter().all(|(_, v)| !v.contains(&true)) {
+    if passing.iter().all(|(_, v)| !v.any_true()) {
         return Ok(Some(tri));
     }
     let walk = JsonWalk {
@@ -1702,7 +1779,7 @@ fn eval_leaf_cells(
         else {
             return Ok(None);
         };
-        if *cells.get(occ as usize).ok_or_else(underflow)? {
+        if cells.get(occ as usize).ok_or_else(underflow)? {
             tri[ev.row as usize] = YES;
         }
     }
@@ -2021,15 +2098,31 @@ fn scan_col(
             }
         }
         Col::Dict { dict, ords } => {
-            let mut verdict = vec![0u8; dict.len()];
-            for (i, &o) in ords.iter().enumerate() {
-                let entry = dict.get(o as usize).ok_or_else(underflow)?;
-                let v = &mut verdict[o as usize];
-                if *v == 0 {
-                    *v = 1 + u8::from(np.found(entry));
+            // Single SIMD sweep over the dictionary bytes: skips scanning `ords` completely on
+            // the common 0-match case and specializes 1-match into a branchless equality scan.
+            let mut matched_entries = Vec::new();
+            scan_buf(dict.bytes(), dict.ends(), &mut |entry_idx| {
+                matched_entries.push(entry_idx as u32);
+            });
+            match matched_entries.as_slice() {
+                [] => {}
+                &[m] => {
+                    for (i, &o) in ords.iter().enumerate() {
+                        if o == m {
+                            hit(i);
+                        }
+                    }
                 }
-                if *v == 2 {
-                    hit(i);
+                entries => {
+                    let mut verdict = vec![false; dict.len()];
+                    for &e in entries {
+                        verdict[e as usize] = true;
+                    }
+                    for (i, &o) in ords.iter().enumerate() {
+                        if *verdict.get(o as usize).ok_or_else(underflow)? {
+                            hit(i);
+                        }
+                    }
                 }
             }
         }

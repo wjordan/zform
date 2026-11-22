@@ -150,7 +150,7 @@ fn walk<R: Read>(
                     let Ok(pb) = BlockParts::of_block(bslice, p, budget) else {
                         continue;
                     };
-                    if let Structure::Whole(s) = pb.structure {
+                    if let Structure::Whole { raw: s, .. } = pb.structure {
                         add_stat(&mut rep, "$structure", s.len() as u64);
                     }
                     let sd_bytes: u64 = pb.dicts.iter().flatten().map(|b| b.len() as u64).sum();
@@ -422,7 +422,7 @@ fn add_parts(
 ) -> u64 {
     let lib = &plan.library;
     let mut sum = 0u64;
-    if let Structure::Whole(s) = parts.structure {
+    if let Structure::Whole { raw: s, .. } = parts.structure {
         let n = node.child(&format!("{prefix}$structure"));
         n.bytes += s.len() as u64;
         n.add_sig(structure_sig(s, plan.json_tree.is_some(), budget));

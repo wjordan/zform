@@ -1272,10 +1272,23 @@ pub struct SplitResult<'a> {
     pub residual_bytes: usize,
     /// JSON objects stored whole because their key layout is not in the plan.
     pub unshaped_bytes: usize,
+    /// Extra raw slices needed for bit-exact structural substring filtering (when requested).
+    pub extra_filter_slices: Vec<&'a [u8]>,
+    /// Set if any used `JsonCand` requires falling back to raw-record substring filtering.
+    pub json_filter_unsafe: bool,
 }
 
 /// Routes every record in `records` through `plan`, appending only present occurrences to `col_occs[cid]`!
 pub fn split_records_with_plan<'a>(records: &[&'a [u8]], plan: &ModelPlan) -> SplitResult<'a> {
+    split_records_with_plan_opts(records, plan, false)
+}
+
+/// [`split_records_with_plan`], optionally capturing raw slices needed by structural filtering.
+pub(crate) fn split_records_with_plan_opts<'a>(
+    records: &[&'a [u8]],
+    plan: &ModelPlan,
+    collect_filter: bool,
+) -> SplitResult<'a> {
     let n = records.len();
     let n_cols = plan.columns.len();
     let mut variant_ids = Vec::with_capacity(n);
@@ -1291,7 +1304,10 @@ pub fn split_records_with_plan<'a>(records: &[&'a [u8]], plan: &ModelPlan) -> Sp
         .map(|c| c.nested_plan.is_some())
         .collect();
     let json_vi = plan.json_tree_variant_id();
-    let mut json_splitter = plan.json_tree.as_ref().map(JsonTreeBlockSplitter::new);
+    let mut json_splitter = plan
+        .json_tree
+        .as_ref()
+        .map(|jt| JsonTreeBlockSplitter::with_filter(jt, collect_filter));
 
     let routes = &plan.routes;
     let slots_of = |vi: u32| match &plan.variants[vi as usize] {
@@ -1392,9 +1408,17 @@ pub fn split_records_with_plan<'a>(records: &[&'a [u8]], plan: &ModelPlan) -> Sp
         residual_bytes += line.len();
     }
 
-    let (json_struct_streams, unshaped_bytes) = json_splitter
-        .map(|js| (js.struct_streams, js.unshaped_bytes))
-        .unwrap_or_default();
+    let (json_struct_streams, unshaped_bytes, extra_filter_slices, json_filter_unsafe) =
+        json_splitter
+            .map(|js| {
+                (
+                    js.struct_streams,
+                    js.unshaped_bytes,
+                    js.extra_filter_slices,
+                    js.filter_unsafe,
+                )
+            })
+            .unwrap_or_default();
 
     let mut per_row = vec![false; n_cols];
     for c in one_each
@@ -1413,6 +1437,8 @@ pub fn split_records_with_plan<'a>(records: &[&'a [u8]], plan: &ModelPlan) -> Sp
         residual_rows,
         residual_bytes,
         unshaped_bytes,
+        extra_filter_slices,
+        json_filter_unsafe,
     }
 }
 
@@ -1437,7 +1463,7 @@ impl BlockReconstructor {
         let json_rec = plan
             .json_tree
             .as_ref()
-            .map(|jt| JsonTreeBlockReconstructor::new(json_struct_streams, jt.paths.len()));
+            .map(|jt| JsonTreeBlockReconstructor::new(json_struct_streams, jt, plan));
         Self {
             col_pos: vec![0usize; plan.columns.len()],
             json_rec,
@@ -1454,6 +1480,10 @@ impl BlockReconstructor {
         self.json_rec
             .as_ref()
             .map_or(&[], |j| j.struct_streams.as_slice())
+    }
+
+    pub(crate) fn json_rec_mut(&mut self) -> Option<&mut JsonTreeBlockReconstructor> {
+        self.json_rec.as_mut()
     }
 
     /// Appends the next unread cell of column `cid` to `out`.
@@ -1483,17 +1513,10 @@ impl BlockReconstructor {
         budget: &DecodeBudget,
         out: &mut Vec<u8>,
     ) -> Result<()> {
-        // Most literals are empty or one separator byte, where a memmove call costs more than
-        // the copy.
-        let lit = |out: &mut Vec<u8>, l: &[u8]| match l {
-            [] => {}
-            &[b] => out.push(b),
-            _ => out.extend_from_slice(l),
-        };
-        lit(out, &s.literals[0]);
+        crate::cells::put_lit(out, &s.literals[0]);
         for (&cid, l) in s.slots.iter().zip(&s.literals[1..]) {
             Self::emit(col_pos, plan, ctx, budget, out, cid)?;
-            lit(out, l);
+            crate::cells::put_lit(out, l);
         }
         Ok(())
     }

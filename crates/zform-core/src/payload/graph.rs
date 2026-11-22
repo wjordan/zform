@@ -124,7 +124,7 @@ pub fn with_encode_opts<R>(backend: EntropyBackend, level: i32, f: impl FnOnce()
 #[inline]
 pub(crate) fn pack_leaf(raw: &[u8]) -> Vec<u8> {
     let (backend, level) = ENC_OPTS.with(|c| c.get());
-    let mut out = Vec::with_capacity(raw.len() + 12);
+    let mut out = Vec::new();
     compress_leaf(&mut out, raw, backend, level);
     out
 }
@@ -164,7 +164,7 @@ pub(crate) fn relevel_leaf(
 #[inline]
 pub(crate) fn pack_text_leaf(raw: &[u8]) -> Vec<u8> {
     let (backend, level) = ENC_OPTS.with(|c| c.get());
-    let mut out = Vec::with_capacity(raw.len() + 12);
+    let mut out = Vec::new();
     with_current(|dict| compress_leaf_with(&mut out, raw, backend, level, dict));
     out
 }
@@ -468,11 +468,7 @@ impl IntStream {
         if span <= u64::MAX as u128 {
             let max_u = span as u64;
             let bits = (64 - max_u.leading_zeros()) as u8;
-            let packed = bitpack_u64(
-                vals.iter().map(|&v| (v as u64).wrapping_sub(min as u64)),
-                bits,
-                vals.len(),
-            );
+            let packed = bitpack_for_slice(vals, min, bits);
             let leaf = pack_leaf(&packed);
             let cost = leaf.len() + 10;
             if best.as_ref().is_none_or(|(b, _)| cost < *b) {
@@ -498,12 +494,15 @@ impl IntStream {
                     8
                 };
                 let n = vals.len();
-                let mut planes = vec![0u8; n * (bw as usize)];
-                // A plane at a time keeps the stores sequential.
-                for (p, plane) in planes.chunks_exact_mut(n).enumerate() {
-                    for (dst, &v) in plane.iter_mut().zip(vals) {
-                        *dst = ((v as u64).wrapping_sub(min as u64) >> (8 * p)) as u8;
-                    }
+                let mut planes = Vec::with_capacity(n * (bw as usize));
+                let min_u = min as u64;
+                // A plane at a time keeps the stores sequential without pre-zeroing.
+                for p in 0..(bw as usize) {
+                    let shift = 8 * p;
+                    planes.extend(
+                        vals.iter()
+                            .map(|&v| ((v as u64).wrapping_sub(min_u) >> shift) as u8),
+                    );
                 }
                 let pay_p = pack_leaf(&planes);
                 let p_cost = pay_p.len() + 10;
@@ -1022,7 +1021,7 @@ impl IntStream {
                 if raw.len() < need_bytes {
                     return Err(Error::Format("truncated bitpack payload".into()));
                 }
-                Ok(bitunpack_u64(raw, *bits, n, *min))
+                Ok(bitunpack_slice_i64(&raw, *bits, n, *min))
             }
             Self::ZigZagVarint { len, leaf } => {
                 let n = *len as usize;
@@ -1138,6 +1137,115 @@ impl IntStream {
                 }
                 if tail.next().is_some() {
                     return Err(Error::Format("ForTail255 trailing tail items".into()));
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// Unpacks directly into `Vec<u32>` for ordinals, lengths, and structure streams, halving
+    /// allocation and memory bandwidth relative to unpacking `Vec<i64>` and narrowing.
+    pub fn unpack_u32(&self, budget: &DecodeBudget) -> Result<Vec<u32>> {
+        let n = self.len();
+        budget.check_alloc(n.saturating_mul(4), "IntStream u32")?;
+        match self {
+            Self::Const { val, len } => {
+                let u = u32::try_from(*val)
+                    .map_err(|_| Error::Format("u32_seq value out of range".into()))?;
+                Ok(vec![u; *len as usize])
+            }
+            Self::Rle { len, leaf } => {
+                let n = *len as usize;
+                let raw = unpack_leaf(leaf, budget)?;
+                let mut s = Cursor::new(&raw);
+                let runs = s.uvar()? as usize;
+                let mut out = Vec::with_capacity(n);
+                for _ in 0..runs {
+                    let v = u32::try_from(s.ivar()?)
+                        .map_err(|_| Error::Format("u32_seq value out of range".into()))?;
+                    let c = s.uvar()? as usize;
+                    if out.len().saturating_add(c) > n {
+                        return Err(Error::Format("RLE run exceeds stream length".into()));
+                    }
+                    out.resize(out.len() + c, v);
+                }
+                if out.len() != n || s.remaining() != 0 {
+                    return Err(Error::Format("RLE length mismatch".into()));
+                }
+                Ok(out)
+            }
+            Self::ForBitpack {
+                len,
+                min,
+                bits,
+                leaf,
+            } if *min >= 0 && (*min as u64) <= u32::MAX as u64 && *bits <= 32 => {
+                let n = *len as usize;
+                let need_bytes = (n * (*bits as usize)).div_ceil(8);
+                let raw = unpack_leaf(leaf, budget)?;
+                if raw.len() < need_bytes {
+                    return Err(Error::Format("truncated bitpack payload".into()));
+                }
+                bitunpack_slice_u32(&raw, *bits, n, *min as u64)
+            }
+            Self::ForPlanes {
+                len,
+                min,
+                width,
+                leaf,
+            } if *min >= 0 && (*min as u64) <= u32::MAX as u64 && *width <= 4 => {
+                let n = *len as usize;
+                let w = *width as usize;
+                let need = n
+                    .checked_mul(w)
+                    .ok_or_else(|| Error::Format("ForPlanes overflow".into()))?;
+                let raw = unpack_leaf(leaf, budget)?;
+                if raw.len() != need {
+                    return Err(Error::Format("ForPlanes payload length mismatch".into()));
+                }
+                if w == 4 && *min > 0 {
+                    // Check for u32 overflow via i64 fallback.
+                    let ints = self.unpack(budget)?;
+                    let mut out = Vec::with_capacity(n);
+                    for v in ints {
+                        out.push(
+                            u32::try_from(v)
+                                .map_err(|_| Error::Format("u32_seq value out of range".into()))?,
+                        );
+                    }
+                    return Ok(out);
+                }
+                let mut out = vec![*min as u32; n];
+                for (k, plane) in raw.chunks_exact(n.max(1)).enumerate() {
+                    let shift = 8 * k;
+                    for (o, &b) in out.iter_mut().zip(plane) {
+                        *o = o.wrapping_add((b as u32) << shift);
+                    }
+                }
+                Ok(out)
+            }
+            Self::ZigZagVarint { len, leaf } => {
+                let n = *len as usize;
+                let raw = unpack_leaf(leaf, budget)?;
+                let mut s = Cursor::new(&raw);
+                let mut out = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let v = u32::try_from(s.ivar()?)
+                        .map_err(|_| Error::Format("u32_seq value out of range".into()))?;
+                    out.push(v);
+                }
+                if s.remaining() != 0 {
+                    return Err(Error::Format("trailing bytes in ZigZagVarint".into()));
+                }
+                Ok(out)
+            }
+            _ => {
+                let ints = self.unpack(budget)?;
+                let mut out = Vec::with_capacity(ints.len());
+                for v in ints {
+                    let u = u32::try_from(v)
+                        .map_err(|_| Error::Format("u32_seq value out of range".into()))?;
+                    out.push(u);
                 }
                 Ok(out)
             }
@@ -2068,6 +2176,9 @@ pub(crate) const MTF_WINDOW: usize = 4096;
 /// Move-to-front codes of `vals` over the last [`MTF_WINDOW`] distinct values: `0` takes the
 /// next of the returned misses, `k` the value `k - 1` places back.
 pub(crate) fn mtf_split(vals: &[i64]) -> (Vec<i64>, Vec<i64>) {
+    if vals.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
     // A value's place in the list is how many distinct values were used since its own last
     // use, counted over a bitmap of last-use times instead of searched for in the list.
     let mut uses = LastUses::new(vals.len());
@@ -2081,19 +2192,24 @@ pub(crate) fn mtf_split(vals: &[i64]) -> (Vec<i64>, Vec<i64>) {
     } else {
         Vec::new()
     };
-    let mut sparse: FastMap<i64, u32> = FastMap::default();
+    let mut sparse: FastMap<i64, u32> = if dense.is_empty() {
+        fast_map_with_capacity(vals.len().min(4096))
+    } else {
+        FastMap::default()
+    };
     let mut codes = Vec::with_capacity(vals.len());
     let mut misses = Vec::new();
+    let lo_u = lo as u64;
     for (t, &v) in vals.iter().enumerate() {
         let prev = if dense.is_empty() {
             sparse.insert(v, t as u32)
         } else {
-            let slot = &mut dense[(v as i128 - lo as i128) as usize];
+            let slot = &mut dense[(v as u64).wrapping_sub(lo_u) as usize];
             Some(std::mem::replace(slot, t as u32)).filter(|&p| p != u32::MAX)
         };
         let rank = prev.map(|prev| {
             uses.clear(prev as usize);
-            uses.between(prev as usize, t)
+            uses.between_capped(prev as usize, t, MTF_WINDOW)
         });
         match rank {
             Some(r) if r < MTF_WINDOW => codes.push(r as i64 + 1),
@@ -2113,7 +2229,8 @@ struct LastUses {
     spans: Vec<u32>,
 }
 
-const SPAN_BITS: usize = 4096;
+/// 512 bits = 8 u64 words = 1 cache line per span, bounding edge word scans to at most 7 words.
+const SPAN_BITS: usize = 512;
 
 impl LastUses {
     fn new(n: usize) -> Self {
@@ -2123,40 +2240,58 @@ impl LastUses {
         }
     }
 
+    #[inline]
     fn set(&mut self, t: usize) {
-        self.words[t / 64] |= 1 << (t % 64);
+        self.words[t >> 6] |= 1u64 << (t & 63);
         self.spans[t / SPAN_BITS] += 1;
     }
 
+    #[inline]
     fn clear(&mut self, t: usize) {
-        self.words[t / 64] &= !(1 << (t % 64));
+        self.words[t >> 6] &= !(1u64 << (t & 63));
         self.spans[t / SPAN_BITS] -= 1;
     }
 
-    /// Set times strictly between `a` and `b`.
-    fn between(&self, a: usize, b: usize) -> usize {
+    /// Set times strictly between `a` and `b`, capped early at `cap`.
+    #[inline]
+    fn between_capped(&self, a: usize, b: usize, cap: usize) -> usize {
         let (lo, hi) = (a + 1, b);
         if lo >= hi {
             return 0;
         }
-        let (wl, wh) = (lo / 64, (hi - 1) / 64);
-        let lo_mask = !0u64 << (lo % 64);
-        let hi_mask = !0u64 >> (63 - (hi - 1) % 64);
+        let (wl, wh) = (lo >> 6, (hi - 1) >> 6);
+        let lo_mask = !0u64 << (lo & 63);
+        let hi_mask = !0u64 >> (63 - ((hi - 1) & 63));
         if wl == wh {
             return (self.words[wl] & lo_mask & hi_mask).count_ones() as usize;
         }
         let mut n =
             (self.words[wl] & lo_mask).count_ones() + (self.words[wh] & hi_mask).count_ones();
         const SPAN_WORDS: usize = SPAN_BITS / 64;
+        let cap_u32 = cap as u32;
         let mut w = wl + 1;
-        while w < wh {
-            if w % SPAN_WORDS == 0 && w + SPAN_WORDS <= wh {
-                n += self.spans[w / SPAN_WORDS];
-                w += SPAN_WORDS;
-            } else {
-                n += self.words[w].count_ones();
-                w += 1;
+        // Scan prefix words up to the next span boundary.
+        let next_span = (w + SPAN_WORDS - 1) & !(SPAN_WORDS - 1);
+        let prefix_end = next_span.min(wh);
+        while w < prefix_end {
+            n += self.words[w].count_ones();
+            w += 1;
+        }
+        if n >= cap_u32 {
+            return cap;
+        }
+        // Scan whole cache-line spans at a time, stopping early once we exceed `cap`.
+        while w + SPAN_WORDS <= wh {
+            n += self.spans[w / SPAN_WORDS];
+            if n >= cap_u32 {
+                return cap;
             }
+            w += SPAN_WORDS;
+        }
+        // Scan suffix words.
+        while w < wh {
+            n += self.words[w].count_ones();
+            w += 1;
         }
         n as usize
     }
@@ -3379,19 +3514,24 @@ impl CoreDecoder {
         let mut compact = Cursor::new(bytes);
         if rows > 0 && rows <= budget.max_records_per_block as u64 {
             let flags = compact.u8()?;
-            if flags & 0x80 != 0 || matches!(flags, 8 | 16) {
+            if flags & 0x80 != 0 {
+                let rows =
+                    u32::try_from(rows).map_err(|_| Error::BudgetExceeded("numeric rows"))?;
+                return decode_compact_numeric(&mut compact, rows, flags, budget);
+            }
+            if matches!(flags, 8 | 16) {
                 let rows =
                     u32::try_from(rows).map_err(|_| Error::BudgetExceeded("numeric rows"))?;
                 let (stream, prog, _) = read_numeric(&mut compact, rows, flags, budget)?;
-                let values = stream.unpack(budget)?;
-                if let Some(prog) = prog {
+                let mut values = stream.unpack(budget)?;
+                if let Some(prog) = prog
+                    && !super::chain::eval_numeric_chain_in_place(&prog, &mut values)
+                {
                     budget.check_alloc(values.len().saturating_mul(8), "numeric lane output")?;
                     let mut out = vec![0; values.len()];
-                    if !super::chain::eval_numeric_chain(&prog, &values, &mut out) {
-                        CompiledProgram::with(&prog.into(), |cp| {
-                            cp.eval_i64(&[&values], &[], &mut out)
-                        });
-                    }
+                    CompiledProgram::with(&prog.into(), |cp| {
+                        cp.eval_i64(&[&values], &[], &mut out)
+                    });
                     return Ok(out);
                 }
                 return Ok(values);
@@ -3655,7 +3795,7 @@ impl CoreDecoder {
                     Val::Buf(b) => b[start..end].to_vec(),
                     other => as_table_bytes(&other)?[start..end].to_vec(),
                 };
-                Ok(Col::Flat(Cells::from_parts(data, ends)?))
+                Ok(Col::Flat(Cells::from_parts_unchecked(data, ends)))
             }
             GraphNode::PagedSlice {
                 buf,
@@ -3974,17 +4114,45 @@ impl CoreDecoder {
                     budget.check_alloc(est, "PatchCells")?;
                     let mut data = Vec::with_capacity(est);
                     let mut ends = Vec::with_capacity(base_c.len());
-                    let mut p = 0usize;
-                    for r in 0..base_c.len() {
-                        if p < patched_idx.len() && patched_idx[p] == r {
-                            data.extend_from_slice(patch_c.get(p).unwrap());
-                            p += 1;
-                        } else {
-                            data.extend_from_slice(base_c.get(r).unwrap());
+                    let base_bytes = base_c.bytes();
+                    let base_ends = base_c.ends();
+                    let mut prev_r = 0usize;
+                    for (p, &pr) in patched_idx.iter().enumerate() {
+                        if pr > prev_r {
+                            let src_start = if prev_r == 0 {
+                                0
+                            } else {
+                                base_ends[prev_r - 1] as usize
+                            };
+                            let src_end = base_ends[pr - 1] as usize;
+                            let dst_start = data.len();
+                            data.extend_from_slice(&base_bytes[src_start..src_end]);
+                            let delta = dst_start.wrapping_sub(src_start);
+                            for &e in &base_ends[prev_r..pr] {
+                                ends.push((e as usize).wrapping_add(delta) as u32);
+                            }
                         }
+                        data.extend_from_slice(patch_c.get(p).unwrap());
                         ends.push(data.len() as u32);
+                        prev_r = pr + 1;
                     }
-                    Val::Cells(Cells::from_parts(data, ends)?)
+                    if prev_r < base_c.len() {
+                        let src_start = if prev_r == 0 {
+                            0
+                        } else {
+                            base_ends[prev_r - 1] as usize
+                        };
+                        let dst_start = data.len();
+                        data.extend_from_slice(&base_bytes[src_start..]);
+                        let delta = dst_start.wrapping_sub(src_start);
+                        for &e in &base_ends[prev_r..] {
+                            ends.push((e as usize).wrapping_add(delta) as u32);
+                        }
+                    }
+                    if data.len() > u32::MAX as usize {
+                        return Err(Error::BudgetExceeded("column bytes"));
+                    }
+                    Val::Cells(Cells::from_parts_unchecked(data, ends))
                 }
                 GraphNode::MtfInts { codes, misses } => {
                     let codes_col = head(as_ints(&vals[*codes as usize])?, upto);
@@ -4054,7 +4222,7 @@ impl CoreDecoder {
                     } else {
                         as_table_bytes(&vals[*buf as usize])?[start..end].to_vec()
                     };
-                    Val::Cells(Cells::from_parts(data, ends)?)
+                    Val::Cells(Cells::from_parts_unchecked(data, ends))
                 }
                 GraphNode::PagedSlice {
                     buf,
@@ -4088,7 +4256,10 @@ impl CoreDecoder {
                         data.extend_from_slice(sl);
                         ends.push(data.len() as u32);
                     }
-                    Val::Cells(Cells::from_parts(data, ends)?)
+                    if data.len() > u32::MAX as usize {
+                        return Err(Error::BudgetExceeded("column bytes"));
+                    }
+                    Val::Cells(Cells::from_parts_unchecked(data, ends))
                 }
                 GraphNode::TemplateCells { template, slots } => {
                     let slot_cols: Vec<&Cells> = slots
@@ -4138,7 +4309,10 @@ impl CoreDecoder {
                         }
                         ends.push(data.len() as u32);
                     }
-                    Val::Cells(Cells::from_parts(data, ends)?)
+                    if data.len() > u32::MAX as usize {
+                        return Err(Error::BudgetExceeded("column bytes"));
+                    }
+                    Val::Cells(Cells::from_parts_unchecked(data, ends))
                 }
                 GraphNode::ConstCells { val, count } => {
                     let n = *count as usize;
@@ -4153,7 +4327,10 @@ impl CoreDecoder {
                         data.extend_from_slice(val);
                         ends.push(data.len() as u32);
                     }
-                    Val::Cells(Cells::from_parts(data, ends)?)
+                    if data.len() > u32::MAX as usize {
+                        return Err(Error::BudgetExceeded("column bytes"));
+                    }
+                    Val::Cells(Cells::from_parts_unchecked(data, ends))
                 }
                 GraphNode::QuoteOrNull { inner, map } => {
                     let inner_c = as_cells(&vals[*inner as usize])?;
@@ -4177,11 +4354,17 @@ impl CoreDecoder {
                             }
                             ends.push(data.len() as u32);
                         }
-                        Val::Cells(Cells::from_parts(data, ends)?)
+                        if data.len() > u32::MAX as usize {
+                            return Err(Error::BudgetExceeded("column bytes"));
+                        }
+                        Val::Cells(Cells::from_parts_unchecked(data, ends))
                     } else {
                         let n = inner_c.len();
                         let total = inner_c.bytes().len().saturating_add(n.saturating_mul(2));
                         budget.check_alloc(total, "QuoteOrNull")?;
+                        if total > u32::MAX as usize {
+                            return Err(Error::BudgetExceeded("column bytes"));
+                        }
                         let mut data = Vec::with_capacity(total);
                         let mut ends = Vec::with_capacity(n);
                         for r in 0..n {
@@ -4190,7 +4373,7 @@ impl CoreDecoder {
                             data.push(b'"');
                             ends.push(data.len() as u32);
                         }
-                        Val::Cells(Cells::from_parts(data, ends)?)
+                        Val::Cells(Cells::from_parts_unchecked(data, ends))
                     }
                 }
                 GraphNode::ParseAsciiInt { cells } => {
@@ -4827,6 +5010,43 @@ fn get_u16_list(cur: &mut Cursor<'_>, limit: usize) -> Result<Vec<u16>> {
     Ok(out)
 }
 
+fn bitpack_for_slice(vals: &[i64], min: i64, bits: u8) -> Vec<u8> {
+    let min_u = min as u64;
+    match bits {
+        0 => Vec::new(),
+        8 => vals
+            .iter()
+            .map(|&v| (v as u64).wrapping_sub(min_u) as u8)
+            .collect(),
+        16 => {
+            let mut out = Vec::with_capacity(vals.len() * 2);
+            for &v in vals {
+                out.extend_from_slice(&((v as u64).wrapping_sub(min_u) as u16).to_le_bytes());
+            }
+            out
+        }
+        32 => {
+            let mut out = Vec::with_capacity(vals.len() * 4);
+            for &v in vals {
+                out.extend_from_slice(&((v as u64).wrapping_sub(min_u) as u32).to_le_bytes());
+            }
+            out
+        }
+        64 => {
+            let mut out = Vec::with_capacity(vals.len() * 8);
+            for &v in vals {
+                out.extend_from_slice(&(v as u64).wrapping_sub(min_u).to_le_bytes());
+            }
+            out
+        }
+        _ => bitpack_u64(
+            vals.iter().map(|&v| (v as u64).wrapping_sub(min_u)),
+            bits,
+            vals.len(),
+        ),
+    }
+}
+
 fn bitpack_u64(vals: impl Iterator<Item = u64>, bits: u8, len: usize) -> Vec<u8> {
     if bits == 0 {
         return Vec::new();
@@ -4851,20 +5071,375 @@ fn bitpack_u64(vals: impl Iterator<Item = u64>, bits: u8, len: usize) -> Vec<u8>
     out
 }
 
-fn bitunpack_u64(mut bytes: Vec<u8>, bits: u8, len: usize, min: i64) -> Vec<i64> {
-    if bits == 0 {
-        return vec![min; len];
+#[inline(always)]
+fn bitunpack_const_i64<const B: usize>(bytes: &[u8], len: usize, min: i64) -> Vec<i64> {
+    let min_u = min as u64;
+    let mask = if B == 64 { u64::MAX } else { (1u64 << B) - 1 };
+    let mut out = Vec::with_capacity(len);
+    match B {
+        8 => {
+            for &b in &bytes[..len] {
+                out.push(min_u.wrapping_add(b as u64) as i64);
+            }
+            return out;
+        }
+        16 => {
+            for c in bytes[..len * 2].as_chunks::<2>().0 {
+                out.push(min_u.wrapping_add(u16::from_le_bytes(*c) as u64) as i64);
+            }
+            return out;
+        }
+        32 => {
+            for c in bytes[..len * 4].as_chunks::<4>().0 {
+                out.push(min_u.wrapping_add(u32::from_le_bytes(*c) as u64) as i64);
+            }
+            return out;
+        }
+        64 => {
+            for c in bytes[..len * 8].as_chunks::<8>().0 {
+                out.push(min_u.wrapping_add(u64::from_le_bytes(*c)) as i64);
+            }
+            return out;
+        }
+        _ => {}
     }
-    let (b, mask) = (bits as usize, u64::MAX >> (64 - bits));
-    // Zero padding gives every lane a whole 16-byte window, so no lane takes a tail path.
-    bytes.resize(bytes.len() + 16, 0);
-    (0..len)
-        .map(|i| {
-            let at = i * b / 8;
-            let w = u128::from_le_bytes(bytes[at..at + 16].try_into().unwrap());
-            (min as u64).wrapping_add((w >> (i * b % 8)) as u64 & mask) as i64
-        })
-        .collect()
+    // For B <= 56, every lane fits inside a single unaligned u64 read whenever `at + 8 <= bytes.len()`.
+    let safe_end = bytes.len().saturating_sub(8);
+    let mut i = 0usize;
+    if B <= 56 && bytes.len() >= 8 {
+        while i < len {
+            let bit = i * B;
+            let at = bit >> 3;
+            if at > safe_end {
+                break;
+            }
+            let w = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+            out.push(min_u.wrapping_add((w >> (bit & 7)) & mask) as i64);
+            i += 1;
+        }
+    }
+    while i < len {
+        let bit = i * B;
+        let at = bit >> 3;
+        let mut tail = [0u8; 16];
+        let avail = (bytes.len() - at).min(16);
+        tail[..avail].copy_from_slice(&bytes[at..at + avail]);
+        let w = u128::from_le_bytes(tail);
+        out.push(min_u.wrapping_add((w >> (bit & 7)) as u64 & mask) as i64);
+        i += 1;
+    }
+    out
+}
+
+fn bitunpack_slice_i64(bytes: &[u8], bits: u8, len: usize, min: i64) -> Vec<i64> {
+    match bits {
+        0 => vec![min; len],
+        1 => bitunpack_const_i64::<1>(bytes, len, min),
+        2 => bitunpack_const_i64::<2>(bytes, len, min),
+        3 => bitunpack_const_i64::<3>(bytes, len, min),
+        4 => bitunpack_const_i64::<4>(bytes, len, min),
+        5 => bitunpack_const_i64::<5>(bytes, len, min),
+        6 => bitunpack_const_i64::<6>(bytes, len, min),
+        7 => bitunpack_const_i64::<7>(bytes, len, min),
+        8 => bitunpack_const_i64::<8>(bytes, len, min),
+        9 => bitunpack_const_i64::<9>(bytes, len, min),
+        10 => bitunpack_const_i64::<10>(bytes, len, min),
+        11 => bitunpack_const_i64::<11>(bytes, len, min),
+        12 => bitunpack_const_i64::<12>(bytes, len, min),
+        13 => bitunpack_const_i64::<13>(bytes, len, min),
+        14 => bitunpack_const_i64::<14>(bytes, len, min),
+        15 => bitunpack_const_i64::<15>(bytes, len, min),
+        16 => bitunpack_const_i64::<16>(bytes, len, min),
+        32 => bitunpack_const_i64::<32>(bytes, len, min),
+        64 => bitunpack_const_i64::<64>(bytes, len, min),
+        _ => {
+            let (b, mask, min_u) = (bits as usize, u64::MAX >> (64 - bits), min as u64);
+            let mut out = Vec::with_capacity(len);
+            let mut i = 0usize;
+            if b <= 56 && bytes.len() >= 8 {
+                let safe_end = bytes.len() - 8;
+                while i < len {
+                    let bit = i * b;
+                    let at = bit >> 3;
+                    if at > safe_end {
+                        break;
+                    }
+                    let w = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+                    out.push(min_u.wrapping_add((w >> (bit & 7)) & mask) as i64);
+                    i += 1;
+                }
+            }
+            while i < len {
+                let bit = i * b;
+                let at = bit >> 3;
+                let mut tail = [0u8; 16];
+                let avail = (bytes.len() - at).min(16);
+                tail[..avail].copy_from_slice(&bytes[at..at + avail]);
+                let w = u128::from_le_bytes(tail);
+                out.push(min_u.wrapping_add((w >> (bit & 7)) as u64 & mask) as i64);
+                i += 1;
+            }
+            out
+        }
+    }
+}
+
+#[inline(always)]
+fn bitunpack_const_u32<const B: usize>(bytes: &[u8], len: usize, min: u32) -> Vec<u32> {
+    let mask = if B == 32 { u32::MAX } else { (1u32 << B) - 1 };
+    let mut out = Vec::with_capacity(len);
+    match B {
+        8 => {
+            for &b in &bytes[..len] {
+                out.push(min.wrapping_add(b as u32));
+            }
+            return out;
+        }
+        16 => {
+            for c in bytes[..len * 2].as_chunks::<2>().0 {
+                out.push(min.wrapping_add(u16::from_le_bytes(*c) as u32));
+            }
+            return out;
+        }
+        32 => {
+            for c in bytes[..len * 4].as_chunks::<4>().0 {
+                out.push(min.wrapping_add(u32::from_le_bytes(*c)));
+            }
+            return out;
+        }
+        _ => {}
+    }
+    let mut i = 0usize;
+    if bytes.len() >= 8 {
+        let safe_end = bytes.len() - 8;
+        while i < len {
+            let bit = i * B;
+            let at = bit >> 3;
+            if at > safe_end {
+                break;
+            }
+            let w = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+            out.push(min.wrapping_add(((w >> (bit & 7)) as u32) & mask));
+            i += 1;
+        }
+    }
+    while i < len {
+        let bit = i * B;
+        let at = bit >> 3;
+        let mut tail = [0u8; 8];
+        let avail = (bytes.len() - at).min(8);
+        tail[..avail].copy_from_slice(&bytes[at..at + avail]);
+        let w = u64::from_le_bytes(tail);
+        out.push(min.wrapping_add(((w >> (bit & 7)) as u32) & mask));
+        i += 1;
+    }
+    out
+}
+
+fn bitunpack_slice_u32(bytes: &[u8], bits: u8, len: usize, min: u64) -> Result<Vec<u32>> {
+    if bits == 0 {
+        return Ok(vec![min as u32; len]);
+    }
+    let max_delta = if bits == 32 {
+        u32::MAX as u64
+    } else {
+        (1u64 << bits) - 1
+    };
+    if min + max_delta > u32::MAX as u64 {
+        // Potential u32 overflow: decode as i64 and validate each value.
+        let ints = bitunpack_slice_i64(bytes, bits, len, min as i64);
+        let mut out = Vec::with_capacity(len);
+        for v in ints {
+            out.push(
+                u32::try_from(v).map_err(|_| Error::Format("u32_seq value out of range".into()))?,
+            );
+        }
+        return Ok(out);
+    }
+    let min32 = min as u32;
+    Ok(match bits {
+        1 => bitunpack_const_u32::<1>(bytes, len, min32),
+        2 => bitunpack_const_u32::<2>(bytes, len, min32),
+        3 => bitunpack_const_u32::<3>(bytes, len, min32),
+        4 => bitunpack_const_u32::<4>(bytes, len, min32),
+        5 => bitunpack_const_u32::<5>(bytes, len, min32),
+        6 => bitunpack_const_u32::<6>(bytes, len, min32),
+        7 => bitunpack_const_u32::<7>(bytes, len, min32),
+        8 => bitunpack_const_u32::<8>(bytes, len, min32),
+        9 => bitunpack_const_u32::<9>(bytes, len, min32),
+        10 => bitunpack_const_u32::<10>(bytes, len, min32),
+        11 => bitunpack_const_u32::<11>(bytes, len, min32),
+        12 => bitunpack_const_u32::<12>(bytes, len, min32),
+        13 => bitunpack_const_u32::<13>(bytes, len, min32),
+        14 => bitunpack_const_u32::<14>(bytes, len, min32),
+        15 => bitunpack_const_u32::<15>(bytes, len, min32),
+        16 => bitunpack_const_u32::<16>(bytes, len, min32),
+        32 => bitunpack_const_u32::<32>(bytes, len, min32),
+        _ => {
+            let (b, mask) = (bits as usize, ((1u64 << bits) - 1) as u32);
+            let mut out = Vec::with_capacity(len);
+            let mut i = 0usize;
+            if bytes.len() >= 8 {
+                let safe_end = bytes.len() - 8;
+                while i < len {
+                    let bit = i * b;
+                    let at = bit >> 3;
+                    if at > safe_end {
+                        break;
+                    }
+                    let w = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+                    out.push(min32.wrapping_add(((w >> (bit & 7)) as u32) & mask));
+                    i += 1;
+                }
+            }
+            while i < len {
+                let bit = i * b;
+                let at = bit >> 3;
+                let mut tail = [0u8; 8];
+                let avail = (bytes.len() - at).min(8);
+                tail[..avail].copy_from_slice(&bytes[at..at + avail]);
+                let w = u64::from_le_bytes(tail);
+                out.push(min32.wrapping_add(((w >> (bit & 7)) as u32) & mask));
+                i += 1;
+            }
+            out
+        }
+    })
+}
+
+/// Zero-copy decoder for compact numeric payloads (`flags & 0x80 != 0`): unpacks directly from
+/// borrowed slices without copying into temporary `IntStream` `Vec`s, and applies linear chains
+/// in-place.
+fn decode_compact_numeric(
+    cur: &mut Cursor<'_>,
+    rows: u32,
+    flags: u8,
+    budget: &DecodeBudget,
+) -> Result<Vec<i64>> {
+    let n = rows as usize;
+    budget.check_alloc(n.saturating_mul(8), "numeric lanes")?;
+    let ops = (flags >> 4) & 7;
+    let mut rest = &cur.buf[cur.pos..];
+    let prog = if ops > 0 {
+        Some(Program::decode_linear_ops(&mut rest, u32::from(ops), true)?)
+    } else {
+        None
+    };
+    let code = cur.remaining() - rest.len();
+    cur.slice(code)?;
+    budget.check_alloc(cur.remaining(), "numeric transport bytes")?;
+    let mut values = match flags & 15 {
+        0 => vec![cur.ivar()?; n],
+        7 => {
+            let shift = cur.u8()?;
+            if !(1..64).contains(&shift) {
+                return Err(Error::Format("invalid constant shift".into()));
+            }
+            let c = cur.ivar()?;
+            let val = c.wrapping_shl(u32::from(shift));
+            if val >> shift != c {
+                return Err(Error::Format("constant shift overflow".into()));
+            }
+            vec![val; n]
+        }
+        4 => {
+            let raw = cur.slice(cur.remaining())?;
+            let mut s = Cursor::new(raw);
+            let mut out = Vec::with_capacity(n);
+            for _ in 0..n {
+                out.push(s.ivar()?);
+            }
+            if s.remaining() != 0 {
+                return Err(Error::Format("trailing bytes in ZigZagVarint".into()));
+            }
+            out
+        }
+        5 => {
+            let leaf = cur.slice(cur.remaining())?;
+            let raw = unpack_leaf(leaf, budget)?;
+            let mut s = Cursor::new(&raw);
+            let mut out = Vec::with_capacity(n);
+            for _ in 0..n {
+                out.push(s.ivar()?);
+            }
+            if s.remaining() != 0 {
+                return Err(Error::Format("trailing bytes in ZigZagVarint".into()));
+            }
+            out
+        }
+        1 => {
+            let leaf = cur.slice(cur.remaining())?;
+            let raw = unpack_leaf(leaf, budget)?;
+            let mut s = Cursor::new(&raw);
+            let runs = s.uvar()? as usize;
+            let mut out = Vec::with_capacity(n);
+            for _ in 0..runs {
+                let v = s.ivar()?;
+                let c = s.uvar()? as usize;
+                if out.len().saturating_add(c) > n {
+                    return Err(Error::Format("RLE run exceeds stream length".into()));
+                }
+                out.resize(out.len() + c, v);
+            }
+            if out.len() != n || s.remaining() != 0 {
+                return Err(Error::Format("RLE length mismatch".into()));
+            }
+            out
+        }
+        3 => {
+            let min = cur.ivar()?;
+            let bits = cur.u8()?;
+            if bits > 64 {
+                return Err(Error::Format("invalid integer bit width".into()));
+            }
+            let raw = cur.slice(cur.remaining())?;
+            let need = (u64::from(rows) * u64::from(bits)).div_ceil(8) as usize;
+            if raw.len() != need {
+                return Err(Error::Format("invalid packed width".into()));
+            }
+            bitunpack_slice_i64(raw, bits, n, min)
+        }
+        2 => {
+            let min = cur.ivar()?;
+            let bits = cur.u8()?;
+            if bits > 64 {
+                return Err(Error::Format("invalid integer bit width".into()));
+            }
+            let leaf = cur.slice(cur.remaining())?;
+            let raw = unpack_leaf(leaf, budget)?;
+            let need = (n * (bits as usize)).div_ceil(8);
+            if raw.len() < need {
+                return Err(Error::Format("truncated bitpack payload".into()));
+            }
+            bitunpack_slice_i64(&raw, bits, n, min)
+        }
+        8 => {
+            let bytes = cur.slice(cur.remaining())?;
+            super::rice::decode(bytes, n, budget)?
+        }
+        11 => {
+            let min = cur.ivar()?;
+            let radix =
+                u32::try_from(cur.uvar()?).map_err(|_| Error::Format("invalid radix".into()))?;
+            let layout = super::radix::Layout::new(radix)
+                .ok_or_else(|| Error::Format("invalid radix".into()))?;
+            let bytes = cur.slice(layout.size(n))?;
+            layout.unpack(bytes, n, min)?
+        }
+        _ => return Err(Error::Format("unknown numeric stream".into())),
+    };
+    if cur.remaining() != 0 {
+        return Err(Error::Format("trailing numeric stream bytes".into()));
+    }
+    if let Some(prog) = prog
+        && !super::chain::eval_numeric_chain_in_place(&prog, &mut values)
+    {
+        budget.check_alloc(values.len().saturating_mul(8), "numeric lane output")?;
+        let mut out = vec![0; values.len()];
+        CompiledProgram::with(&prog.into(), |cp| cp.eval_i64(&[&values], &[], &mut out));
+        return Ok(out);
+    }
+    Ok(values)
 }
 
 fn read_numeric(
@@ -5012,7 +5587,7 @@ fn bitpack_roundtrips_every_width() {
                 .collect();
             let packed = bitpack_u64(vals.iter().copied(), bits, len);
             assert_eq!(packed.len(), (len * bits as usize).div_ceil(8));
-            let back = bitunpack_u64(packed, bits, len, 0);
+            let back = bitunpack_slice_i64(&packed, bits, len, 0);
             assert!(
                 back.iter().zip(&vals).all(|(&a, &b)| a as u64 == b),
                 "{bits}"

@@ -575,10 +575,9 @@ impl PackRegistry {
             ..
         }) = pick
         {
-            let mut best: Option<(usize, PayloadGraph, bool, Cand)> = None;
-            for (&cand, tape) in std::iter::once(first).chain(also).zip(tapes) {
-                let scope = tape::Scope::replay(tape);
-                let got = match cand {
+            if also.is_none() {
+                let scope = tape::Scope::replay(&tapes[0]);
+                let got = match *first {
                     None => Some(base()),
                     Some(k) => self
                         .packs
@@ -589,20 +588,44 @@ impl PackRegistry {
                 };
                 scope.end();
                 if let Some((graph, raw)) = got {
-                    let cost = graph.cost();
-                    if best.as_ref().is_none_or(|b| cost < b.0) {
-                        best = Some((cost, graph, raw, cand));
+                    return Single {
+                        graph,
+                        raw,
+                        won: *first,
+                        also: None,
+                        tapes: Default::default(),
+                    };
+                }
+            } else {
+                let mut best: Option<(usize, PayloadGraph, bool, Cand)> = None;
+                for (&cand, tape) in std::iter::once(first).chain(also).zip(tapes) {
+                    let scope = tape::Scope::replay(tape);
+                    let got = match cand {
+                        None => Some(base()),
+                        Some(k) => self
+                            .packs
+                            .get(k as usize)
+                            .filter(|p| p.precheck(&ColumnProfile::sample(rows)))
+                            .and_then(|p| p.try_encode(rows))
+                            .map(|g| (g, false)),
+                    };
+                    scope.end();
+                    if let Some((graph, raw)) = got {
+                        let cost = graph.cost();
+                        if best.as_ref().is_none_or(|b| cost < b.0) {
+                            best = Some((cost, graph, raw, cand));
+                        }
                     }
                 }
-            }
-            if let Some((_, graph, raw, won)) = best {
-                return Single {
-                    graph,
-                    raw,
-                    won,
-                    also: None,
-                    tapes: Default::default(),
-                };
+                if let Some((_, graph, raw, won)) = best {
+                    return Single {
+                        graph,
+                        raw,
+                        won,
+                        also: None,
+                        tapes: Default::default(),
+                    };
+                }
             }
         }
 
@@ -1051,12 +1074,49 @@ fn mt_locate(
     Some((at, missing))
 }
 
+/// Compact 128 KiB filter of all words across `0..MT_SEEDS` MT19937 streams so real hashes/UUIDs
+/// reject in O(1) nanoseconds without pinning megabytes of precomputed streams in RSS.
+fn mt_seed_filter() -> &'static [u64] {
+    static FILTER: std::sync::OnceLock<Box<[u64]>> = std::sync::OnceLock::new();
+    FILTER.get_or_init(|| {
+        let mut filter = vec![0u64; 1 << 14].into_boxed_slice();
+        for seed in 0..MT_SEEDS {
+            let mut stream = MtStream::seeded(seed);
+            stream.grow(2 * MT_N);
+            for &w in &stream.words {
+                let h = w.wrapping_mul(0x9e37_79b9) >> 12;
+                filter[(h >> 6) as usize] |= 1u64 << (h & 63);
+            }
+        }
+        filter
+    })
+}
+
 fn mt_search_seed(recs: &[u8], width: usize, layouts: &[(MtLayout, usize)]) -> Option<u32> {
+    let probe_rows: Vec<(usize, &[u8])> = recs.chunks_exact(width).take(4).enumerate().collect();
+    let all_probeable = probe_rows
+        .iter()
+        .all(|&(_, rec)| layouts.iter().all(|&(l, _)| l.probe(rec).is_some()));
+    if all_probeable {
+        let filter = mt_seed_filter();
+        let any_hit = probe_rows.iter().any(|&(_, rec)| {
+            layouts.iter().any(|&(layout, _)| {
+                layout.probe(rec).is_some_and(|(_, word)| {
+                    let h = word.wrapping_mul(0x9e37_79b9) >> 12;
+                    (filter[(h >> 6) as usize] & (1u64 << (h & 63))) != 0
+                })
+            })
+        });
+        if !any_hit {
+            return None;
+        }
+    }
     (0..MT_SEEDS).find(|&seed| {
         let mut stream = MtStream::seeded(seed);
         stream.grow(2 * MT_N);
-        let rows = recs.chunks_exact(width).take(4).enumerate();
-        rows.flat_map(|row| layouts.iter().map(move |l| (row, l)))
+        probe_rows
+            .iter()
+            .flat_map(|&row| layouts.iter().map(move |l| (row, l)))
             .any(|((row, rec), &(layout, k))| {
                 let prev = mt_before(recs, row, width);
                 stream.words.windows(k).any(|w| layout.fits(w, prev, rec))
@@ -2232,15 +2292,30 @@ impl CodecPack for JavaLcgPack {
         let mut anchor = None;
         let mut steps = Vec::with_capacity(rows.len());
         let (mut exc_idx, mut exc_vals) = (Vec::new(), Vec::new());
+        let mut cache: FastMap<&[u8], Option<i64>> = FastMap::default();
         for (i, &r) in rows.iter().enumerate() {
             // Other data almost never passes, so 16 values settle it.
-            if i == 16 && exc_idx.len() > 8 {
-                return None;
-            }
-            match ExactIntPack::parse_canonical_i64(r).and_then(Self::state_of) {
-                Some(state) => {
-                    steps.push(Self::distance(*anchor.get_or_insert(state), state));
+            if i == 16 {
+                if exc_idx.len() > 8 {
+                    return None;
                 }
+                cache.reserve(rows.len().min(4096));
+            }
+            let step = if i > 16
+                && let Some(&cached) = cache.get(r)
+            {
+                cached
+            } else {
+                let computed = ExactIntPack::parse_canonical_i64(r)
+                    .and_then(Self::state_of)
+                    .map(|state| Self::distance(*anchor.get_or_insert(state), state));
+                if i >= 16 && cache.len() < 32768 {
+                    cache.insert(r, computed);
+                }
+                computed
+            };
+            match step {
+                Some(dist) => steps.push(dist),
                 None => {
                     exc_idx.push(i);
                     exc_vals.push(r);
@@ -4721,13 +4796,17 @@ impl CodecPack for BinaryPlanesPack {
 /// Result of encoding all columns of a dense block via [`PackRegistry::encode_dense_block`].
 pub struct EncodedDenseBlock {
     pub shared_dict_blobs: Vec<Vec<u8>>,
+    pub(crate) shared_dict_graphs: Vec<Option<PayloadGraph>>,
     /// The text pool's leaves: none, one leaf, or pages.
     pub pool_pages: Vec<Vec<u8>>,
     /// Each page's token filter and by row its page plus one (`0` for none), when paged.
     pub pool_filters: Vec<Vec<u8>>,
     pub pool_rows: Vec<u32>,
     pub col_blobs: Vec<Vec<u8>>,
+    pub(crate) col_graphs: Vec<Option<PayloadGraph>>,
     pub summaries: Vec<ColSummary>,
+    /// By column, whether all distinct values were already added to the block substring filter.
+    pub(crate) filtered_cols: Vec<bool>,
     /// By column, the candidate that coded it and its cells.
     pub picks: Vec<Pick>,
 }
@@ -4741,9 +4820,14 @@ pub struct Paging<'a> {
     pub cell_rows: &'a dyn Fn(&[bool]) -> Option<Vec<Vec<u32>>>,
 }
 
-/// A text pool's leaves and its columns' graphs, and when paged each page's token filter and
-/// by row its page plus one.
-type PoolEnc = (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<u32>);
+/// A text pool's leaves and its columns' graphs+wire blobs, and when paged each page's token
+/// filter and by row its page plus one.
+type PoolEnc = (
+    Vec<Vec<u8>>,
+    Vec<(PayloadGraph, Vec<u8>)>,
+    Vec<Vec<u8>>,
+    Vec<u32>,
+);
 
 /// The pool as one leaf, each column's cells back to back.
 fn whole_pool(cols: &[&[&[u8]]]) -> PoolEnc {
@@ -4756,14 +4840,22 @@ fn whole_pool(cols: &[&[&[u8]]]) -> PoolEnc {
         let mut gb = GraphBuilder::new(vals.len());
         let p_node = gb.add_ext_pool();
         let s_node = gb.add_slice_buf(p_node, base, &lens);
-        specs.push(gb.finish(s_node).encode());
+        let g = gb.finish(s_node);
+        let wire = g.encode();
+        specs.push((g, wire));
     }
     (vec![pack_text_leaf(&raw)], specs, Vec::new(), Vec::new())
 }
 
 /// The pool cut into pages of whole rows, so a record reads one page and the first. Rows go in
 /// order of their longest cell's leading bytes, which puts like rows, and repeats, together.
-fn page_pool(cols: &[&[&[u8]]], rows: &[Vec<u32>], page_bytes: usize, level: i32) -> PoolEnc {
+fn page_pool(
+    cols: &[&[&[u8]]],
+    rows: &[Vec<u32>],
+    page_bytes: usize,
+    level: i32,
+    mut block_filter: Option<&mut FilterBuilder>,
+) -> (PoolEnc, bool) {
     const KEY: usize = 32;
     let n_rows = rows
         .iter()
@@ -4797,20 +4889,41 @@ fn page_pool(cols: &[&[&[u8]]], rows: &[Vec<u32>], page_bytes: usize, level: i32
         cur += row_bytes[r];
     }
     let mut pages = vec![Vec::new(); n_pages as usize];
-    let mut filters: Vec<_> = (0..n_pages)
-        .map(|_| FilterBuilder::new(DEFAULT_FILTER_BITS))
-        .collect();
+    let mut page_cells: Vec<Vec<&[u8]>> = vec![Vec::new(); n_pages as usize];
     let mut col_pages = Vec::with_capacity(cols.len());
     let mut col_bases = Vec::with_capacity(cols.len());
     for (vals, rs) in cols.iter().zip(rows) {
         let ids: Vec<i64> = rs.iter().map(|&r| page_of[r as usize] as i64).collect();
         let bases: Vec<usize> = pages.iter().map(Vec::len).collect();
-        for (v, &p) in vals.iter().zip(&ids) {
+        for (&v, &p) in vals.iter().zip(&ids) {
             pages[p as usize].extend_from_slice(v);
-            filters[p as usize].add_text(v);
+            if !v.is_empty() {
+                page_cells[p as usize].push(v);
+            }
         }
         col_pages.push(ids);
         col_bases.push(bases);
+    }
+    // Build page filters one page at a time with a single L1-resident FilterBuilder, merging
+    // each page's bitset directly into the block filter in O(words) to avoid double-scanning prose.
+    let mut page_fb = FilterBuilder::new(DEFAULT_FILTER_BITS);
+    let mut filters = Vec::with_capacity(n_pages as usize);
+    let mut merged_all = block_filter.is_some();
+    for cells in &page_cells {
+        let mut prev: Option<&[u8]> = None;
+        for &v in cells {
+            if prev == Some(v) {
+                continue;
+            }
+            prev = Some(v);
+            page_fb.add_text(v);
+        }
+        if let Some(bf) = block_filter.as_deref_mut()
+            && !bf.merge_from(&page_fb)
+        {
+            merged_all = false;
+        }
+        filters.push(page_fb.finish_page_and_reset());
     }
     let starts: Vec<usize> = pages
         .iter()
@@ -4830,17 +4943,18 @@ fn page_pool(cols: &[&[&[u8]]], rows: &[Vec<u32>], page_bytes: usize, level: i32
             let mut gb = GraphBuilder::new(vals.len());
             let p_node = gb.add_ext_pool();
             let s_node = gb.add_paged_slice(p_node, &lens, ids, &bases);
-            gb.finish(s_node).encode()
+            let g = gb.finish(s_node);
+            let wire = g.encode();
+            (g, wire)
         })
-        .collect();
-    let filters = filters
-        .into_iter()
-        .map(FilterBuilder::finish_page)
         .collect();
     let rows = (0..n_rows)
         .map(|r| (row_bytes[r] > 0) as u32 * (page_of[r] + 1))
         .collect();
-    (compress_pages(&pages, level), specs, filters, rows)
+    (
+        (compress_pages(&pages, level), specs, filters, rows),
+        merged_all,
+    )
 }
 
 fn replace_subslice(hay: &[u8], needle: &[u8], rep: &[u8]) -> Option<Vec<u8>> {
@@ -4860,7 +4974,7 @@ struct Interned<'v> {
 
 impl<'v> Interned<'v> {
     fn of(col: &[&'v [u8]]) -> Self {
-        let mut ids: FastMap<&[u8], u32> = FastMap::default();
+        let mut ids: FastMap<&[u8], u32> = fast_map_with_capacity(col.len().min(4096));
         let rows = col
             .iter()
             .map(|&v| {
@@ -4882,7 +4996,7 @@ fn keyed_lookup<'v>(
     head: impl Fn(usize) -> &'v FastSet<&'v [u8]>,
     interned: impl Fn(usize) -> &'v Interned<'v>,
     align: impl Fn(usize, usize) -> Option<Vec<i64>>,
-) -> Option<(Vec<u8>, usize)> {
+) -> Option<(PayloadGraph, Vec<u8>, usize)> {
     // Small columns rarely repay the search.
     let vals = &occ[cid];
     if vals.len() < KEYED_ROWS {
@@ -4908,7 +5022,7 @@ fn keyed_lookup<'v>(
         .filter(|&(d, k)| d >= 64 && d * 4 <= occ[k].len().min(1024) * 3)
         .collect();
     keys.sort_unstable_by(|a, b| b.cmp(a));
-    let mut best: Option<(Vec<u8>, usize)> = None;
+    let mut best: Option<(PayloadGraph, Vec<u8>, usize)> = None;
     let mut tries = 0;
     for &s in &srcs {
         for &(_, k) in &keys {
@@ -4931,8 +5045,10 @@ fn keyed_lookup<'v>(
                 *n += 1;
                 first.entry(pair(kid, sv)).or_insert(*n);
             }
+            let max_exc = vals.len() / 2;
             let mut codes = Vec::with_capacity(vals.len());
             let (mut exc_idx, mut exc_vals) = (Vec::new(), Vec::new());
+            let mut too_many = false;
             for (i, &v) in vals.iter().enumerate() {
                 let code = src
                     .ids
@@ -4944,9 +5060,13 @@ fn keyed_lookup<'v>(
                 if code == 0 {
                     exc_idx.push(i);
                     exc_vals.push(v);
+                    if exc_idx.len() > max_exc {
+                        too_many = true;
+                        break;
+                    }
                 }
             }
-            if exc_idx.len() * 2 > vals.len() {
+            if too_many {
                 continue;
             }
             let mut gb = GraphBuilder::new(vals.len());
@@ -4957,9 +5077,10 @@ fn keyed_lookup<'v>(
             let idx = gb.add_match_index(needles, hay, codes_n);
             let base = gb.add_index_cells(src_n, idx);
             let root = gb.add_patch(base, &exc_idx, &exc_vals);
-            let cand = gb.finish(root).priced();
-            if best.as_ref().is_none_or(|b| cand.1 < b.1) {
-                best = Some(cand);
+            let graph = gb.finish(root);
+            let (wire, cost) = graph.priced();
+            if best.as_ref().is_none_or(|b| cost < b.2) {
+                best = Some((graph, wire, cost));
             }
         }
     }
@@ -5013,12 +5134,48 @@ impl PackRegistry {
         level: i32,
         picks: Option<&[Pick]>,
     ) -> EncodedDenseBlock {
+        self.encode_dense_block_with_opts(
+            occ_streams,
+            dict_groups,
+            horiz_cands,
+            preencoded_nested,
+            standalone,
+            layout,
+            paging,
+            backend,
+            level,
+            picks,
+            false,
+            None,
+        )
+    }
+
+    /// Internal entry point for [`Self::encode_dense_block_picked`] supporting `sample_only`
+    /// (skips summaries, Phase 2 shared dicts, and Phase 3 prose pooling when only `picks` is
+    /// needed) and optional structural `filter` feeding of categorical vocabularies.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_dense_block_with_opts(
+        &self,
+        occ_streams: &[Vec<&[u8]>],
+        dict_groups: &[&str],
+        horiz_cands: &[Vec<usize>],
+        preencoded_nested: &mut [Option<(ColSummary, Vec<u8>)>],
+        standalone: &[bool],
+        layout: Option<(&ModelPlan, &[u32])>,
+        paging: Option<Paging<'_>>,
+        backend: EntropyBackend,
+        level: i32,
+        picks: Option<&[Pick]>,
+        sample_only: bool,
+        mut filter: Option<(&mut FilterBuilder, &[bool])>,
+    ) -> EncodedDenseBlock {
         let _mixing = crate::payload::graph::ContextMixScope::new(false);
         let _memo = crate::payload::graph::EncodeMemoScope::new();
         let search = crate::payload::graph::search_level(level);
         with_encode_opts(backend, search, || {
             let n_cols = occ_streams.len();
             let mut col_blobs = Vec::with_capacity(n_cols);
+            let mut col_graphs: Vec<Option<PayloadGraph>> = Vec::with_capacity(n_cols);
             // What each blob counts as when sizes are compared: its length less shared code.
             let mut col_costs = Vec::with_capacity(n_cols);
             let mut summaries = Vec::with_capacity(n_cols);
@@ -5059,6 +5216,8 @@ impl PackRegistry {
                 (0..n_cols).map(|_| OnceCell::new()).collect();
             let interned: Vec<OnceCell<Interned<'_>>> =
                 (0..n_cols).map(|_| OnceCell::new()).collect();
+            let id_luts: Vec<OnceCell<FastMap<&[u8], i64>>> =
+                (0..n_cols).map(|_| OnceCell::new()).collect();
 
             // Phase 1: Single-column `PayloadGraph` + horizontal `ExtPeer` derivations.
             for cid in 0..n_cols {
@@ -5066,23 +5225,34 @@ impl PackRegistry {
                     summaries.push(sum);
                     col_costs.push(blob.len());
                     col_blobs.push(blob);
+                    col_graphs.push(None);
                     used_ext[cid] = true;
                     continue;
                 }
                 let vals = &occ_streams[cid];
                 if vals.is_empty() {
+                    let g = PayloadGraph::empty();
+                    let wire = g.encode();
                     summaries.push(ColSummary::of(&[]));
-                    col_blobs.push(PayloadGraph::empty().encode());
+                    col_blobs.push(wire);
+                    col_graphs.push(Some(g));
                     col_costs.push(1);
                     continue;
                 }
                 let occ_len = vals.len();
-                let mut sum = ColSummary::of(vals);
-                if let Some((lo, hi)) = int_bounds(vals) {
-                    (sum.numeric_kind, sum.min_val, sum.max_val) = (1, lo, hi);
-                } else if let Some((lo, hi)) = time_bounds(vals) {
-                    (sum.numeric_kind, sum.min_val, sum.max_val) = (2, lo, hi);
-                }
+                let sum = if sample_only {
+                    ColSummary::default()
+                } else {
+                    let mut sum = ColSummary::of(vals);
+                    if sum.letters == 0
+                        && let Some((lo, hi)) = int_bounds(vals)
+                    {
+                        (sum.numeric_kind, sum.min_val, sum.max_val) = (1, lo, hi);
+                    } else if let Some((lo, hi)) = time_bounds(vals) {
+                        (sum.numeric_kind, sum.min_val, sum.max_val) = (2, lo, hi);
+                    }
+                    sum
+                };
 
                 let must_standalone = standalone.get(cid).copied().unwrap_or(false);
                 let whole = Pick {
@@ -5093,17 +5263,25 @@ impl PackRegistry {
                     .and_then(|p| p.get(cid))
                     .filter(|p| p.cells >= PICK_CELLS.min(occ_len))
                     .unwrap_or(&whole);
-                let (mut best_blob, mut best_cost, mut is_raw_fb, mut choice, mut tapes);
+                let (
+                    mut best_graph,
+                    mut best_blob,
+                    mut best_cost,
+                    mut is_raw_fb,
+                    mut choice,
+                    mut tapes,
+                );
                 let (mut want, mut near) = (pick.choice, false);
                 loop {
                     let all = want == Choice::Search;
-                    (best_blob, best_cost, is_raw_fb, choice) =
-                        (Vec::new(), usize::MAX, false, want);
+                    (best_graph, best_blob, best_cost, is_raw_fb, choice) =
+                        (None, Vec::new(), usize::MAX, false, want);
                     tapes = Default::default();
                     used_ext[cid] = false;
                     if all || matches!(want, Choice::Single(..)) {
                         let single = self.encode_single(vals, 0, (!all).then_some(pick));
                         (best_blob, best_cost) = single.graph.priced();
+                        best_graph = Some(single.graph);
                         is_raw_fb = single.raw;
                         choice = Choice::Single(single.won, single.also);
                         tapes = single.tapes;
@@ -5160,8 +5338,10 @@ impl PackRegistry {
                                     let mut gb = GraphBuilder::new(occ_len);
                                     let peer = gb.add_ext_peer(src_i as u32);
                                     let root = gb.add_patch(peer, &exc_idx, &exc_vals);
-                                    let (cand, cand_cost) = gb.finish(root).priced();
+                                    let g = gb.finish(root);
+                                    let (cand, cand_cost) = g.priced();
                                     if cand_cost + 6 < best_cost {
+                                        best_graph = Some(g);
                                         best_blob = cand;
                                         best_cost = cand_cost;
                                         used_ext[cid] = true;
@@ -5228,8 +5408,10 @@ impl PackRegistry {
                                     template: t_node,
                                     slots: slot_nodes,
                                 });
-                                let (cand, cand_cost) = gb.finish(root).priced();
+                                let g = gb.finish(root);
+                                let (cand, cand_cost) = g.priced();
                                 if cand_cost + 6 < best_cost {
+                                    best_graph = Some(g);
                                     best_blob = cand;
                                     best_cost = cand_cost;
                                     used_ext[cid] = true;
@@ -5329,8 +5511,10 @@ impl PackRegistry {
                                             fmt_n
                                         };
                                         let root = gb.add_patch(base_n, &exc_idx, &exc_vals);
-                                        let (cand, cand_cost) = gb.finish(root).priced();
+                                        let g = gb.finish(root);
+                                        let (cand, cand_cost) = g.priced();
                                         if cand_cost + 6 < best_cost {
+                                            best_graph = Some(g);
                                             best_blob = cand;
                                             best_cost = cand_cost;
                                             used_ext[cid] = true;
@@ -5347,12 +5531,15 @@ impl PackRegistry {
                                 if fixed_id_widths[src_i] == Some(fw)
                                     && !occ_streams[src_i].is_empty()
                                 {
-                                    let src_vals = &occ_streams[src_i];
-                                    let mut lut: FastMap<&[u8], i64> =
-                                        fast_map_with_capacity(src_vals.len().min(4096));
-                                    for (idx, &sv) in src_vals.iter().enumerate() {
-                                        lut.entry(sv).or_insert(idx as i64);
-                                    }
+                                    let lut = id_luts[src_i].get_or_init(|| {
+                                        let src_vals = &occ_streams[src_i];
+                                        let mut m: FastMap<&[u8], i64> =
+                                            fast_map_with_capacity(src_vals.len().min(4096));
+                                        for (idx, &sv) in src_vals.iter().enumerate() {
+                                            m.entry(sv).or_insert(idx as i64);
+                                        }
+                                        m
+                                    });
                                     let probe = occ_len.min(64);
                                     let probe_hits = vals[..probe]
                                         .iter()
@@ -5379,8 +5566,10 @@ impl PackRegistry {
                                             let idx_node = gb.add_mtf_ints(&idxs);
                                             let indexed = gb.add_index_cells(peer, idx_node);
                                             let root = gb.add_patch(indexed, &exc_idx, &exc_vals);
-                                            let (cand, cand_cost) = gb.finish(root).priced();
+                                            let g = gb.finish(root);
+                                            let (cand, cand_cost) = g.priced();
                                             if cand_cost + 12 < best_cost {
+                                                best_graph = Some(g);
                                                 best_blob = cand;
                                                 best_cost = cand_cost;
                                                 used_ext[cid] = true;
@@ -5426,9 +5615,10 @@ impl PackRegistry {
                             )
                         });
                         let tape = scope.end();
-                        if let Some((cand, cand_cost)) = found
+                        if let Some((g, cand, cand_cost)) = found
                             && cand_cost + 12 < best_cost
                         {
+                            best_graph = Some(g);
                             best_blob = cand;
                             best_cost = cand_cost;
                             used_ext[cid] = true;
@@ -5471,6 +5661,7 @@ impl PackRegistry {
                                     && graph.nodes.iter().any(keyed)
                                     && cost * 2 < best_cost.saturating_mul(3);
                                 if cost + 32 < best_cost {
+                                    best_graph = Some(graph);
                                     best_blob = cand;
                                     best_cost = cost;
                                     used_ext[cid] = true;
@@ -5507,6 +5698,22 @@ impl PackRegistry {
                 summaries.push(sum);
                 col_costs.push(best_cost);
                 col_blobs.push(best_blob);
+                col_graphs.push(best_graph);
+            }
+
+            if sample_only {
+                return EncodedDenseBlock {
+                    shared_dict_blobs: Vec::new(),
+                    shared_dict_graphs: Vec::new(),
+                    pool_pages: Vec::new(),
+                    pool_filters: Vec::new(),
+                    pool_rows: Vec::new(),
+                    col_blobs,
+                    col_graphs,
+                    summaries,
+                    filtered_cols: Vec::new(),
+                    picks: chosen,
+                };
             }
 
             // Phase 2: Block-level `SharedDictPool` (`ExtDict` + `IndexCells`) across categorical columns.
@@ -5515,6 +5722,7 @@ impl PackRegistry {
                 all_quoted: bool,
                 vocab: FastMap<&'a [u8], u32>,
             }
+            let mut filtered_cols = vec![false; n_cols];
             let mut dict_cands = Vec::<DictCand<'_>>::new();
             for cid in 0..n_cols {
                 let vals = &occ_streams[cid];
@@ -5543,34 +5751,84 @@ impl PackRegistry {
                         vocab.insert(inner, 1);
                     }
                 }
-                if ok && vocab.len() >= 2 && vocab.len() * 4 <= vals.len() * 3 {
-                    dict_cands.push(DictCand {
-                        cid,
-                        all_quoted: all_q,
-                        vocab,
-                    });
+                if ok {
+                    if let Some((fb, skip)) = filter.as_mut()
+                        && !skip.get(cid).copied().unwrap_or(false)
+                        && (summaries[cid].letters & 0x03ff_ffff) != 0
+                    {
+                        for &k in vocab.keys() {
+                            fb.add_text(k);
+                        }
+                        filtered_cols[cid] = true;
+                    }
+                    if vocab.len() >= 2 && vocab.len() * 4 <= vals.len() * 3 {
+                        dict_cands.push(DictCand {
+                            cid,
+                            all_quoted: all_q,
+                            vocab,
+                        });
+                    }
                 }
             }
 
+            // Build O(ΣV) inverted index per `all_quoted` group to compute exact pairwise overlaps.
+            let n_dc = dict_cands.len();
+            let mut postings: Vec<Vec<u16>> = Vec::new();
+            if n_dc >= 2 {
+                let mut term_map_q: FastMap<&[u8], u32> = fast_map_with_capacity(1024);
+                let mut term_map_u: FastMap<&[u8], u32> = fast_map_with_capacity(1024);
+                for (ci, dc) in dict_cands.iter().enumerate() {
+                    let map = if dc.all_quoted {
+                        &mut term_map_q
+                    } else {
+                        &mut term_map_u
+                    };
+                    for &s in dc.vocab.keys() {
+                        let tid = *map.entry(s).or_insert_with(|| {
+                            let id = postings.len() as u32;
+                            postings.push(Vec::new());
+                            id
+                        });
+                        postings[tid as usize].push(ci as u16);
+                    }
+                }
+            }
+            let mut shared_terms: Vec<Vec<u32>> = vec![Vec::new(); n_dc];
+            for (tid, plist) in postings.iter().enumerate() {
+                if plist.len() >= 2 {
+                    for &ci in plist {
+                        shared_terms[ci as usize].push(tid as u32);
+                    }
+                }
+            }
+            let mut overlap_counts = vec![0u32; n_dc];
+
             let mut shared_dict_blobs = Vec::<Vec<u8>>::new();
-            let mut assigned = vec![false; dict_cands.len()];
-            for i in 0..dict_cands.len() {
-                if assigned[i] {
+            let mut shared_dict_graphs = Vec::<PayloadGraph>::new();
+            let mut assigned = vec![false; n_dc];
+            for i in 0..n_dc {
+                if assigned[i] || shared_terms[i].is_empty() {
                     continue;
+                }
+                overlap_counts[i + 1..].fill(0);
+                for &tid in &shared_terms[i] {
+                    for &j in postings[tid as usize].iter().rev() {
+                        let j = j as usize;
+                        if j <= i {
+                            break;
+                        }
+                        overlap_counts[j] += 1;
+                    }
                 }
                 let mut cluster = vec![i];
                 let gi = dict_groups.get(dict_cands[i].cid).copied().unwrap_or("");
-                for j in (i + 1)..dict_cands.len() {
-                    if assigned[j] || dict_cands[j].all_quoted != dict_cands[i].all_quoted {
+                for j in (i + 1)..n_dc {
+                    let inter = overlap_counts[j] as usize;
+                    if inter == 0 || assigned[j] {
                         continue;
                     }
                     let gj = dict_groups.get(dict_cands[j].cid).copied().unwrap_or("");
                     let same_group = !gi.is_empty() && gi == gj;
-                    let inter = dict_cands[i]
-                        .vocab
-                        .keys()
-                        .filter(|k| dict_cands[j].vocab.contains_key(*k))
-                        .count();
                     let min_v = dict_cands[i].vocab.len().min(dict_cands[j].vocab.len());
                     if (same_group && inter >= 1) || (min_v >= 4 && inter * 10 >= min_v) {
                         cluster.push(j);
@@ -5591,8 +5849,8 @@ impl PackRegistry {
                 let mut entries: Vec<(&[u8], u32)> = merged.into_iter().collect();
                 entries.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
                 let entry_slices: Vec<&[u8]> = entries.iter().map(|e| e.0).collect();
-                let (dict_blob, dict_cost) =
-                    self.encode_best_graph_inner(&entry_slices, 0).0.priced();
+                let dict_graph = self.encode_best_graph_inner(&entry_slices, 0).0;
+                let (dict_blob, dict_cost) = dict_graph.priced();
 
                 let mut lut: FastMap<&[u8], i64> = fast_map_with_capacity(entry_slices.len());
                 for (id, &s) in entry_slices.iter().enumerate() {
@@ -5624,16 +5882,19 @@ impl PackRegistry {
                     } else {
                         idx_node
                     };
-                    let mb = gb.finish(root).encode();
+                    let mg = gb.finish(root);
+                    let mb = mg.encode();
                     new_sum += mb.len();
-                    member_blobs.push((ci, cid, mb));
+                    member_blobs.push((ci, cid, mg, mb));
                 }
                 if new_sum + 16 < cur_sum {
                     shared_dict_blobs.push(dict_blob);
-                    for (ci, cid, mb) in member_blobs {
+                    shared_dict_graphs.push(dict_graph);
+                    for (ci, cid, mg, mb) in member_blobs {
                         assigned[ci] = true;
                         col_costs[cid] = mb.len();
                         col_blobs[cid] = mb;
+                        col_graphs[cid] = Some(mg);
                         used_ext[cid] = true;
                         raw_backed[cid] = false;
                     }
@@ -5701,11 +5962,31 @@ impl PackRegistry {
                     });
                 let cost = |(pages, specs, ..): &PoolEnc| {
                     pages.iter().map(|p| p.len() + 3).sum::<usize>()
-                        + specs.iter().map(Vec::len).sum::<usize>()
+                        + specs.iter().map(|(_, b)| b.len()).sum::<usize>()
                 };
+                let mut prose_merged = false;
+                let can_merge_prose = filter.as_ref().is_some_and(|(_, skip)| {
+                    prose_cols
+                        .iter()
+                        .all(|&c| !skip.get(c).copied().unwrap_or(false))
+                });
                 let paged = rows
-                    .map(|(page_bytes, rows)| page_pool(&cols, &rows, page_bytes, level))
+                    .map(|(page_bytes, rows)| {
+                        let bf = if can_merge_prose {
+                            filter.as_mut().map(|(fb, _)| &mut **fb)
+                        } else {
+                            None
+                        };
+                        let (enc, merged) = page_pool(&cols, &rows, page_bytes, level, bf);
+                        prose_merged = merged;
+                        enc
+                    })
                     .filter(|p| (2..=MAX_PAGES).contains(&p.0.len()));
+                if prose_merged {
+                    for &cid in &prose_cols {
+                        filtered_cols[cid] = true;
+                    }
+                }
                 // Pages cost a little more than one leaf. The pool is chosen as one leaf would
                 // be, then paged unless that costs over a quarter more: text that repeats
                 // across rows pays for its repeats in every page.
@@ -5724,33 +6005,53 @@ impl PackRegistry {
                     pool_pages = pages;
                     pool_filters = filters;
                     pool_rows = rows;
-                    for (&cid, blob) in prose_cols.iter().zip(member_specs) {
+                    for (&cid, (g, blob)) in prose_cols.iter().zip(member_specs) {
                         col_costs[cid] = blob.len();
                         col_blobs[cid] = blob;
+                        col_graphs[cid] = Some(g);
                     }
                 }
             }
 
             if self.context_mixing {
-                for blob in col_blobs.iter_mut().chain(&mut shared_dict_blobs) {
-                    // Nested wrappers have already optimized their own constituent payloads.
-                    if let Ok(graph) =
-                        PayloadGraph::decode(blob, &crate::wire::DecodeBudget::default())
-                    {
-                        let mixed = graph.with_context_mixing().encode();
+                for (blob, g_opt) in col_blobs.iter_mut().zip(&mut col_graphs) {
+                    if let Some(graph) = g_opt {
+                        let mixed_graph = graph.clone().with_context_mixing();
+                        let mixed = mixed_graph.encode();
                         if mixed.len() < blob.len() {
                             *blob = mixed;
+                            *graph = mixed_graph;
                         }
                     }
+                }
+                for (blob, graph) in shared_dict_blobs.iter_mut().zip(&mut shared_dict_graphs) {
+                    let mixed_graph = graph.clone().with_context_mixing();
+                    let mixed = mixed_graph.encode();
+                    if mixed.len() < blob.len() {
+                        *blob = mixed;
+                        *graph = mixed_graph;
+                    }
+                }
+            }
+            let need_relevel = search != level;
+            let keep_graph = |g: PayloadGraph| (need_relevel || g.has_code()).then_some(g);
+            let shared_dict_graphs: Vec<Option<PayloadGraph>> =
+                shared_dict_graphs.into_iter().map(keep_graph).collect();
+            for slot in &mut col_graphs {
+                if let Some(g) = slot.take() {
+                    *slot = keep_graph(g);
                 }
             }
             EncodedDenseBlock {
                 shared_dict_blobs,
+                shared_dict_graphs,
                 pool_pages,
                 pool_filters,
                 pool_rows,
                 col_blobs,
+                col_graphs,
                 summaries,
+                filtered_cols,
                 picks: chosen,
             }
         })

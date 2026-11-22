@@ -2,21 +2,22 @@
 //! compressed against it, so a block spells out only what the rest of the file does not hold.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::fmt;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use zstd_safe::zstd_sys as zs;
-use zstd_safe::{CCtx, CParameter, DCtx};
+use zstd_safe::{CCtx, CParameter};
 
 use crate::container::PackOptions;
 use crate::grammar::{ModelPlan, split_records_with_plan};
 use crate::packs::HexFixedPack;
+use crate::payload::graph::FastMap;
 use crate::tables::Tables;
 use crate::wire::{
     Cursor, DecodeBudget, EntropyBackend, Error, Result, decompress_leaf, put_leaf, window_log,
-    xxh64,
+    xxh64, xxh64_pair,
 };
 
 /// Seed of a dictionary's id, as of a frame's content checksum.
@@ -36,12 +37,35 @@ const DIGEST_WINDOW_LOG: u32 = 17;
 pub struct Dictionary {
     /// The content digested, by level. A writer prices leaves at one level and keeps them at
     /// another, and digesting the content costs more than most leaves do. Declared first: a
-    /// digest refers to `bytes`, so it must be dropped before them.
+    /// digest and `ddict` refer to `bytes`, so they must be dropped before them.
     digests: Mutex<Vec<(i32, Arc<Digest>)>>,
+    ddict: OnceLock<Option<DDict>>,
     bytes: Vec<u8>,
     /// Computed when first asked for: a writer's tables may still be encoding their wire.
     id: OnceLock<u64>,
     tables: Option<Arc<Tables>>,
+}
+
+/// Content wrapped as a zero-copy `ZSTD_DDict` for decompression.
+struct DDict(NonNull<zs::ZSTD_DDict>);
+
+// zstd only reads a DDict once it is made.
+unsafe impl Send for DDict {}
+unsafe impl Sync for DDict {}
+
+impl DDict {
+    /// `content` must outlive the DDict, which refers to it.
+    fn new(content: &[u8]) -> Option<Self> {
+        let ptr =
+            unsafe { zs::ZSTD_createDDict_byReference(content.as_ptr().cast(), content.len()) };
+        NonNull::new(ptr).map(Self)
+    }
+}
+
+impl Drop for DDict {
+    fn drop(&mut self) {
+        unsafe { zs::ZSTD_freeDDict(self.0.as_ptr()) };
+    }
 }
 
 impl fmt::Debug for Dictionary {
@@ -63,6 +87,7 @@ impl Dictionary {
         }
         Self {
             digests: Mutex::default(),
+            ddict: OnceLock::new(),
             id: OnceLock::new(),
             bytes,
             tables: None,
@@ -140,6 +165,7 @@ impl Dictionary {
         let id = OnceLock::from(id);
         Ok(Self {
             digests: Mutex::default(),
+            ddict: OnceLock::new(),
             bytes,
             id,
             tables: tables.map(Arc::new),
@@ -167,27 +193,52 @@ impl Dictionary {
         };
         COMPRESSOR.with_borrow_mut(|c| {
             if c.is_none() {
-                *c = NonNull::new(unsafe { zs::ZSTD_createCCtx() }).map(Compressor);
+                *c = NonNull::new(unsafe { zs::ZSTD_createCCtx() }).map(Compressor::new);
             }
-            c.as_ref()?.compress(&digest, dst, src, level)
+            c.as_mut()?.compress(&digest, dst, src, level)
         })
     }
 
-    /// Expands a frame `compress` wrote. The content is referred to, not copied.
-    pub(crate) fn decompress(
+    /// Expands a frame `compress` wrote directly into `dst_ptr[..dst_cap]`.
+    /// The content is referred to through a cached zero-copy `ZSTD_DDict`.
+    pub(crate) fn decompress_raw(
         &self,
-        dctx: &mut DCtx<'_>,
-        dst: &mut [u8],
+        dctx: *mut zs::ZSTD_DCtx,
+        dst_ptr: *mut u8,
+        dst_cap: usize,
         src: &[u8],
-    ) -> zstd_safe::SafeResult {
-        dctx.decompress_using_dict(dst, src, &self.bytes)
+    ) -> usize {
+        if let Some(dd) = self.ddict.get_or_init(|| DDict::new(&self.bytes)) {
+            unsafe {
+                zs::ZSTD_decompress_usingDDict(
+                    dctx,
+                    dst_ptr.cast(),
+                    dst_cap,
+                    src.as_ptr().cast(),
+                    src.len(),
+                    dd.0.as_ptr(),
+                )
+            }
+        } else {
+            unsafe {
+                zs::ZSTD_decompress_usingDict(
+                    dctx,
+                    dst_ptr.cast(),
+                    dst_cap,
+                    src.as_ptr().cast(),
+                    src.len(),
+                    self.bytes.as_ptr().cast(),
+                    self.bytes.len(),
+                )
+            }
+        }
     }
 }
 
 fn content_id(bytes: &[u8], tables: Option<&Tables>) -> u64 {
     match tables {
         None => xxh64(bytes, ID_SEED),
-        Some(t) => xxh64(&[bytes, t.wire()].concat(), ID_SEED),
+        Some(t) => xxh64_pair(bytes, t.wire(), ID_SEED),
     }
 }
 
@@ -196,8 +247,13 @@ fn zok(code: usize) -> Option<()> {
     (unsafe { zs::ZSTD_isError(code) } == 0).then_some(())
 }
 
+static NEXT_DIGEST_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Content digested at one level: tables that compressors on any thread search in place.
-struct Digest(NonNull<zs::ZSTD_CDict>);
+struct Digest {
+    ptr: NonNull<zs::ZSTD_CDict>,
+    id: u64,
+}
 
 // zstd only reads a digest once it is made.
 unsafe impl Send for Digest {}
@@ -243,48 +299,86 @@ impl Digest {
                     )
                 });
             zs::ZSTD_freeCCtxParams(p.as_ptr());
-            NonNull::new(made?).map(Self)
+            NonNull::new(made?).map(|ptr| Self {
+                ptr,
+                id: NEXT_DIGEST_ID.fetch_add(1, Ordering::Relaxed),
+            })
         }
     }
 }
 
 impl Drop for Digest {
     fn drop(&mut self) {
-        unsafe { zs::ZSTD_freeCDict(self.0.as_ptr()) };
+        unsafe { zs::ZSTD_freeCDict(self.ptr.as_ptr()) };
     }
 }
 
 /// A thread's compressor for frames against a digest.
-struct Compressor(NonNull<zs::ZSTD_CCtx>);
+struct Compressor {
+    ctx: NonNull<zs::ZSTD_CCtx>,
+    last_digest_id: u64,
+    last_level: i32,
+    last_strategy: i32,
+    last_wlog: i32,
+}
 
 impl Compressor {
-    fn compress(&self, digest: &Digest, dst: &mut [u8], src: &[u8], level: i32) -> Option<usize> {
+    fn new(ctx: NonNull<zs::ZSTD_CCtx>) -> Self {
+        Self {
+            ctx,
+            last_digest_id: 0,
+            last_level: i32::MIN,
+            last_strategy: i32::MIN,
+            last_wlog: i32::MIN,
+        }
+    }
+
+    fn compress(
+        &mut self,
+        digest: &Digest,
+        dst: &mut [u8],
+        src: &[u8],
+        level: i32,
+    ) -> Option<usize> {
         use zs::ZSTD_cParameter::*;
-        let c = self.0.as_ptr();
+        let c = self.ctx.as_ptr();
+        let strategy = unsafe { zs::ZSTD_getCParams(level, src.len() as u64, 0).strategy as i32 };
+        let wlog = window_log(src.len()) as i32;
         unsafe {
-            zok(zs::ZSTD_CCtx_reset(
-                c,
-                zs::ZSTD_ResetDirective::ZSTD_reset_session_and_parameters,
-            ))?;
-            zok(zs::ZSTD_CCtx_setParameter(
-                c,
-                ZSTD_c_compressionLevel,
-                level,
-            ))?;
-            // A digest made with explicit parameters carries no level, so the frame would
-            // settle what the digest leaves open (block splitting) as for the default level.
-            let strategy = zs::ZSTD_getCParams(level, src.len() as u64, 0).strategy as i32;
-            zok(zs::ZSTD_CCtx_setParameter(c, ZSTD_c_strategy, strategy))?;
-            zok(zs::ZSTD_CCtx_setParameter(c, ZSTD_c_checksumFlag, 0))?;
-            // The content stays in reach only within a frame's first window.
-            zok(zs::ZSTD_CCtx_setParameter(
-                c,
-                ZSTD_c_windowLog,
-                window_log(src.len()) as i32,
-            ))?;
-            // `ZSTD_c_forceAttachDict`: the leaf searches the digest in place, never a copy.
-            zok(zs::ZSTD_CCtx_setParameter(c, ZSTD_c_experimentalParam4, 1))?;
-            zok(zs::ZSTD_CCtx_refCDict(c, digest.0.as_ptr()))?;
+            if self.last_digest_id != digest.id || self.last_level != level {
+                zok(zs::ZSTD_CCtx_reset(
+                    c,
+                    zs::ZSTD_ResetDirective::ZSTD_reset_session_and_parameters,
+                ))?;
+                zok(zs::ZSTD_CCtx_setParameter(
+                    c,
+                    ZSTD_c_compressionLevel,
+                    level,
+                ))?;
+                zok(zs::ZSTD_CCtx_setParameter(c, ZSTD_c_strategy, strategy))?;
+                zok(zs::ZSTD_CCtx_setParameter(c, ZSTD_c_checksumFlag, 0))?;
+                zok(zs::ZSTD_CCtx_setParameter(c, ZSTD_c_windowLog, wlog))?;
+                // `ZSTD_c_forceAttachDict`: the leaf searches the digest in place, never a copy.
+                zok(zs::ZSTD_CCtx_setParameter(c, ZSTD_c_experimentalParam4, 1))?;
+                zok(zs::ZSTD_CCtx_refCDict(c, digest.ptr.as_ptr()))?;
+                self.last_digest_id = digest.id;
+                self.last_level = level;
+                self.last_strategy = strategy;
+                self.last_wlog = wlog;
+            } else {
+                zok(zs::ZSTD_CCtx_reset(
+                    c,
+                    zs::ZSTD_ResetDirective::ZSTD_reset_session_only,
+                ))?;
+                if self.last_strategy != strategy {
+                    zok(zs::ZSTD_CCtx_setParameter(c, ZSTD_c_strategy, strategy))?;
+                    self.last_strategy = strategy;
+                }
+                if self.last_wlog != wlog {
+                    zok(zs::ZSTD_CCtx_setParameter(c, ZSTD_c_windowLog, wlog))?;
+                    self.last_wlog = wlog;
+                }
+            }
             let n = zs::ZSTD_compress2(
                 c,
                 dst.as_mut_ptr().cast(),
@@ -299,7 +393,7 @@ impl Compressor {
 
 impl Drop for Compressor {
     fn drop(&mut self) {
-        unsafe { zs::ZSTD_freeCCtx(self.0.as_ptr()) };
+        unsafe { zs::ZSTD_freeCCtx(self.ctx.as_ptr()) };
     }
 }
 
@@ -370,7 +464,7 @@ struct Tally {
     /// Values the open block is the first to hold.
     fresh: Vec<u64>,
     /// Values some earlier block held too.
-    found: HashMap<u64, Found>,
+    found: FastMap<u64, Found>,
     arena: Vec<u8>,
 }
 

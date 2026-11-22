@@ -98,7 +98,32 @@ pub fn decode(
 }
 
 pub fn decode_i64(bytes: &[u8], count: usize, budget: &DecodeBudget) -> Result<Vec<i64>> {
-    let column = decode(bytes, count, &[], budget)?;
+    use zform_core::payload::graph::GraphNode;
+    use zform_core::payload::ir::{Len, Width};
+    let graph = PayloadGraph::decode(bytes, budget)?;
+    if graph.rows as usize != count {
+        return Err(Error::Format("column row count mismatch".into()));
+    }
+    let fast_root = match &graph.nodes[graph.root as usize] {
+        GraphNode::ProgramCells {
+            prog, inputs, bufs, ..
+        } if prog.ops.is_empty()
+            && prog.width == Width::W64
+            && prog.n_in == 1
+            && bufs.is_empty()
+            && prog.sinks == [(0, Len::Fixed(8))]
+            && inputs.len() == 1 =>
+        {
+            Some(inputs[0])
+        }
+        _ => None,
+    };
+    if let Some(inp) = fast_root {
+        let mut sub = graph;
+        sub.root = inp;
+        return CoreDecoder::decode_ints(&sub, &ExtInputs::empty(), budget);
+    }
+    let column = CoreDecoder::decode_col(&graph, &ExtInputs::empty(), budget)?;
     let mut scratch = Vec::new();
     (0..count)
         .map(|r| {

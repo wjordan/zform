@@ -1,9 +1,24 @@
 //! Centered Rice transport for signed integer lanes.
+use std::cell::RefCell;
+
 use crate::wire::{Cursor, DecodeBudget, Error, Result, put_ivarint};
+
+thread_local! {
+    static RICE_SCRATCH: RefCell<(Vec<i64>, Vec<u64>)> = const { RefCell::new((Vec::new(), Vec::new())) };
+}
 
 pub(super) fn encode(values: &[i64], budget: usize) -> Option<Vec<u8>> {
     let mut out = Vec::new();
-    encode_rice(values, budget, &mut Vec::new(), &mut Vec::new(), &mut out).then_some(out)
+    RICE_SCRATCH.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        let (median, centered) = &mut *borrow;
+        let ok = encode_rice(values, budget, median, centered, &mut out);
+        if median.capacity() > 4096 {
+            *median = Vec::new();
+            *centered = Vec::new();
+        }
+        ok.then_some(out)
+    })
 }
 
 pub(super) fn decode(bytes: &[u8], count: usize, budget: &DecodeBudget) -> Result<Vec<i64>> {
@@ -116,7 +131,61 @@ fn decode_rice(
         word: 0,
         available: 0,
     };
-    for _ in 0..count {
+    // Fast sliding-window unaligned-u64 path for k <= 55: keeps >= 57 bits in view with no
+    // word-boundary refill splits on common short quotients.
+    let mut done = 0usize;
+    if k <= 55 && bytes.len() >= 8 {
+        let mask = (1u64 << k) - 1;
+        let limit_bytes = bytes.len() - 8;
+        let mut bit_pos = 0usize;
+        while done < count {
+            let byte_pos = bit_pos >> 3;
+            if byte_pos > limit_bytes {
+                break;
+            }
+            let w = u64::from_le_bytes(bytes[byte_pos..byte_pos + 8].try_into().unwrap())
+                >> (bit_pos & 7);
+            let avail = 64 - (bit_pos & 7) as u32;
+            let q = w.trailing_zeros();
+            if q + 1 + k <= avail {
+                let code = ((q as u64) << k) | ((w >> (q + 1)) & mask);
+                let delta = ((code >> 1) as i64) ^ -((code & 1) as i64);
+                emit(center.checked_add(delta).ok_or("Rice residual overflow")?)?;
+                bit_pos += (q + 1 + k) as usize;
+                done += 1;
+            } else {
+                // Rare long unary run: sync into RiceReader and consume one symbol cleanly.
+                let byte_aligned = bit_pos >> 3;
+                let rem_bits = (bit_pos & 7) as u32;
+                reader.at = byte_aligned;
+                reader.refill()?;
+                reader.word >>= rem_bits;
+                reader.available -= rem_bits;
+                let quotient = reader.unary(u64::MAX >> k)?;
+                let code = (quotient << k) | reader.bits(k)?;
+                let delta = ((code >> 1) as i64) ^ -((code & 1) as i64);
+                emit(center.checked_add(delta).ok_or("Rice residual overflow")?)?;
+                bit_pos = reader.at * 8 - reader.available as usize;
+                done += 1;
+            }
+        }
+        // Sync bit_pos back into RiceReader for the final <= 8 bytes and finish() validation.
+        let byte_aligned = bit_pos >> 3;
+        let rem_bits = (bit_pos & 7) as u32;
+        reader.at = byte_aligned;
+        if byte_aligned < bytes.len() {
+            reader.refill()?;
+            if rem_bits > reader.available {
+                return Err("truncated Rice residuals".into());
+            }
+            reader.word >>= rem_bits;
+            reader.available -= rem_bits;
+        } else {
+            reader.word = 0;
+            reader.available = 0;
+        }
+    }
+    for _ in done..count {
         let quotient = reader.unary(u64::MAX >> k)?;
         let code = (quotient << k) | reader.bits(k)?;
         let delta = ((code >> 1) as i64) ^ -((code & 1) as i64);

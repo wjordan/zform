@@ -539,12 +539,87 @@ pub struct PathTrieNode {
     pub elem_node: i32,
 }
 
+/// How a `JsonCand` interacts with structural block substring-filter construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandFilter {
+    /// Boundary-safe: adding the candidate's literals once per block is bit-exact.
+    Safe,
+    /// Needs raw `val_slice` fed into the filter (e.g. `b64` or letter-touching affix, no free part).
+    RawSlice,
+    /// Letter-touching `MultiConcat` with a free part: the entire path feeds raw `val_slice`
+    /// directly to the filter and skips scanning its `value_col`.
+    RawPath,
+}
+
+/// Compact 16-byte bytecode operation for whole-block JSON reconstruction.
+#[derive(Clone, Copy)]
+pub(crate) struct FastOp {
+    pub lit_off: u32,
+    pub lit_len: u32,
+    pub kind: FastOpKind,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FastArrayOp {
+    pub count_stream: u16,
+    pub elem_path: u16,
+    pub sep_off: u32,
+    pub sep_len: u16,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum FastOpKind {
+    LitOnly,
+    Col {
+        cid: u16,
+    },
+    ColScope {
+        cid: u16,
+        path_idx: u16,
+    },
+    Cand {
+        path_idx: u16,
+        sel_stream: u16,
+        cid: u16,
+        need_scope: bool,
+    },
+    SubObj {
+        path_idx: u16,
+        shape_stream: u16,
+        cid: u16,
+    },
+    Array {
+        idx: u16,
+    },
+}
+
+/// Flattened, L1-resident decode plan built once per `JsonTreePlan`.
+#[derive(Clone, Default)]
+pub(crate) struct FastJsonPlan {
+    pub lit_arena: Vec<u8>,
+    pub ops: Vec<FastOp>,
+    pub arrays: Vec<FastArrayOp>,
+    pub shape_ranges: Vec<Vec<(u32, u32)>>,
+    pub path_op: Vec<FastOpKind>,
+}
+
 /// Precomputed fast-matching index for `JsonTreePlan` (rebuilt via `rebuild_runtime_index`).
 #[derive(Clone, Default)]
 pub struct JsonTreeRuntime {
     pub trie: Vec<PathTrieNode>,
     /// Per-path shape key lookup `shape_key -> 1-based shape_id`.
     pub shape_maps: Vec<HashMap<Vec<u8>, u32>>,
+    /// Per-path index in `trie` (`u32::MAX` if unmapped).
+    pub path_trie_node: Vec<u32>,
+    /// Whether any `JsonCand` references `paths[i]`.
+    pub is_referenced: Vec<bool>,
+    /// Precomputed filter safety for each path's candidates.
+    pub cand_filter: Vec<Vec<CandFilter>>,
+    /// Per-path flag: true when any candidate on this path is `RawPath` (must emit raw `val_slice`
+    /// for all occurrences of this path and skip scanning its `value_col`).
+    pub path_raw_filter: Vec<bool>,
+    /// Flattened whole-block decode bytecode.
+    pub(crate) fast_decode: FastJsonPlan,
 }
 
 impl std::fmt::Debug for JsonTreeRuntime {
@@ -770,15 +845,180 @@ impl JsonTreePlan {
     pub fn rebuild_runtime_index(&mut self) {
         let names: Vec<&[u8]> = self.paths.iter().map(|p| p.name.as_bytes()).collect();
         let trie = build_path_trie(&names);
-        let mut shape_maps = Vec::with_capacity(self.paths.len());
-        for p in &self.paths {
+        let n_paths = self.paths.len();
+        let mut path_trie_node = vec![u32::MAX; n_paths];
+        for (ti, tn) in trie.iter().enumerate() {
+            if tn.path_idx >= 0 && (tn.path_idx as usize) < n_paths {
+                path_trie_node[tn.path_idx as usize] = ti as u32;
+            }
+        }
+        let mut is_referenced = vec![false; n_paths];
+        let mut shape_maps = Vec::with_capacity(n_paths);
+        let mut cand_filter = Vec::with_capacity(n_paths);
+        for (pi, p) in self.paths.iter().enumerate() {
             let mut m = crate::payload::graph::fast_map_with_capacity(p.shapes.len());
             for (si, sh) in p.shapes.iter().enumerate() {
                 m.insert(encode_shape_match_key(sh), (si + 1) as u32);
             }
             shape_maps.push(m);
+            let mut cf = Vec::with_capacity(p.cands.len());
+            for c in &p.cands {
+                match c {
+                    JsonCand::Copy { ref_path } => {
+                        if let Some(slot) = is_referenced.get_mut(*ref_path as usize) {
+                            *slot = true;
+                        }
+                        cf.push(CandFilter::Safe);
+                    }
+                    JsonCand::Affix {
+                        prefix,
+                        ref_path,
+                        suffix,
+                    } => {
+                        if let Some(slot) = is_referenced.get_mut(*ref_path as usize) {
+                            *slot = true;
+                        }
+                        let ok = prefix.last().is_none_or(|b| !b.is_ascii_alphabetic())
+                            && suffix.first().is_none_or(|b| !b.is_ascii_alphabetic());
+                        cf.push(if ok {
+                            CandFilter::Safe
+                        } else {
+                            CandFilter::RawSlice
+                        });
+                    }
+                    JsonCand::MultiConcat { lits, refs, b64 } => {
+                        for &r in refs {
+                            if r as usize != pi
+                                && let Some(slot) = is_referenced.get_mut(r as usize)
+                            {
+                                *slot = true;
+                            }
+                        }
+                        if *b64 {
+                            cf.push(if c.has_free(pi) {
+                                CandFilter::RawPath
+                            } else {
+                                CandFilter::RawSlice
+                            });
+                        } else {
+                            let ok = lits.len() >= 2
+                                && lits[0].last().is_none_or(|b| !b.is_ascii_alphabetic())
+                                && lits[lits.len() - 1]
+                                    .first()
+                                    .is_none_or(|b| !b.is_ascii_alphabetic())
+                                && lits[1..lits.len() - 1].iter().all(|l| {
+                                    !l.is_empty()
+                                        && !l[0].is_ascii_alphabetic()
+                                        && !l[l.len() - 1].is_ascii_alphabetic()
+                                });
+                            cf.push(if ok {
+                                CandFilter::Safe
+                            } else if c.has_free(pi) {
+                                CandFilter::RawPath
+                            } else {
+                                CandFilter::RawSlice
+                            });
+                        }
+                    }
+                }
+            }
+            cand_filter.push(cf);
         }
-        self.runtime = JsonTreeRuntime { trie, shape_maps };
+        let path_raw_filter: Vec<bool> = cand_filter
+            .iter()
+            .map(|cf| cf.contains(&CandFilter::RawPath))
+            .collect();
+
+        // Compile L1-resident `FastJsonPlan` for whole-block decoding.
+        let mut lit_arena = Vec::new();
+        let mut ops = Vec::new();
+        let mut arrays = Vec::new();
+        let mut shape_ranges = Vec::with_capacity(n_paths);
+        let path_op: Vec<FastOpKind> = self
+            .paths
+            .iter()
+            .enumerate()
+            .map(|(pi, p)| {
+                if !p.shapes.is_empty() {
+                    FastOpKind::SubObj {
+                        path_idx: pi as u16,
+                        shape_stream: p.shape_stream,
+                        cid: p.value_col,
+                    }
+                } else if !p.cands.is_empty() {
+                    FastOpKind::Cand {
+                        path_idx: pi as u16,
+                        sel_stream: p.sel_stream,
+                        cid: p.value_col,
+                        need_scope: is_referenced[pi],
+                    }
+                } else if is_referenced[pi] {
+                    FastOpKind::ColScope {
+                        cid: p.value_col,
+                        path_idx: pi as u16,
+                    }
+                } else {
+                    FastOpKind::Col { cid: p.value_col }
+                }
+            })
+            .collect();
+        for p in &self.paths {
+            let mut ranges = Vec::with_capacity(p.shapes.len());
+            for sh in &p.shapes {
+                let start = ops.len() as u32;
+                for part in sh {
+                    let lit_off = lit_arena.len() as u32;
+                    lit_arena.extend_from_slice(&part.literal);
+                    let lit_len = part.literal.len() as u32;
+                    let kind = match part.kind {
+                        SlotKind::None => FastOpKind::LitOnly,
+                        SlotKind::Scalar | SlotKind::Text | SlotKind::Object => {
+                            path_op[part.path_idx as usize]
+                        }
+                        SlotKind::Array => {
+                            let arr_p = &self.paths[part.path_idx as usize];
+                            let sep_off = lit_arena.len() as u32;
+                            lit_arena.extend_from_slice(&part.sep);
+                            let idx = arrays.len() as u16;
+                            arrays.push(FastArrayOp {
+                                count_stream: arr_p.count_stream,
+                                elem_path: arr_p.elem_path,
+                                sep_off,
+                                sep_len: part.sep.len().min(u16::MAX as usize) as u16,
+                            });
+                            FastOpKind::Array { idx }
+                        }
+                    };
+                    ops.push(FastOp {
+                        lit_off,
+                        lit_len,
+                        kind,
+                    });
+                }
+                ranges.push((start, ops.len() as u32));
+            }
+            shape_ranges.push(ranges);
+        }
+        // Pad `lit_arena` with 32 trailing bytes so `FastBuf::put_padded` can emit any literal
+        // <= 32 bytes with a single branchless 32-byte unaligned copy.
+        lit_arena.resize(lit_arena.len() + 32, 0);
+        let fast_decode = FastJsonPlan {
+            lit_arena,
+            ops,
+            arrays,
+            shape_ranges,
+            path_op,
+        };
+
+        self.runtime = JsonTreeRuntime {
+            trie,
+            shape_maps,
+            path_trie_node,
+            is_referenced,
+            cand_filter,
+            path_raw_filter,
+            fast_decode,
+        };
     }
 }
 
@@ -1004,26 +1244,45 @@ fn concat_fit<'v>(
 }
 
 /// Reusable encoder state for `JsonTreePlan` within a block.
-pub struct JsonTreeBlockSplitter {
+pub struct JsonTreeBlockSplitter<'a> {
     pub doc: JsonDoc,
     pub struct_streams: Vec<Vec<u32>>,
     key_buf: Vec<u8>,
     child_slots: Vec<ChildSlot>,
-    scope: Vec<Option<(usize, usize)>>,
+    /// Per-path `(row_gen, start, end)` avoiding 24 KiB per-row `scope.fill(None)` memset.
+    scope: Vec<(u32, u32, u32)>,
+    scope_row: u32,
+    /// Most recently matched 1-based `shape_id` per path for direct literal fast-path matching.
+    last_shape: Vec<u32>,
     /// Bytes of objects whose key layout no kept shape matched, stored whole.
     pub unshaped_bytes: usize,
+    /// When `collect_filter` is true, raw slices from `b64`/boundary-unsafe cands and JSON-tagged
+    /// nested columns that must be fed into the block substring filter.
+    pub collect_filter: bool,
+    pub extra_filter_slices: Vec<&'a [u8]>,
+    pub filter_unsafe: bool,
     tmp: Vec<u8>,
 }
 
-impl JsonTreeBlockSplitter {
+impl<'a> JsonTreeBlockSplitter<'a> {
     pub fn new(jt: &JsonTreePlan) -> Self {
+        Self::with_filter(jt, false)
+    }
+
+    pub fn with_filter(jt: &JsonTreePlan, collect_filter: bool) -> Self {
+        let n_paths = jt.paths.len();
         Self {
             doc: JsonDoc::default(),
             struct_streams: vec![Vec::new(); jt.n_struct_streams],
             key_buf: Vec::with_capacity(256),
             child_slots: Vec::with_capacity(64),
-            scope: vec![None; jt.paths.len()],
+            scope: vec![(0, 0, 0); n_paths],
+            scope_row: 0,
+            last_shape: vec![1; n_paths],
             unshaped_bytes: 0,
+            collect_filter,
+            extra_filter_slices: Vec::new(),
+            filter_unsafe: false,
             tmp: Vec::new(),
         }
     }
@@ -1031,7 +1290,7 @@ impl JsonTreeBlockSplitter {
     /// Attempts to split `line` using `jt`, pushing `u32` structural tokens to `self.struct_streams`
     /// and pushing value occurrences into `col_occs[cid]` (with `scratch` for nested-plan unescaping).
     /// Returns `false` (mutating nothing!) if `line` is not a valid root JSON object.
-    pub fn split_row<'a>(
+    pub fn split_row(
         &mut self,
         line: &'a [u8],
         jt: &JsonTreePlan,
@@ -1042,13 +1301,17 @@ impl JsonTreeBlockSplitter {
         if !self.doc.parse_root_object(line) {
             return false;
         }
-        self.scope.fill(None);
+        self.scope_row = self.scope_row.wrapping_add(1);
+        if self.scope_row == 0 {
+            self.scope.fill((0, 0, 0));
+            self.scope_row = 1;
+        }
         self.emit_node(0, 0, 0, line, jt, has_nested, col_occs, scratch);
         true
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn emit_node<'a>(
+    fn emit_node(
         &mut self,
         ni: usize,
         path_idx: usize,
@@ -1065,15 +1328,29 @@ impl JsonTreeBlockSplitter {
         // Leaf / Text path (`shapes.is_empty()`): check derivations, else emit scalar/text slice!
         if pdef.shapes.is_empty() {
             let val_slice = &line[v.start as usize..v.end as usize];
+            let raw_path = self.collect_filter && jt.runtime.path_raw_filter[path_idx];
+            if raw_path {
+                self.extra_filter_slices.push(val_slice);
+            }
             let mut sel = 0u32;
             let mut stored = Some(val_slice);
             if !pdef.cands.is_empty() {
                 let scope = &self.scope;
-                let val = |r: u16| scope[r as usize].map(|(s, e)| &line[s..e]);
+                let cur_row = self.scope_row;
+                let val = |r: u16| {
+                    let (row_gen, s, e) = scope[r as usize];
+                    (row_gen == cur_row).then(|| &line[s as usize..e as usize])
+                };
                 for (ci, cand) in pdef.cands.iter().enumerate() {
                     if let Some(free) = cand_fit(cand, path_idx, val_slice, val, &mut self.tmp) {
                         sel = (ci + 1) as u32;
                         stored = free.map(|(s, e)| &val_slice[s..e]);
+                        if self.collect_filter
+                            && !raw_path
+                            && jt.runtime.cand_filter[path_idx][ci] == CandFilter::RawSlice
+                        {
+                            self.extra_filter_slices.push(val_slice);
+                        }
                         break;
                     }
                 }
@@ -1082,19 +1359,42 @@ impl JsonTreeBlockSplitter {
             if let Some(cell) = stored
                 && pdef.value_col != u16::MAX
             {
-                push_json_val_occ(pdef.value_col as usize, cell, has_nested, col_occs, scratch);
+                let cid = pdef.value_col as usize;
+                if self.collect_filter && !raw_path && has_nested[cid] {
+                    self.extra_filter_slices.push(cell);
+                }
+                push_json_val_occ(cid, cell, has_nested, col_occs, scratch);
             }
-            self.scope[path_idx] = Some((v.start as usize, v.end as usize));
+            if jt.runtime.is_referenced[path_idx] {
+                self.scope[path_idx] = (self.scope_row, v.start, v.end);
+            }
             return;
         }
 
-        // Tabled path (`!pdef.shapes.is_empty()`): build canonical shape key + child list
+        // Tabled path (`!pdef.shapes.is_empty()`): try direct verification of last matched shape
+        // (and shape 1) before falling back to per-key trie HashMap lookups + `key_buf` hashing.
         let mark = self.child_slots.len();
-        let shape_id = if self.build_shape_key(ni, trie_node, line, jt) {
-            jt.runtime.shape_maps[path_idx]
+        let last_sid = self.last_shape[path_idx];
+        let shape_id = if last_sid > 0
+            && (last_sid as usize) <= pdef.shapes.len()
+            && self.try_match_shape(ni, path_idx, last_sid, line, jt)
+        {
+            last_sid
+        } else if last_sid != 1
+            && !pdef.shapes.is_empty()
+            && self.try_match_shape(ni, path_idx, 1, line, jt)
+        {
+            self.last_shape[path_idx] = 1;
+            1
+        } else if self.build_shape_key(ni, trie_node, line, jt) {
+            let sid = jt.runtime.shape_maps[path_idx]
                 .get(&self.key_buf)
                 .copied()
-                .unwrap_or(0)
+                .unwrap_or(0);
+            if sid > 0 {
+                self.last_shape[path_idx] = sid;
+            }
+            sid
         } else {
             0
         };
@@ -1107,13 +1407,11 @@ impl JsonTreeBlockSplitter {
             }
             if pdef.value_col != u16::MAX {
                 let raw_sub = &line[v.start as usize..v.end as usize];
-                push_json_val_occ(
-                    pdef.value_col as usize,
-                    raw_sub,
-                    has_nested,
-                    col_occs,
-                    scratch,
-                );
+                let cid = pdef.value_col as usize;
+                if self.collect_filter && has_nested[cid] {
+                    self.extra_filter_slices.push(raw_sub);
+                }
+                push_json_val_occ(cid, raw_sub, has_nested, col_occs, scratch);
             }
             return;
         }
@@ -1153,6 +1451,103 @@ impl JsonTreeBlockSplitter {
             }
         }
         self.child_slots.truncate(mark);
+    }
+
+    #[inline]
+    fn try_match_shape(
+        &mut self,
+        ni: usize,
+        path_idx: usize,
+        shape_id: u32,
+        line: &[u8],
+        jt: &JsonTreePlan,
+    ) -> bool {
+        let v = self.doc.nodes[ni];
+        if v.kind != J_OBJECT {
+            return false;
+        }
+        let sh = &jt.paths[path_idx].shapes[(shape_id - 1) as usize];
+        let Some((last_part, slot_parts)) = sh.split_last() else {
+            return false;
+        };
+        let mark = self.child_slots.len();
+        let mut pos = v.start as usize;
+        let v_end = v.end as usize;
+        let mut ki = v.first as usize;
+        let k_end = (v.first + v.n) as usize;
+
+        for p in slot_parts {
+            let lit = p.literal.as_slice();
+            let next_pos = pos + lit.len();
+            if next_pos > v_end || &line[pos..next_pos] != lit {
+                self.child_slots.truncate(mark);
+                return false;
+            }
+            pos = next_pos;
+            while ki < k_end
+                && (self.doc.nodes[self.doc.kids[ki].node as usize].end as usize) <= pos
+            {
+                ki += 1;
+            }
+            if ki >= k_end {
+                self.child_slots.truncate(mark);
+                return false;
+            }
+            let kid = self.doc.kids[ki];
+            let cv = self.doc.nodes[kid.node as usize];
+            let ct = jt.runtime.path_trie_node[p.path_idx as usize];
+            if ct == u32::MAX {
+                self.child_slots.truncate(mark);
+                return false;
+            }
+            match p.kind {
+                SlotKind::Scalar => {
+                    if cv.start as usize != pos || cv.kind < J_STRING {
+                        self.child_slots.truncate(mark);
+                        return false;
+                    }
+                    pos = cv.end as usize;
+                }
+                SlotKind::Text | SlotKind::Object => {
+                    if cv.start as usize != pos {
+                        self.child_slots.truncate(mark);
+                        return false;
+                    }
+                    pos = cv.end as usize;
+                }
+                SlotKind::Array => {
+                    if cv.kind != J_ARRAY || (cv.n == 0 && cv.end - cv.start != 2) {
+                        self.child_slots.truncate(mark);
+                        return false;
+                    }
+                    let (es, ee) = array_elems_span(&self.doc, &cv);
+                    if es != pos
+                        || uniform_array_sep(&self.doc, line, kid.node as usize)
+                            != Some(p.sep.as_slice())
+                    {
+                        self.child_slots.truncate(mark);
+                        return false;
+                    }
+                    pos = ee;
+                }
+                SlotKind::None => {
+                    self.child_slots.truncate(mark);
+                    return false;
+                }
+            }
+            ki += 1;
+            self.child_slots.push(ChildSlot {
+                path_idx: p.path_idx,
+                kind: p.kind,
+                node: kid.node,
+                trie_node: ct,
+            });
+        }
+        if &line[pos..v_end] != last_part.literal.as_slice() {
+            self.child_slots.truncate(mark);
+            return false;
+        }
+        true
     }
 
     fn build_shape_key(
@@ -1347,12 +1742,324 @@ pub fn decode_json_struct_streams(
     Ok(out)
 }
 
+/// Appends `out[rs..re]` to `out` without hitting libc `memmove` for short slices (<=32 bytes).
+#[inline(always)]
+fn put_within(out: &mut Vec<u8>, rs: usize, re: usize) {
+    let n = re - rs;
+    if n == 0 {
+        return;
+    }
+    if n <= 32 {
+        out.reserve(n);
+        // SAFETY: `rs..re` is within `out[..len]`, `out` has room for `n` bytes past `len`,
+        // so source and destination do not overlap.
+        unsafe {
+            let len = out.len();
+            let base = out.as_mut_ptr();
+            let sp = base.add(rs);
+            let dst = base.add(len);
+            if n == 1 {
+                *dst = *sp;
+            } else if n <= 8 {
+                if n >= 4 {
+                    std::ptr::copy_nonoverlapping(sp, dst, 4);
+                    std::ptr::copy_nonoverlapping(sp.add(n - 4), dst.add(n - 4), 4);
+                } else {
+                    std::ptr::copy_nonoverlapping(sp, dst, 2);
+                    *dst.add(n - 1) = *sp.add(n - 1);
+                }
+            } else if n <= 16 {
+                std::ptr::copy_nonoverlapping(sp, dst, 8);
+                std::ptr::copy_nonoverlapping(sp.add(n - 8), dst.add(n - 8), 8);
+            } else {
+                std::ptr::copy_nonoverlapping(sp, dst, 16);
+                std::ptr::copy_nonoverlapping(sp.add(n - 16), dst.add(n - 16), 16);
+            }
+            out.set_len(len + n);
+        }
+        return;
+    }
+    out.extend_from_within(rs..re);
+}
+
+struct FastJsonCtx<'a, 'b, 'c, 's> {
+    jt: &'a JsonTreePlan,
+    fp: &'a FastJsonPlan,
+    streams: &'b mut [&'s [u32]],
+    fast_cols: &'b mut [crate::cells::FastCol<'c>],
+    scope_ranges: &'b mut [(u32, usize, usize)],
+    tmp: &'b mut Vec<u8>,
+    row: u32,
+    max_arr: usize,
+}
+
+impl FastJsonCtx<'_, '_, '_, '_> {
+    #[inline(always)]
+    fn scope_ref(&self, r: u16) -> Option<(usize, usize)> {
+        let &(row, rs, re) = self.scope_ranges.get(r as usize)?;
+        (row == self.row).then_some((rs, re))
+    }
+
+    #[inline(always)]
+    fn unquoted_ref(&self, r: u16, out: &[u8]) -> Option<(usize, usize)> {
+        let (rs, re) = self.scope_ref(r)?;
+        if re >= rs + 2 && out[rs] == b'"' && out[re - 1] == b'"' {
+            Some((rs + 1, re - 1))
+        } else {
+            Some((rs, re))
+        }
+    }
+
+    #[inline(always)]
+    fn emit_op(
+        &mut self,
+        kind: FastOpKind,
+        out: &mut crate::cells::FastBuf<'_>,
+        depth: usize,
+    ) -> bool {
+        match kind {
+            FastOpKind::LitOnly => true,
+            FastOpKind::Col { cid } => self
+                .fast_cols
+                .get_mut(cid as usize)
+                .is_some_and(|c| c.write_next(out)),
+            FastOpKind::ColScope { cid, path_idx } => {
+                let start = out.len();
+                let ok = self
+                    .fast_cols
+                    .get_mut(cid as usize)
+                    .is_some_and(|c| c.write_next(out));
+                if ok {
+                    self.scope_ranges[path_idx as usize] = (self.row, start, out.len());
+                }
+                ok
+            }
+            FastOpKind::Cand {
+                path_idx,
+                sel_stream,
+                cid,
+                need_scope,
+            } => {
+                let Some(s) = self.streams.get_mut(sel_stream as usize) else {
+                    return false;
+                };
+                let Some((&sel, rest)) = s.split_first() else {
+                    return false;
+                };
+                *s = rest;
+                let start = if need_scope { out.len() } else { 0 };
+                let ok = if sel == 0 {
+                    self.fast_cols
+                        .get_mut(cid as usize)
+                        .is_some_and(|c| c.write_next(out))
+                } else {
+                    self.emit_cand(path_idx as usize, sel as usize, cid, out)
+                };
+                if ok && need_scope {
+                    self.scope_ranges[path_idx as usize] = (self.row, start, out.len());
+                }
+                ok
+            }
+            FastOpKind::SubObj {
+                path_idx,
+                shape_stream,
+                cid,
+            } => self.emit_obj(
+                path_idx as usize,
+                shape_stream as usize,
+                cid as usize,
+                out,
+                depth,
+            ),
+            FastOpKind::Array { idx } => {
+                let a = self.fp.arrays[idx as usize];
+                self.emit_array(
+                    a.count_stream as usize,
+                    a.elem_path as usize,
+                    a.sep_off as usize,
+                    a.sep_len as usize,
+                    out,
+                    depth,
+                )
+            }
+        }
+    }
+
+    fn emit_array(
+        &mut self,
+        count_stream: usize,
+        elem_path: usize,
+        sep_off: usize,
+        sep_len: usize,
+        out: &mut crate::cells::FastBuf<'_>,
+        depth: usize,
+    ) -> bool {
+        let Some(s) = self.streams.get_mut(count_stream) else {
+            return false;
+        };
+        let Some((&cnt, rest)) = s.split_first() else {
+            return false;
+        };
+        *s = rest;
+        let count = cnt as usize;
+        if count > self.max_arr {
+            return false;
+        }
+        let elem_op = self.fp.path_op[elem_path];
+        let lits = self.fp.lit_arena.as_slice();
+        for ei in 0..count {
+            if ei > 0 {
+                out.put_padded(lits, sep_off, sep_len);
+            }
+            if !self.emit_op(elem_op, out, depth + 1) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn emit_obj(
+        &mut self,
+        path_idx: usize,
+        shape_stream: usize,
+        cid: usize,
+        out: &mut crate::cells::FastBuf<'_>,
+        depth: usize,
+    ) -> bool {
+        if depth > MAX_PARSE_DEPTH + 4 {
+            return false;
+        }
+        let Some(s) = self.streams.get_mut(shape_stream) else {
+            return false;
+        };
+        let Some((&shape_id, rest)) = s.split_first() else {
+            return false;
+        };
+        *s = rest;
+        if shape_id == 0 {
+            return self
+                .fast_cols
+                .get_mut(cid)
+                .is_some_and(|c| c.write_next(out));
+        }
+        let Some(&(op_start, op_end)) = self.fp.shape_ranges[path_idx].get((shape_id - 1) as usize)
+        else {
+            return false;
+        };
+        let lits = self.fp.lit_arena.as_slice();
+        for &op in &self.fp.ops[op_start as usize..op_end as usize] {
+            if op.lit_len > 0 {
+                out.put_padded(lits, op.lit_off as usize, op.lit_len as usize);
+            }
+            if !self.emit_op(op.kind, out, depth + 1) {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[inline(always)]
+    fn emit_cand(
+        &mut self,
+        path_idx: usize,
+        sel: usize,
+        cid: u16,
+        out: &mut crate::cells::FastBuf<'_>,
+    ) -> bool {
+        let Some(cand) = self.jt.paths[path_idx].cands.get(sel - 1) else {
+            return false;
+        };
+        match cand {
+            JsonCand::Copy { ref_path } => {
+                let Some((rs, re)) = self.scope_ref(*ref_path) else {
+                    return false;
+                };
+                out.put_within(rs, re);
+                true
+            }
+            JsonCand::Affix {
+                prefix,
+                ref_path,
+                suffix,
+            } => {
+                let Some((rs, re)) = self.unquoted_ref(*ref_path, out.as_slice()) else {
+                    return false;
+                };
+                out.put_lit(prefix);
+                out.put_within(rs, re);
+                out.put_lit(suffix);
+                true
+            }
+            JsonCand::MultiConcat {
+                lits,
+                refs,
+                b64: false,
+            } => {
+                out.put_lit(&lits[0]);
+                for (i, &r) in refs.iter().enumerate() {
+                    if r as usize == path_idx {
+                        if !self
+                            .fast_cols
+                            .get_mut(cid as usize)
+                            .is_some_and(|c| c.write_next(out))
+                        {
+                            return false;
+                        }
+                    } else {
+                        let Some((rs, re)) = self.unquoted_ref(r, out.as_slice()) else {
+                            return false;
+                        };
+                        out.put_within(rs, re);
+                    }
+                    out.put_lit(&lits[i + 1]);
+                }
+                true
+            }
+            JsonCand::MultiConcat { lits, refs, .. } => self.emit_cand_b64(lits, refs, out),
+        }
+    }
+
+    #[inline(never)]
+    fn emit_cand_b64(
+        &mut self,
+        lits: &[Vec<u8>],
+        refs: &[u16],
+        out: &mut crate::cells::FastBuf<'_>,
+    ) -> bool {
+        self.tmp.clear();
+        self.tmp.extend_from_slice(&lits[0]);
+        let cur = out.as_slice();
+        for (i, &r) in refs.iter().enumerate() {
+            let Some((rs, re)) = self.unquoted_ref(r, cur) else {
+                return false;
+            };
+            self.tmp.extend_from_slice(&cur[rs..re]);
+            self.tmp.extend_from_slice(&lits[i + 1]);
+        }
+        if !b64_text_ok(self.tmp) {
+            return false;
+        }
+        let text = self.tmp.as_slice();
+        out.with_vec(|v| {
+            v.reserve(text.len().div_ceil(3) * 4 + 2);
+            v.push(b'"');
+            crate::lex::format_base64(text, v);
+            v.push(b'"');
+        });
+        true
+    }
+}
+
 /// Stateful streaming decoder for `JsonTreePlan` rows within a block!
 pub struct JsonTreeBlockReconstructor {
     pub struct_streams: Vec<Vec<u32>>,
     pub struct_pos: Vec<usize>,
     /// By path: where its value stands in the output, valid on the row numbered `row`.
     scope_ranges: Vec<(u32, usize, usize)>,
+    /// By path: true if any `JsonCand` in the plan references this path.
+    is_referenced: Vec<bool>,
+    /// By column id: true if `plan.columns[cid].nested_plan.is_some()`.
+    is_nested: Vec<bool>,
     row: u32,
     tmp: Vec<u8>,
     /// `skip_order` of the tree, once a skip needs it.
@@ -1362,17 +2069,94 @@ pub struct JsonTreeBlockReconstructor {
 }
 
 impl JsonTreeBlockReconstructor {
-    pub fn new(struct_streams: Vec<Vec<u32>>, n_paths: usize) -> Self {
+    pub fn new(struct_streams: Vec<Vec<u32>>, jt: &JsonTreePlan, plan: &ModelPlan) -> Self {
         let ns = struct_streams.len();
+        let n_paths = jt.paths.len();
+        let is_referenced = if jt.runtime.is_referenced.len() == n_paths {
+            jt.runtime.is_referenced.clone()
+        } else {
+            vec![true; n_paths]
+        };
+        let is_nested = plan
+            .columns
+            .iter()
+            .map(|c| c.nested_plan.is_some())
+            .collect();
         Self {
             struct_streams,
             struct_pos: vec![0usize; ns],
             scope_ranges: vec![(0, 0, 0); n_paths],
+            is_referenced,
+            is_nested,
             row: 0,
             tmp: Vec::new(),
             order: None,
             visits: Default::default(),
         }
+    }
+
+    /// Whole-block fast emitter for JSON blocks without nested-plan columns: writes directly
+    /// through register-cached [`FastBuf`], pre-resolved [`FastCol`] cursors, and L1-resident
+    /// [`FastJsonPlan`] bytecode with 32-byte padded branchless literal copies.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn emit_fast_block(
+        &mut self,
+        n_rows: usize,
+        jt: &JsonTreePlan,
+        fast_cols: &mut [crate::cells::FastCol<'_>],
+        out: &mut crate::cells::FastBuf<'_>,
+        delim: &[u8],
+        skip_last_delim: bool,
+        budget: &DecodeBudget,
+    ) -> Result<()> {
+        let struct_streams = std::mem::take(&mut self.struct_streams);
+        let mut streams: Vec<&[u32]> = struct_streams
+            .iter()
+            .zip(&self.struct_pos)
+            .map(|(s, &p)| &s[p.min(s.len())..])
+            .collect();
+        let fp = &jt.runtime.fast_decode;
+        let max_row = budget.max_block_decoded_bytes;
+        let root_op = fp.path_op[0];
+
+        let mut fc = FastJsonCtx {
+            jt,
+            fp,
+            streams: &mut streams,
+            fast_cols,
+            scope_ranges: &mut self.scope_ranges,
+            tmp: &mut self.tmp,
+            row: self.row,
+            max_arr: budget.max_records_per_block,
+        };
+
+        let mut res = Ok(());
+        for r in 0..n_rows {
+            fc.row = fc.row.wrapping_add(1);
+            if fc.row == 0 {
+                fc.scope_ranges.fill((0, 0, 0));
+                fc.row = 1;
+            }
+            let row_start = out.len();
+            if !fc.emit_op(root_op, out, 0) {
+                res = Err(Error::Format("JsonTree fast decode error".into()));
+                break;
+            }
+            if out.len() - row_start > max_row {
+                res = Err(Error::BudgetExceeded("json reconstructed row size"));
+                break;
+            }
+            if r + 1 < n_rows || !skip_last_delim {
+                if delim.len() == 1 {
+                    out.put_byte(delim[0]);
+                } else {
+                    out.put_lit(delim);
+                }
+            }
+        }
+        self.row = fc.row;
+        self.struct_streams = struct_streams;
+        res
     }
 
     #[inline(always)]
@@ -1446,23 +2230,34 @@ impl JsonTreeBlockReconstructor {
         if !pdef.shapes.is_empty() {
             return self.emit_path(p, jt, plan, ctx, col_pos, out, budget, depth);
         }
-        let start = out.len();
+        let need_scope = self.is_referenced[p];
+        let start = if need_scope { out.len() } else { 0 };
         let sel = match pdef.cands.is_empty() {
             true => 0,
             false => self.next_u32(pdef.sel_stream)? as usize,
         };
         if sel == 0 {
-            emit_json_stored_cell(pdef.value_col as usize, plan, ctx, col_pos, out, budget)?;
+            emit_json_stored_cell(
+                pdef.value_col as usize,
+                &self.is_nested,
+                plan,
+                ctx,
+                col_pos,
+                out,
+                budget,
+            )?;
         } else {
             self.emit_cand(p, sel, jt, plan, ctx, col_pos, out, budget)?;
         }
-        self.scope_ranges[p] = (self.row, start, out.len());
+        if need_scope {
+            self.scope_ranges[p] = (self.row, start, out.len());
+        }
         Ok(())
     }
 
     /// Emits leaf `path_idx` from its candidate `sel`.
     #[allow(clippy::too_many_arguments)]
-    #[inline(never)]
+    #[inline(always)]
     fn emit_cand(
         &mut self,
         path_idx: usize,
@@ -1482,7 +2277,7 @@ impl JsonTreeBlockReconstructor {
         match cand {
             JsonCand::Copy { ref_path } => {
                 let (rs, re) = self.scope_ref(*ref_path)?;
-                out.extend_from_within(rs..re);
+                put_within(out, rs, re);
             }
             JsonCand::Affix {
                 prefix,
@@ -1490,45 +2285,62 @@ impl JsonTreeBlockReconstructor {
                 suffix,
             } => {
                 let (rs, re) = self.unquoted_ref(*ref_path, out)?;
-                out.extend_from_slice(prefix);
-                out.extend_from_within(rs..re);
-                out.extend_from_slice(suffix);
+                out.reserve(prefix.len() + (re - rs) + suffix.len());
+                crate::cells::put_lit(out, prefix);
+                put_within(out, rs, re);
+                crate::cells::put_lit(out, suffix);
             }
             JsonCand::MultiConcat {
                 lits,
                 refs,
                 b64: false,
             } => {
-                out.extend_from_slice(&lits[0]);
+                crate::cells::put_lit(out, &lits[0]);
                 for (i, &r) in refs.iter().enumerate() {
                     if r as usize == path_idx {
                         let cid = pdef.value_col as usize;
-                        emit_json_stored_cell(cid, plan, ctx, col_pos, out, budget)?;
+                        emit_json_stored_cell(
+                            cid,
+                            &self.is_nested,
+                            plan,
+                            ctx,
+                            col_pos,
+                            out,
+                            budget,
+                        )?;
                     } else {
                         let (rs, re) = self.unquoted_ref(r, out)?;
-                        out.extend_from_within(rs..re);
+                        put_within(out, rs, re);
                     }
-                    out.extend_from_slice(&lits[i + 1]);
+                    crate::cells::put_lit(out, &lits[i + 1]);
                 }
             }
             JsonCand::MultiConcat { lits, refs, .. } => {
-                let mut text = std::mem::take(&mut self.tmp);
-                text.clear();
-                text.extend_from_slice(&lits[0]);
-                for (i, &r) in refs.iter().enumerate() {
-                    let (rs, re) = self.unquoted_ref(r, out)?;
-                    text.extend_from_slice(&out[rs..re]);
-                    text.extend_from_slice(&lits[i + 1]);
-                }
-                if !b64_text_ok(&text) {
-                    return Err(Error::Format("Base64 candidate text not printable".into()));
-                }
-                out.push(b'"');
-                crate::lex::format_base64(&text, out);
-                out.push(b'"');
-                self.tmp = text;
+                self.emit_cand_b64(lits, refs, out)?;
             }
         }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn emit_cand_b64(&mut self, lits: &[Vec<u8>], refs: &[u16], out: &mut Vec<u8>) -> Result<()> {
+        let mut text = std::mem::take(&mut self.tmp);
+        text.clear();
+        text.extend_from_slice(&lits[0]);
+        for (i, &r) in refs.iter().enumerate() {
+            let (rs, re) = self.unquoted_ref(r, out)?;
+            text.extend_from_slice(&out[rs..re]);
+            text.extend_from_slice(&lits[i + 1]);
+        }
+        if !b64_text_ok(&text) {
+            self.tmp = text;
+            return Err(Error::Format("Base64 candidate text not printable".into()));
+        }
+        out.reserve(text.len().div_ceil(3) * 4 + 2);
+        out.push(b'"');
+        crate::lex::format_base64(&text, out);
+        out.push(b'"');
+        self.tmp = text;
         Ok(())
     }
 
@@ -1551,7 +2363,15 @@ impl JsonTreeBlockReconstructor {
         let pdef = &jt.paths[path_idx];
         let shape_id = self.next_u32(pdef.shape_stream)? as usize;
         if shape_id == 0 {
-            emit_json_stored_cell(pdef.value_col as usize, plan, ctx, col_pos, out, budget)?;
+            emit_json_stored_cell(
+                pdef.value_col as usize,
+                &self.is_nested,
+                plan,
+                ctx,
+                col_pos,
+                out,
+                budget,
+            )?;
             return Ok(());
         }
         let shape = pdef
@@ -1560,7 +2380,7 @@ impl JsonTreeBlockReconstructor {
             .ok_or_else(|| Error::Format("JsonTree shape_id out of bounds".into()))?;
 
         for part in shape {
-            out.extend_from_slice(&part.literal);
+            crate::cells::put_lit(out, &part.literal);
             match part.kind {
                 SlotKind::None => {}
                 SlotKind::Scalar | SlotKind::Text | SlotKind::Object => {
@@ -1576,7 +2396,7 @@ impl JsonTreeBlockReconstructor {
                     let elem_p = jt.paths[arr_p].elem_path as usize;
                     for ei in 0..count {
                         if ei > 0 {
-                            out.extend_from_slice(&part.sep);
+                            crate::cells::put_lit(out, &part.sep);
                         }
                         self.emit_child(elem_p, jt, plan, ctx, col_pos, out, budget, depth + 1)?;
                     }
@@ -1856,6 +2676,7 @@ fn stream_underflow() -> Error {
 #[inline(always)]
 fn emit_json_stored_cell(
     cid: usize,
+    is_nested: &[bool],
     plan: &ModelPlan,
     ctx: &mut BlockDecodeCtx<'_>,
     col_pos: &mut [usize],
@@ -1865,14 +2686,23 @@ fn emit_json_stored_cell(
     let p = col_pos
         .get_mut(cid)
         .ok_or_else(|| Error::Format("JsonTree col index out of bounds".into()))?;
-    *p += 1;
-    let nested = plan.columns[cid].nested_plan.is_some();
+    let idx = *p;
+    *p = idx + 1;
     let col = block_col(cid, plan, ctx, budget)?;
-    if !nested {
-        return col.write(*p - 1, out);
+    if !is_nested[cid] {
+        return col.write(idx, out);
+    }
+    emit_json_nested_cell(col, idx, out)
+}
+
+#[inline(never)]
+fn emit_json_nested_cell(col: &crate::cells::Col, idx: usize, out: &mut Vec<u8>) -> Result<()> {
+    if let Some(span) = col.span(idx) {
+        let (buf, s, e) = span?;
+        return emit_nested_cell(&buf[s..e], out);
     }
     let mut cell = Vec::new();
-    col.write(*p - 1, &mut cell)?;
+    col.write(idx, &mut cell)?;
     emit_nested_cell(&cell, out)
 }
 
