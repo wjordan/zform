@@ -14,10 +14,10 @@
         "size": 99694708
       },
       "zform --best": {
-        "size": 33244150
+        "size": 33244954
       },
       "zform HDFS predictors": {
-        "size": 17700720
+        "size": 17702935
       }
     }
   },
@@ -36,13 +36,13 @@
         "size": 38016648
       },
       "zform --best": {
-        "size": 21049996
+        "size": 21026432
       },
       "zform ordered": {
-        "size": 23563187
+        "size": 23572781
       },
       "zform --best ordered": {
-        "size": 18315487
+        "size": 18304891
       }
     }
   },

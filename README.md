@@ -1,71 +1,117 @@
-# `zform` — Lossless Structure-Aware Compression
+# zform
 
-`zform` is a lossless compressor for logs, telemetry and event streams, available as a CLI and a Rust library. It learns the structure of its input, compresses it and lets you search the archive directly.
+A structure-aware lossless compressor and queryable archive format for logs, event streams, telemetry, and structured binary files, available as a CLI and a Rust library.
+
+### Archive Size
 
 <!-- bench:comparison -->
-| Corpus | Raw | `zform` | `zstd -3` | `zstd -19` | `xz -6` |
+| Corpus | Raw | `zstd -3` | `zstd -19` | `xz -6` | `zform` |
 |---|---:|---:|---:|---:|---:|
-| HDFS DataNode logs | 1,504.88 MiB | 16.88 MiB (89.1x)<br>`-l 6 --hdfs-predictors --context-mixing` | 145.88 MiB (10.3x) | 93.86 MiB (16x) | 95.08 MiB (15.8x) |
-| GitHub Archive NDJSON | 476.32 MiB | 17.47 MiB (27.3x)<br>`--best --order-by type,repo.id` | 50.54 MiB (9.42x) | 36.03 MiB (13.2x) | 36.26 MiB (13.1x) |
-| Silesia sao | 6.92 MiB | 3.38 MiB (2.05x)<br>`--best` | 5.30 MiB (1.31x) | 4.77 MiB (1.45x) | 4.21 MiB (1.64x) |
+| HDFS DataNode logs | 1,504.88 MiB | 145.88 MiB (10.3x) | 93.86 MiB (16x) | 95.08 MiB (15.8x) | **16.88 MiB (89.1x)** |
+| GitHub Archive NDJSON | 476.32 MiB | 50.54 MiB (9.42x) | 36.03 MiB (13.2x) | 36.26 MiB (13.1x) | **17.46 MiB (27.3x)** |
+| Silesia sao | 6.92 MiB | 5.30 MiB (1.31x) | 4.77 MiB (1.45x) | 4.21 MiB (1.64x) | **3.38 MiB (2.05x)** |
 <!-- /bench:comparison -->
+
+### Throughput (Pack / Unpack MB/s, Single-Threaded)
+
+| Corpus | `gzip -6` | `zstd -3` | `zstd -19` | `xz -6` | `zform` (default) | `zform` (best) |
+|---|---:|---:|---:|---:|---:|---:|
+| HDFS DataNode logs | 118 / 435 | **802** / 2,207 | 3.2 / **2,794** | 6.8 / 448 | 148 / 1,113 | 97 / 397 |
+| GitHub Archive NDJSON | 106 / 394 | **699** / 2,334 | 6.6 / **2,335** | 9.8 / 380 | 211 / 1,370 | 17 / 883 |
+| Silesia sao | 23 / 114 | **114** / **471** | 6.0 / 466 | 4.5 / 44 | 34 / 466 | 1.8 / 467 |
+
+<details>
+<summary>Benchmark details</summary>
+
+All runs are single-threaded on an AMD Ryzen 7 7700, include CLI startup and file I/O, verify exact SHA-256 roundtrips, and include `zform`'s trailing query index. [Full CI report](https://github.com/wjordan/zform/actions/runs/45268934613) · [Benchmark commands](bench/README.md)
+
+<!-- bench:presets -->
+| Corpus | Pack flags | Archive |
+|---|---|---:|
+| HDFS DataNode logs | `--best` | 31.70 MiB (47.5x) |
+| HDFS DataNode logs | `-l 6 --hdfs-predictors --context-mixing` | 16.88 MiB (89.1x) |
+| GitHub Archive NDJSON | `--best` | 20.05 MiB (23.8x) |
+| GitHub Archive NDJSON | `--order-by type,repo.id` | 22.48 MiB (21.2x) |
+| GitHub Archive NDJSON | `--best --order-by type,repo.id` | 17.46 MiB (27.3x) |
+| Silesia sao | `--best` | 3.38 MiB (2.05x) |
+<!-- /bench:presets -->
+
+Default `zform` (no flags) produces **33.41 MiB (45x)** on HDFS, **28.63 MiB (16.6x)** on GitHub Archive, and **3.57 MiB (1.94x)** on Silesia `sao`. On GitHub Archive, `zform select` projects four fields across 63,340 `PushEvent` records in **48 ms**, reading **2.11 MB** of compressed data.
+
+</details>
 
 ```bash
 zform pack app.log -o app.zfm      # any bytes in; no schema, no format flag
 zform unpack app.zfm -o app.log    # identical bytes out
-zform grep "timed out" app.zfm     # search the compressed file
+zform grep "timed out" app.zfm     # query the compressed archive in place
 ```
 
-## Why it compresses better
+## How `zform` Is Different
 
-Machine-written data is full of structure: the same line layouts and keys over and over, fields that count up, tick forward or follow from other fields. Byte-stream compressors (`gzip`, `zstd`, `xz`) match repeated byte sequences and never see that structure. Columnar formats (`Parquet`, `Arrow`) do, but they need a schema up front and discard the original bytes.
+Stream compressors (`gzip`, `zstd`, `xz`) match flat byte windows and stay blind to data structure. Columnar formats (`Parquet`, `Arrow`) and log stores (`CLP`) require schemas or fixed codecs and discard original formatting.
 
-`zform` keeps a stream compressor's contract and adds a columnar format's model. It learns how records split into fields, what each field's values look like, and how fields relate (`end = start + dur`, a URL built from other fields), then stores the model and only what the model cannot predict:
+`zform` keeps a stream compressor's lossless, schema-free contract while compiling each input's **generative model** into small decoding programs stored inside the archive:
 
-- **Byte-exact output.** Formatting survives (`12.300`, `007`, `-0`, key order, whitespace). Mixed formats can share a file, and lines the model does not recognise are stored verbatim.
-- **Queries on the compressed file.** `zform grep` and `zform select` filter and project records without unpacking, skipping blocks by index and decoding only the columns a query touches.
+```text
+          ┌───────────────────┐   ┌────────────────────────────┐   ┌─────────────────┐
+raw bytes▶│ Smart Writer      │──▶│ .zfm Archive               │──▶│ Format-Blind VM │
+          │ discovery + packs │   │ programs, residuals, index │   │ unpack / query  │
+          └───────────────────┘   └────────────────────────────┘   └─────────────────┘
+```
 
-`zform` suits archives of logs, events and telemetry that you want to filter in place. For opaque data such as media or encrypted payloads, it falls back to byte-stream compression.
+- **Zero-schema structure discovery.** The writer infers recursive log templates, nested sparse JSON trees, and fixed-width binary structs automatically while preserving every byte verbatim, falling back to `zstd` on incompressible data.
+- **Cross-field and stateful prediction.** Rather than encoding columns in isolation, `zform` models peer derivations (such as URLs and affine arithmetic), per-entity running sums, file-wide entity tables, reversible entity sorting, and optional nibble context mixing.
+- **Programs instead of fixed codecs.** Each column stores a self-describing decoding graph over a small, branchless VM (25 graph nodes, 35 lane ops, bounded recurrences). The reader contains no format, log, or PRNG logic, validating each graph in one pass under a bounded execution budget.
+- **Extensible writer plug-ins.** Because decoding logic travels as data, custom encoders can target bespoke domain structure without changing the reader or wire format. That makes it practical to write, or have an LLM tune and optimize, specialized encoders for specific workloads; the 89.1x HDFS predictor is one example.
+- **Queryable in place.** Independent blocks and a trailing index let `zform grep` and `zform select` prune blocks and decode only the columns a query touches, without unpacking the file.
+
+<details>
+<summary>Corpus breakdown</summary>
+
+- **HDFS DataNode logs (`1,504.88 MiB -> 16.88 MiB`, 89.1x):** Learns log templates, cracks the 48-bit `java.util.Random` LCG generating block IDs into a bounded recurrence, stores each block's three pipeline replicas once in a file table, tracks per-datanode clocks and thread counters with ordered per-key running sums, and applies bounded nibble context mixing to integer residuals.
+- **GitHub Archive NDJSON (`476.32 MiB -> 17.46 MiB`, 27.3x):** Learns the sparse heterogeneous JSON tree automatically, derives redundant URLs and identifiers from peer columns, clusters recurring repositories with `--order-by type,repo.id` (restoring exact input order on unpack), and builds a shared file dictionary.
+- **Silesia `sao` star catalog (`6.92 MiB -> 3.38 MiB`, 2.05x):** Detects the 28-byte binary header and 28-byte struct stride automatically, splits the star fields (`f64` coordinates, spectral type, `i16` magnitude, `f32` proper motion), and compiles lane programs for IEEE-754 ordered-float deltas, prefix scans, and byte-plane transposes.
+
+</details>
 
 ## Usage
-
-### CLI
 
 ```bash
 cargo build --release --workspace   # binary: ./target/release/zform
 ```
 
 ```bash
-# Compress and restore files (or stream via stdin/stdout)
 zform pack events.ndjson -o events.zfm
 zform unpack events.zfm -o events.ndjson
-zform pack < app.log > app.zfm
+zform select -f id,type,actor.login,repo.name --where type=PushEvent events.zfm
+zform inspect -v events.zfm
+```
 
-# Pack a JSON document (elements of its main array become records)
+<details>
+<summary>More CLI examples</summary>
+
+```bash
+# Stream via stdin/stdout, or pack a JSON document (elements of its main array become records)
+zform pack < app.log > app.zfm
 zform pack cloudtrail.json -o cloudtrail.zfm
 
-# Try context mixing on selected integer streams for smaller files (slower decoding)
-zform pack --context-mixing app.log -o app.zfm
-
-# Try HDFS field predictions through the same payload engine
-zform pack --hdfs-predictors --context-mixing HDFS.log -o hdfs.zfm
-
-# Store an event log sorted on its entity fields; unpack restores the original order
+# High-density options: shared dictionary, reversible entity sorting, context mixing, custom packs
 zform pack --best --order-by type,repo.id events.ndjson -o events.zfm
+zform pack --context-mixing app.log -o app.zfm
+zform pack -l 6 --hdfs-predictors --context-mixing HDFS.log -o hdfs.zfm
 
-# Inspect stream metadata, ratio, and top columns by compressed size
-zform inspect -v events.zfm
-
-# Query compressed files directly (--stats reports blocks pruned and bytes read)
-zform select -f id,type,actor.login,repo.name --where type=PushEvent events.zfm
+# Filtered search with index pruning stats
 zform grep --where level=ERROR --range dur_us=10000.. events.zfm --stats
 
-# Train a reusable profile once so small chunks compress well without warm-up
+# Train a reusable profile so small chunks compress well from record one
 zform train sample.ndjson -o github.zfp
 zform pack --profile github.zfp live-chunk.ndjson -o live-chunk.zfm
 ```
 
-### Rust library
+</details>
+
+<details>
+<summary>Rust library</summary>
 
 ```rust
 use std::io::Cursor;
@@ -99,101 +145,31 @@ fn main() -> zform::Result<()> {
 }
 ```
 
-## How it works
+</details>
 
-```text
-             ┌───────┐   ┌───────┐   ┌────────┐   ┌──────────┐
-raw bytes ──►│ frame │──►│ model │──►│ encode │──►│ compress │──► .zfm
-             └───────┘   └───────┘   └────────┘   └──────────┘
-              records     fields      columns      zstd or LZ4
-                                                   + block index
-```
+## Documentation
 
-1. **Frame.** Splits the stream into records: lines, length-prefixed or fixed-width binary records, or the elements of a JSON array. Incompressible chunks skip modelling and go straight to `zstd`.
-2. **Model.** Learns record layouts from a sample, drawn from across the file when packing one, then splits each record into fields. A record or JSON object in a layout the model lacks is stored whole. Later input reuses the model, and the writer retrains when the stream drifts.
-3. **Encode.** Gathers each field into a column and tries candidate encodings per block, keeping the smallest. A field derivable from others (`end_us = start_us + dur_us`, a URL embedding a repository name) is stored as the rule.
-4. **Compress & index.** Compresses the columns with `zstd` or `LZ4` into independent blocks. A trailing index holds byte ranges, per-column bounds and a substring filter, so a query fetches and decodes only what it needs.
+- [`DESIGN.md`](DESIGN.md): architecture, self-describing payloads, query engine, and host embedding.
+- [`FORMAT.md`](FORMAT.md): binary wire specification for streams, column payloads, indexes, and profiles.
+- [`PROGRAMS.md`](PROGRAMS.md): the 35-opcode lane VM instruction set and bounded recurrences.
+- [`bench/README.md`](bench/README.md): benchmark runners, corpora, and ablations.
 
-For example, these three records:
-
-```text
-{"ts":"2026-11-10T12:00:00.004Z","svc":"auth","status":200,"start_us":1000,"dur_us":412,"end_us":1412}
-{"ts":"2026-11-10T12:00:00.019Z","svc":"auth","status":200,"start_us":1015,"dur_us":388,"end_us":1403}
-{"ts":"2026-11-10T12:00:00.031Z","svc":"cart","status":503,"start_us":1027,"dur_us":97,"end_us":1124}
-```
-
-encode into:
-
-```text
-shape      const     {"ts":"_","svc":"_","status":_,"start_us":_,"dur_us":_,"end_us":_}
-ts         delta     2026-11-10T12:00:00.004Z, +15ms, +12ms
-svc        dict      [auth, cart] -> 0, 0, 1
-status     int       200, 200, 503
-start_us   delta     1000, +15, +12
-dur_us     int       412, 388, 97
-end_us     derived   start_us + dur_us
-```
-
-`zform inspect -v` shows the compressed bytes each column takes.
-
-## Architecture
-
-The writer holds all knowledge of formats. A file carries its own decoding instructions, and the reader runs a small fixed set of generic operations. A new log syntax or value type can use the existing decoder operations.
-
-The instructions describe two layers:
-
-- **Record layout.** A record follows a *shape*: literal text with slots filled from columns. The writer's front ends for `logfmt`, CSV/TSV, CRI and syslog envelopes, fixed-width binary structs and learned free-text templates all produce shapes, with separators, keys and quotes as literal text. Nested JSON has a tree model of its own.
-- **Column values.** A column carries a small graph of operations over byte buffers and integer streams: dictionaries, deltas, references to other columns (a copy, or a lookup by a shared key such as a block id), and short programs that do arithmetic and format bytes. Writer-side codec packs recognise timestamps, decimals, UUIDs, network addresses, hex ids and pseudo-random sequences (`java.util.Random`, Python's Mersenne Twister) and express each in those operations.
-
-The reader therefore has no timestamp, `logfmt` or generator code. Programs have no branches, loops or writes to memory, so a reader validates one in a single pass and bounds its cost before running it. Code that blocks share is stored once with the model. An application can register its own `CodecPack` for a column or `RelationPack` for relationships between columns without changing the format.
-
-The `.zfm` container serves streaming pipelines and indexed archives:
-
-- **Standalone or profiled:** Models travel in the stream, so every file decodes alone. `zform train` saves a model as a `.zfp` profile so small chunks compress well from the first record.
-- **Concatenation:** `cat a.zfm b.zfm` is a valid stream that unpacks to both inputs in order.
-- **Independent blocks:** No block refers to another, so a reader fetches and decodes single blocks and columns. Columns hold values only where a field occurs, so sparse JSON pays nothing for absent fields.
-- **Integrity:** Frame headers carry CRC32 checksums and payloads XXH64.
-- **Embeddable:** A storage engine can keep `zform` blocks or files inside its own objects, next to its own columns and indexes ([`DESIGN.md`](DESIGN.md)).
-
-The wire format is experimental and changes without notice; keep original copies of data you cannot repack.
-
-## Benchmarks
-
-The comparison uses the full Loghub HDFS log, the complete GitHub Archive hour `2020-06-17-16`, and the whole Silesia `sao` star catalog. `zform` sizes include the query index.
-
-<!-- bench:presets -->
-| Corpus | Pack flags | Archive |
-|---|---|---:|
-| HDFS DataNode logs | `--best` | 31.70 MiB (47.5x) |
-| HDFS DataNode logs | `-l 6 --hdfs-predictors --context-mixing` | 16.88 MiB (89.1x) |
-| GitHub Archive NDJSON | `--best` | 20.07 MiB (23.7x) |
-| GitHub Archive NDJSON | `--order-by type,repo.id` | 22.47 MiB (21.2x) |
-| GitHub Archive NDJSON | `--best --order-by type,repo.id` | 17.47 MiB (27.3x) |
-| Silesia sao | `--best` | 3.38 MiB (2.05x) |
-<!-- /bench:presets -->
-
-`--best` builds a shared dictionary from recurring values. `--order-by type,repo.id` groups events in stored order, which `grep` and `select` use. Unpack buffers one run, up to 512 MiB by default, to restore input order. The HDFS predictor preset models block IDs, write pipelines and per-node clocks.
-
-The [benchmark workflow](https://github.com/wjordan/zform/actions/workflows/bench.yml) reports per-corpus throughput and peak memory. [Benchmark commands](bench/README.md) cover the same inputs, queries and CloudTrail.
-
-
-## Repository layout
-
-- [`crates/zform-core`](crates/zform-core) — framing, modelling, writer-side codec packs, the payload decoder and the query engine.
-- [`crates/zform`](crates/zform) — public Rust API: `pack`, `unpack`, `train`, `Archive` for queries, and the `file` and `block` modules for embedding.
-- [`crates/zform-cli`](crates/zform-cli) — the `zform` command-line tool.
-- [`DESIGN.md`](DESIGN.md) — layers, queryable files and the host embedding interface.
-- [`FORMAT.md`](FORMAT.md) — binary layout of streams, column payloads, index regions and profiles.
-- [`PROGRAMS.md`](PROGRAMS.md) — the instruction set column payloads compute with.
-- [`bench/`](bench) — corpus generators and benchmark runners.
-
-## Related work
+## Related Work
 
 - **Format-aware compression:** OpenZL (Meta, 2024–2025) routes typed streams through codec graphs. Zstandard (Collet & Kucherawy, RFC 8878) is `zform`'s default entropy backend.
 - **Log compression:** CLP (Rodrigues et al., *OSDI 2021*) and LogGrep (Wei et al., *EuroSys 2023*) split logs into templates and variables for compressed search; Drain (He et al., *ICWS 2017*) parses log templates online.
 - **Semi-structured columns:** JSON Tiles (Durner et al., *SIGMOD 2021*; Zeng et al., *VLDB 2023*) extracts typed sub-columns from heterogeneous JSON documents.
 - **Lightweight codecs:** FSST (Boncz, Neumann & Leis, *VLDB 2020*) for strings; Gorilla (Pelkonen et al., *VLDB 2015*), BtrBlocks (Kuschewski et al., *SIGMOD 2023*), and FastLanes (Afroozeh & Boncz, *VLDB 2023*) for delta and frame-of-reference encodings; Blosc byte-shuffle (Alted, 2010).
 
-## License
+<details>
+<summary>What's the Weissman score?</summary>
 
-Licensed under the [Apache License, Version 2.0](LICENSE).
+Following the [IEEE Spectrum formulation](https://spectrum.ieee.org/a-madefortv-compression-metric-moves-to-the-real-world), `W = α · (r / r̄) × (log T̄ / log T)` with `α = 1`, `T` in seconds, and `gzip -6` (`r̄ = 10.14x`, `T̄ = 13.40 s`) as baseline on the full 1,577.98 MB HDFS corpus:
+
+- `zform` (`r = 89.14x`, `T = 16.30 s`): **`W = (89.14 / 10.14) × (log 13.40 / log 16.30) = 8.17`**
+
+This exceeds the [award-winning score](https://en.wikipedia.org/wiki/Optimal_Tip-to-Tip_Efficiency) of 5.2, though it's a single result on a highly compressible log corpus- structure-aware encoding for 3D video is left to future work.
+
+</details>
+
+*The wire format is experimental and changes without notice; keep original copies of data you cannot repack. Licensed under the [Apache License, Version 2.0](LICENSE).*

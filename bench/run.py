@@ -99,15 +99,19 @@ def size_cell(raw_len, size):
 def size_table(report, codecs):
     labels = [f"`{codec}`" for codec in codecs]
     rows = [
-        "| Corpus | Raw | `zform` | " + " | ".join(labels) + " |",
-        "|---|---:|---:|" + "---:|" * len(codecs),
+        "| Corpus | Raw | " + " | ".join(labels) + " | `zform` |",
+        "|---|---:|" + "---:|" * len(codecs) + "---:|",
     ]
     for dataset in report:
         raw_len = dataset["raw_bytes"]
         results = dataset["codecs"]
         preset = min((c for c in PRESETS if c in results), key=lambda c: results[c]["size"])
-        cells = [f"{size_cell(raw_len, results[preset]['size'])}<br>`{PRESETS[preset]}`"]
-        cells.extend(size_cell(raw_len, results[c]["size"]) for c in codecs)
+        sizes = [results[c]["size"] for c in codecs] + [results[preset]["size"]]
+        best_size = min(sizes)
+        cells = [
+            f"**{size_cell(raw_len, s)}**" if s == best_size else size_cell(raw_len, s)
+            for s in sizes
+        ]
         rows.append(f"| {dataset['name']} | {raw_len / 2**20:,.2f} MiB | " + " | ".join(cells) + " |")
     return "\n".join(rows)
 
