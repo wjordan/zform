@@ -16,7 +16,7 @@ Every codec runs on one thread. Timings include process startup and file I/O. Th
 
 The [full-corpus benchmark workflow](https://github.com/wjordan/zform/actions/workflows/bench.yml) runs on changes to the compressor, weekly, and on demand. Each run publishes a summary and a report artifact with per-corpus timings, memory, archive sizes, input hashes and tool versions.
 
-The first successful run records the README size baseline. Subsequent runs update the tables when an archive size moves at least 1% from the published baseline. Timing and memory measurements stay in the workflow reports.
+The first successful run records the README size baseline. Subsequent runs update the comparison and preset tables when an archive size moves at least 1% from the published baseline.
 
 ```bash
 bash bench/fetch_corpora.sh bench/corpus
@@ -316,6 +316,8 @@ $qbench newest day clickhouse created_at 20 1592438400 # newest 20 with a substr
 $qbench top day type PullRequestEvent payload.pull_request.base.repo.language 20
 $qbench filters day                                    # index sizes and filter fill
 ```
+
+For `qbench pack`, use `wall_s` to compare ingest times. Its `cpu_s` measures only the calling thread, while the file writer can encode blocks on worker threads.
 
 ## CloudTrail
 

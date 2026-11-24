@@ -13,7 +13,7 @@ Its peers are compressed log stores (CLP, LogGrep) and seekable zstd. It has no 
 bytes rather than typed vectors, and has no aggregation kernels, so against Parquet or Vortex the
 comparison that applies is file size and the bytes and round trips of a selective read.
 
-Nothing depends on the format yet, so it changes in place with no compatibility path.
+The wire format is experimental and can change between builds.
 
 ## layers
 
@@ -42,7 +42,7 @@ for a timestamp can emit integer residuals, arithmetic, and a program that forma
 A new pack using existing nodes and instructions needs no reader changes. Adding a node or
 instruction changes the decoder's contract; the format is experimental and is not frozen.
 
-A block of 16,384 records or more is searched in two steps. The writer runs the whole search
+A block of 16,384 records or more is searched in two steps. The writer tests column encodings
 on 4,096 records from the block's middle, then codes each column with the candidate that won
 there, and with the runner-up where that came within a quarter. The candidate also repeats the
 sample's choices between integer codings (as they are, by difference, by recency) without
@@ -51,6 +51,10 @@ only to its misses, a stream too short to judge. A column gets the whole search 
 sample held under 512 of its cells, or when its winner costs a cell a quarter more on the
 block than on the sample; keyed lookups need 1,024 cells, so a smaller sample does not rule
 them out.
+
+Smaller JSON blocks can reuse column choices from an earlier block that used the same model.
+The writer also reuses integer encoding choices for JSON structure streams across blocks and frames.
+Each block carries the instructions its reader needs to decode those streams.
 
 Each model carries a library of shared programs, recurrences, and byte tables. Column graphs
 can name library entries and override a program's constants for the block, so code does not
@@ -67,7 +71,9 @@ below, are the one input from outside the block.
 views when the graph root permits it. This avoids copying repeated cell bytes and lets a
 predicate run once per dictionary value. `decode_cells` materializes byte strings;
 `decode_ints` returns native integer lanes for numeric roots. The `zform::column` and
-`zform::numeric` APIs use the same payload format outside record files.
+`zform::numeric` APIs use the same payload format outside record files. For floating-point
+batches, reuse a `numeric::FloatEncoder` for its scratch space and keep a `numeric::FloatHint`
+per series to reuse a decimal scale. The encoder preserves the exact bits of each value.
 [`FORMAT.md` §4](FORMAT.md#4-model-and-column-payloads) specifies the wire representation.
 
 ### context mixing
@@ -236,7 +242,9 @@ with and without `--best`.
 - **Filter pages**, one per block, hold a bit filter over the letter runs of its records, case
   kept: each run of 3 or 4 letters, and each 5 letters of a longer run. A needle prunes a block
   when one of its own runs is missing. A query fetches a block's filter only when the filter is
-  smaller than the parts it might save.
+  smaller than the parts it might save. When the writer can account for every letter run from
+  the model and cells, it indexes each used literal once and adds tokens from field values.
+  Otherwise it scans the original records so the filter includes runs that cross field boundaries.
 
 Rows are numbered from 0 across the file. The row number is the only identifier a host shares
 with `zform`. A host with its own row ranges (one per stream, say) maps them onto blocks by row
@@ -261,7 +269,7 @@ Operations take and return row sets:
 | Operation | Result |
 |---|---|
 | `paths()` | The field paths the file's models define. |
-| `matches(pred, within)` | Rows of `within` that satisfy `pred`. No record is built, so a count is the set's size. |
+| `matches(pred, within)` | Rows of `within` that satisfy `pred`. The set's size gives the count. |
 | `records(rows)` | Those records, byte-exact, in row order. |
 | `fields(paths, rows)` | Those fields of those rows. |
 | `distinct(path, within)` | Per block, each value of a column with the rows holding it; a dictionary-coded column yields each value once. |
@@ -281,6 +289,11 @@ its column in most blocks; a host whose own index chose the rows opens the sessi
 `without_filters`. A field every row of a block holds once is tested as a column, with no walk
 of the rows' structure.
 
+For JSON fields with one scalar value per row, `fields` can pass decoded column values directly
+to the callback. On a dictionary-coded field, `distinct` can group rows by dictionary index.
+For delimited JSON or template blocks, unpack can copy layout literals and column values
+directly into the frame's output buffer.
+
 A field value is one of: the field's bytes exactly as they appear in the record, quotes and
 escapes included; absent; or unparsed, when the record was stored verbatim and the host has to
 look at the record itself. A path that occurs several times in a record, as array elements do,
@@ -293,18 +306,18 @@ a word there, or a substring with more than eight such placements, rebuilds rows
 JSON records with leading whitespace are stored verbatim and are rebuilt for queries.
 
 One query keeps its decoded column state in a session. A `File` shares its models, query-plan
-cache, and loaded dictionary across sessions. A host opening the file again can supply the
-dictionary through `set_dictionary`. Per-thread caches retain compiled payload programs and
-zstd contexts. `DecodeBudget` bounds decoding of untrusted bytes.
+cache, and loaded dictionary across sessions. `File::reopen` reuses the parsed root and models
+with a fresh query-plan cache. A host can attach a cached dictionary through `set_dictionary`.
+Per-thread caches retain compiled payload programs and zstd contexts.
+`DecodeBudget` bounds decoding of untrusted bytes.
 
 ## writing
 
-The writer takes records in their final order; only `pack_stream` reorders them, before any
-block is cut. `cut()` ends a block early, and `finish()`
-returns the index region. Data region bytes are emitted in order as blocks complete and never
-revisited.
+`file::Writer` takes records in their final order. It writes completed blocks to the data
+region in input order. `cut()` closes the current block and drains queued writes.
+`finish()` drains the writer and returns the sink and index region.
 
-- **Memory** is a multiple of the block size and does not grow with the file. A dictionary
+- **Encoding memory** grows with block size and the number of blocks in flight. A dictionary
   adds its content and match tables, 7 to 13 times its size; choosing one holds a block, a
   filter of up to 64 MiB and four budgets of candidate values. Training adds sample and
   model-building memory. `TrainOptions` controls sampling, with defaults of 16,384 rows and 16 MiB.
@@ -312,7 +325,8 @@ revisited.
   data region. Every block reports a `Fit`: the rows and bytes its model could not place. When
   to retrain is the host's policy.
 - **Determinism.** The same records, options, model and library version give the same bytes.
-- **Threads.** None. A writer runs on the calling thread.
+- **Threads.** `PackOptions::threads` defaults to the available parallelism. A value of 1
+  encodes on the calling thread. Higher values encode blocks concurrently and produce the same bytes.
 
 ## what the host owns
 

@@ -223,7 +223,8 @@ pub struct PackOptions {
     pub pool_page_bytes: usize,
     /// Pluggable writer-side codec packs evaluated on columns.
     pub packs: PackRegistry,
-    /// Frames `pack_stream` encodes at once; the output is the same for any count.
+    /// Maximum concurrent frames for `pack_stream`, or blocks for `file::Writer`.
+    /// Defaults to the available parallelism. The output is the same for any count.
     pub threads: usize,
     /// Fields, as dotted paths, that `pack_stream` sorts each run of JSON lines on before
     /// storing it; order frames restore the runs on unpack. Empty stores records as they come.
